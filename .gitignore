@@ -1,0 +1,21 @@
+# Compiled binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+metricflow
+
+# Test binary / coverage output
+*.test
+*.out
+coverage.*
+
+# Go workspace file
+go.work
+go.work.sum
+
+# Editor / OS cruft
+.DS_Store
+.idea/
+.vscode/
