@@ -18,6 +18,8 @@ type Event struct {
 	Type  string  `json:"type"`  // metric kind, e.g. "gauge" / "counter"
 }
 
+var totalEvents int
+
 func main() {
 	// GET /health - liveness check, just proves the server is up.
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -48,6 +50,10 @@ func main() {
 		fmt.Printf("parsed event: name=%s value=%.2f type=%s ts=%d\n",
 			ev.Name, ev.Value, ev.Type, ev.TS)
 		fmt.Fprintln(w, "got it")
+		totalEvents++
+	})
+	http.HandleFunc("/count", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "total events: %d\n", totalEvents)
 	})
 
 	// Register routes above, THEN start the server - ListenAndServe
