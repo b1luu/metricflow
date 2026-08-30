@@ -18,7 +18,9 @@ type Event struct {
 	Type  string  `json:"type"`  // metric kind, e.g. "gauge" / "counter"
 }
 
-var totalEvents int
+// counts is a per-metric tally: key = metric name, value = running count.
+// make() builds a real empty map; a nil map would panic on write.
+var counts = make(map[string]int)
 
 func main() {
 	// GET /health - liveness check, just proves the server is up.
@@ -50,10 +52,17 @@ func main() {
 		fmt.Printf("parsed event: name=%s value=%.2f type=%s ts=%d\n",
 			ev.Name, ev.Value, ev.Type, ev.TS)
 		fmt.Fprintln(w, "got it")
-		totalEvents++
+
+		// Bump this metric's own counter. If ev.Name is new, the map
+		// returns 0 for it and ++ makes it 1 - no "create if missing" needed.
+		counts[ev.Name]++
 	})
+	// GET /count - per-metric breakdown, one line per name.
 	http.HandleFunc("/count", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "total events: %d\n", totalEvents)
+		// range over a map yields each key/value pair (order is random).
+		for name, c := range counts {
+			fmt.Fprintf(w, "%s: %d\n", name, c)
+		}
 	})
 
 	// Register routes above, THEN start the server - ListenAndServe
