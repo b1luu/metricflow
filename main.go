@@ -75,12 +75,17 @@ func record(ev Event) {
 	}
 }
 
-// mergeBuckets folds a metric's per-bucket Aggs into one combined Agg.
-// The bool is false when there's no data. Caller must hold mu.
-func mergeBuckets(series map[int64]*Agg) (Agg, bool) {
+// mergeBuckets folds a metric's per-bucket Aggs into one combined Agg,
+// ignoring any bucket whose key (its start time, unix seconds) is older
+// than cutoff. Pass cutoff <= 0 to include every bucket.
+// The bool is false when no bucket qualifies. Caller must hold mu.
+func mergeBuckets(series map[int64]*Agg, cutoff int64) (Agg, bool) {
 	var merged Agg
 	first := true
-	for _, a := range series {
+	for bucket, a := range series {
+		if bucket < cutoff {
+			continue // outside the window
+		}
 		merged.Count += a.Count
 		merged.Sum += a.Sum
 		if first || a.Min < merged.Min {
@@ -92,6 +97,13 @@ func mergeBuckets(series map[int64]*Agg) (Agg, bool) {
 		first = false
 	}
 	return merged, !first
+}
+
+// windowStart returns the key of the oldest bucket still inside the
+// current window: the current bucket, minus (numBuckets-1) older ones.
+func windowStart() int64 {
+	return time.Now().Truncate(bucketWidth).
+		Add(-(numBuckets - 1) * bucketWidth).Unix()
 }
 
 // handleHealth: GET /health - liveness check, proves the server is up.
@@ -127,13 +139,15 @@ func handleIngest(w http.ResponseWriter, r *http.Request) {
 
 // handleStats: GET /stats - per-metric aggregate: count, average, min, max.
 func handleStats(w http.ResponseWriter, r *http.Request) {
+	cutoff := windowStart()
+
 	mu.Lock()
 	defer mu.Unlock()
 
 	for name, series := range aggs {
-		m, ok := mergeBuckets(series)
+		m, ok := mergeBuckets(series, cutoff)
 		if !ok {
-			continue
+			continue // no data inside the window
 		}
 		avg := m.Sum / float64(m.Count)
 		fmt.Fprintf(w, "%s: count=%d avg=%.2f min=%.2f max=%.2f\n",

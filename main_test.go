@@ -16,6 +16,12 @@ func resetAggs() {
 	aggs = make(map[string]map[int64]*Agg)
 }
 
+// mergeAll folds every bucket for a metric, ignoring the time window.
+// Used by tests that check record()'s output regardless of wall-clock timing.
+func mergeAll(name string) (Agg, bool) {
+	return mergeBuckets(aggs[name], 0)
+}
+
 // --- unit test: the aggregation logic, no HTTP involved ---
 
 func TestRecordAggregates(t *testing.T) {
@@ -27,7 +33,7 @@ func TestRecordAggregates(t *testing.T) {
 
 	// Events may land in one or two buckets depending on timing;
 	// mergeBuckets recombines them so the assertions hold either way.
-	a, ok := mergeBuckets(aggs["cpu.load"])
+	a, ok := mergeAll("cpu.load")
 	if !ok {
 		t.Fatal("expected data for cpu.load, got none")
 	}
@@ -52,7 +58,7 @@ func TestRecordSeedsMinMaxFromFirstValue(t *testing.T) {
 	record(Event{Name: "latency", Value: 5})
 	record(Event{Name: "latency", Value: 8})
 
-	a, ok := mergeBuckets(aggs["latency"])
+	a, ok := mergeAll("latency")
 	if !ok {
 		t.Fatal("expected data for latency, got none")
 	}
@@ -67,8 +73,8 @@ func TestRecordKeepsMetricsSeparate(t *testing.T) {
 	record(Event{Name: "cpu.load", Value: 1})
 	record(Event{Name: "memory.used", Value: 512})
 
-	cpu, cpuOK := mergeBuckets(aggs["cpu.load"])
-	mem, memOK := mergeBuckets(aggs["memory.used"])
+	cpu, cpuOK := mergeAll("cpu.load")
+	mem, memOK := mergeAll("memory.used")
 	if !cpuOK || !memOK || cpu.Count != 1 || mem.Count != 1 {
 		t.Errorf("metrics bled into each other: %+v", aggs)
 	}
@@ -88,7 +94,7 @@ func TestIngestHandlerValid(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
-	a, ok := mergeBuckets(aggs["cpu.load"])
+	a, ok := mergeAll("cpu.load")
 	if !ok || a.Count != 1 {
 		t.Errorf("event was not recorded: %+v", aggs)
 	}
@@ -159,7 +165,7 @@ func TestRecordMissingFieldsUsesZeroValues(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (missing fields are allowed)", rec.Code)
 	}
-	a, ok := mergeBuckets(aggs["cpu.load"])
+	a, ok := mergeAll("cpu.load")
 	if !ok || a.Count != 1 || a.Sum != 0 {
 		t.Errorf("got %+v, want Count=1 Sum=0 (value defaulted to 0)", a)
 	}
@@ -174,7 +180,7 @@ func TestRecordAllNegativeValues(t *testing.T) {
 		record(Event{Name: "temp.delta", Value: v})
 	}
 
-	a, ok := mergeBuckets(aggs["temp.delta"])
+	a, ok := mergeAll("temp.delta")
 	if !ok {
 		t.Fatal("expected data for temp.delta, got none")
 	}
@@ -186,10 +192,10 @@ func TestRecordAllNegativeValues(t *testing.T) {
 // --- mergeBuckets in isolation ---
 
 func TestMergeBucketsEmpty(t *testing.T) {
-	if _, ok := mergeBuckets(nil); ok {
+	if _, ok := mergeBuckets(nil, 0); ok {
 		t.Error("mergeBuckets(nil) ok = true, want false")
 	}
-	if _, ok := mergeBuckets(map[int64]*Agg{}); ok {
+	if _, ok := mergeBuckets(map[int64]*Agg{}, 0); ok {
 		t.Error("mergeBuckets(empty) ok = true, want false")
 	}
 }
@@ -204,7 +210,7 @@ func TestMergeBucketsAcrossBuckets(t *testing.T) {
 		120: {Count: 3, Sum: -6, Min: -4, Max: 0},
 	}
 
-	m, ok := mergeBuckets(series)
+	m, ok := mergeBuckets(series, 0) // cutoff 0 -> every bucket
 	if !ok {
 		t.Fatal("ok = false, want true")
 	}
@@ -219,6 +225,41 @@ func TestMergeBucketsAcrossBuckets(t *testing.T) {
 	}
 	if m.Max != 10 {
 		t.Errorf("Max = %v, want 10 (largest across all buckets)", m.Max)
+	}
+}
+
+// Change 2: buckets older than the cutoff are excluded from the merge.
+func TestMergeBucketsRespectsCutoff(t *testing.T) {
+	series := map[int64]*Agg{
+		100: {Count: 5, Sum: 50, Min: 1, Max: 20}, // before cutoff - ignored
+		110: {Count: 2, Sum: 6, Min: 2, Max: 4},
+		120: {Count: 1, Sum: 9, Min: 9, Max: 9},
+	}
+
+	m, ok := mergeBuckets(series, 110)
+	if !ok {
+		t.Fatal("ok = false, want true")
+	}
+	if m.Count != 3 {
+		t.Errorf("Count = %d, want 3 (bucket 100 excluded)", m.Count)
+	}
+	if m.Sum != 15 {
+		t.Errorf("Sum = %v, want 15", m.Sum)
+	}
+	if m.Min != 2 || m.Max != 9 {
+		t.Errorf("Min/Max = %v/%v, want 2/9 (bucket 100's 1 and 20 excluded)", m.Min, m.Max)
+	}
+}
+
+// When every bucket is older than the cutoff, the metric has no data
+// in the window and ok is false.
+func TestMergeBucketsAllStale(t *testing.T) {
+	series := map[int64]*Agg{
+		100: {Count: 5, Sum: 50, Min: 1, Max: 20},
+		110: {Count: 2, Sum: 6, Min: 2, Max: 4},
+	}
+	if _, ok := mergeBuckets(series, 200); ok {
+		t.Error("ok = true, want false (all buckets stale)")
 	}
 }
 
@@ -246,7 +287,7 @@ func TestRecordConcurrent(t *testing.T) {
 	wg.Wait()
 
 	want := goroutines * perGoroutine
-	m, ok := mergeBuckets(aggs["cpu.load"])
+	m, ok := mergeAll("cpu.load")
 	if !ok || m.Count != want {
 		t.Errorf("Count = %d, want %d (lost updates - mutex not protecting?)", m.Count, want)
 	}
