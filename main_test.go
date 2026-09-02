@@ -263,6 +263,58 @@ func TestMergeBucketsAllStale(t *testing.T) {
 	}
 }
 
+// --- eviction (Change 3) ---
+
+// evict removes buckets older than cutoff and leaves the rest untouched.
+// A bucket exactly at the cutoff is kept (the test uses < , not <=).
+func TestEvict(t *testing.T) {
+	series := map[int64]*Agg{
+		100: {Count: 1}, // older than cutoff - dropped
+		109: {Count: 1}, // older than cutoff - dropped
+		110: {Count: 1}, // exactly at cutoff - kept
+		120: {Count: 1}, // newer - kept
+	}
+
+	evict(series, 110)
+
+	if _, ok := series[100]; ok {
+		t.Error("bucket 100 still present, should be evicted")
+	}
+	if _, ok := series[109]; ok {
+		t.Error("bucket 109 still present, should be evicted")
+	}
+	if _, ok := series[110]; !ok {
+		t.Error("bucket 110 evicted, should be kept (at cutoff)")
+	}
+	if _, ok := series[120]; !ok {
+		t.Error("bucket 120 evicted, should be kept")
+	}
+}
+
+// record() itself evicts aged-out buckets for the metric it touches.
+// An ancient bucket is injected, then one live event is recorded; the
+// ancient bucket should be gone and only the current one should remain.
+func TestRecordEvictsStaleBuckets(t *testing.T) {
+	resetAggs()
+
+	mu.Lock()
+	aggs["cpu.load"] = map[int64]*Agg{
+		1000: {Count: 99, Sum: 99, Min: 1, Max: 1}, // ancient
+	}
+	mu.Unlock()
+
+	record(Event{Name: "cpu.load", Value: 0.5})
+
+	mu.Lock()
+	defer mu.Unlock()
+	if _, ok := aggs["cpu.load"][1000]; ok {
+		t.Error("ancient bucket 1000 survived a record() call")
+	}
+	if got := len(aggs["cpu.load"]); got != 1 {
+		t.Errorf("series has %d buckets, want 1 (just the current one)", got)
+	}
+}
+
 // --- concurrency: the project's core claim ---
 
 // N goroutines hammering record() on the same metric must not lose a

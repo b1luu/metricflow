@@ -73,6 +73,22 @@ func record(ev Event) {
 	if ev.Value > a.Max {
 		a.Max = ev.Value
 	}
+
+	// Drop buckets that have aged out of the window, so a long-lived
+	// metric's map stays bounded to ~numBuckets entries. A metric that
+	// goes silent keeps its last buckets until it resumes - acceptable,
+	// see DESIGN.md §10.
+	evict(series, windowStart())
+}
+
+// evict deletes buckets older than cutoff from a metric's series.
+// Deleting keys during a range loop is safe in Go. Caller must hold mu.
+func evict(series map[int64]*Agg, cutoff int64) {
+	for bucket := range series {
+		if bucket < cutoff {
+			delete(series, bucket)
+		}
+	}
 }
 
 // mergeBuckets folds a metric's per-bucket Aggs into one combined Agg,

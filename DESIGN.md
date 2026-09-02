@@ -131,6 +131,27 @@ An event's bucket is decided by `time.Now()` when the request is handled —
 - The code carries a comment at the bucketing call marking this as the
   deliberate simplification and pointing at the event-time milestone.
 
+### 10. Bucket eviction happens on write, not on a timer
+
+Once a bucket ages out of the window it is *ignored* by `mergeBuckets`, but it
+still occupies memory. `record` deletes aged-out buckets for the metric it just
+touched, every time it runs (`evict(series, windowStart())`).
+
+- **Why on-write, not a background goroutine:** the unbounded-growth risk is a
+  metric that receives events forever — and on-write eviction caps *that* metric
+  at ~`numBuckets` live buckets. It needs no extra goroutine, no second thing
+  reasoning about the lock, and no cleanup work while the server is idle. The
+  eviction runs exactly where we already hold `mu` and already have the
+  metric's `series` in hand.
+- **What it gives up:** a metric that stops receiving events keeps its last
+  handful of buckets indefinitely — nothing triggers their cleanup. That is
+  bounded (it stopped growing when the writes stopped) and small, so it is
+  accepted. The whole metric entry also stays in `aggs` forever once seen.
+- **When to revisit:** if metric *names* churn heavily (many short-lived
+  names), the retained-forever entries add up and a periodic sweep — a ticker
+  goroutine that drops empty series and their `aggs` entry — becomes worth the
+  extra moving part.
+
 ## Testing
 
 See `main_test.go`. The strategy:
