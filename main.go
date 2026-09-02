@@ -6,6 +6,7 @@ import (
 	"io"            // io.ReadAll, to slurp the request body
 	"net/http"      // the HTTP server and routing
 	"sync"          // Mutex, to guard the shared aggs map
+	"time"
 )
 
 // Event is the in-memory form of one metric observation.
@@ -28,29 +29,42 @@ type Agg struct {
 	Max   float64 // largest value seen
 }
 
+const (
+	bucketWidth = 10 * time.Second // width of one time bucket
+	numBuckets  = 6                // 6 * 10s = 60s window
+)
+
 // aggs maps metric name -> its Agg. *Agg (pointer) so we fetch the real
 // struct and modify it in place; a value map would hand back a copy.
 // mu guards aggs - HTTP handlers run concurrently on separate goroutines.
 var (
 	mu   sync.Mutex
-	aggs = make(map[string]*Agg)
+	aggs = make(map[string]map[int64]*Agg)
 )
 
 // record folds one event into its metric's running aggregate.
 // Pulled out of the HTTP handler so it can be unit-tested on its own.
 func record(ev Event) {
+	// Bucket by server receive time. Using ev.TS (event time) would mean
+	// handling out-of-order, duplicate, and future-dated events — deferred
+	// to the event-time milestone. See DESIGN.md §9.
+	bucket := time.Now().Truncate(bucketWidth).Unix()
+
 	mu.Lock()
 	defer mu.Unlock()
 
-	a := aggs[ev.Name]
-	if a == nil {
-		// First sighting of this metric: create its Agg and seed
-		// Min/Max with this value so the first comparison is correct.
-		// (Leaving them at 0 would break Min for positive-only metrics
-		// and Max for all-negative ones.)
-		a = &Agg{Min: ev.Value, Max: ev.Value}
-		aggs[ev.Name] = a
+	series := aggs[ev.Name]
+	if series == nil {
+		series = make(map[int64]*Agg)
+		aggs[ev.Name] = series
 	}
+
+	a := series[bucket]
+	if a == nil {
+		a = &Agg{Min: ev.Value, Max: ev.Value}
+		series[bucket] = a
+	}
+
 	a.Count++
 	a.Sum += ev.Value
 	if ev.Value < a.Min {
@@ -59,6 +73,25 @@ func record(ev Event) {
 	if ev.Value > a.Max {
 		a.Max = ev.Value
 	}
+}
+
+// mergeBuckets folds a metric's per-bucket Aggs into one combined Agg.
+// The bool is false when there's no data. Caller must hold mu.
+func mergeBuckets(series map[int64]*Agg) (Agg, bool) {
+	var merged Agg
+	first := true
+	for _, a := range series {
+		merged.Count += a.Count
+		merged.Sum += a.Sum
+		if first || a.Min < merged.Min {
+			merged.Min = a.Min
+		}
+		if first || a.Max > merged.Max {
+			merged.Max = a.Max
+		}
+		first = false
+	}
+	return merged, !first
 }
 
 // handleHealth: GET /health - liveness check, proves the server is up.
@@ -97,12 +130,14 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	for name, a := range aggs {
-		// Count is int, Sum is float64; Go won't divide across types,
-		// so convert Count explicitly.
-		avg := a.Sum / float64(a.Count)
+	for name, series := range aggs {
+		m, ok := mergeBuckets(series)
+		if !ok {
+			continue
+		}
+		avg := m.Sum / float64(m.Count)
 		fmt.Fprintf(w, "%s: count=%d avg=%.2f min=%.2f max=%.2f\n",
-			name, a.Count, avg, a.Min, a.Max)
+			name, m.Count, avg, m.Min, m.Max)
 	}
 }
 

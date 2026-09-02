@@ -93,6 +93,44 @@ zero values.
 - **Future:** explicit validation (reject events with an empty `Name`, etc.)
   is a separate step, deliberately not folded into parsing.
 
+### 8. Time-windowed aggregates: 10-second buckets, 6 per window
+
+All-time aggregates are being replaced with windowed ones ("avg over the last
+minute"). The approach is **bucketing**: time is chopped into fixed slices, each
+holding its own small `Agg`; a window query sums the buckets that overlap it,
+and buckets older than the window are discarded.
+
+Chosen defaults: **10-second bucket width**, **6 buckets = a 60-second window**.
+
+The trade-off being balanced:
+
+- Smaller buckets → finer time resolution, more memory, more buckets to sum
+  per query.
+- Bigger buckets → cheaper, coarser; "last minute" gets fuzzy at the edges
+  (a 60s window built from 20s buckets really means 60–80s).
+
+10s/6 is a clean, human-readable default, not a tuned value. This project
+isn't bound to a specific company or use case yet, so there's no real
+workload to optimize against — the right move is to pick a sensible default,
+make the width a single named constant, and revisit it once there's an actual
+usage pattern (or a load-harness measurement) to react to.
+
+### 9. Windowing uses server receive time, not event time (for now)
+
+An event's bucket is decided by `time.Now()` when the request is handled —
+**not** by the `ts` field in the payload.
+
+- **Why defer event-time:** trusting `ev.TS` means handling out-of-order
+  arrivals, duplicates, and events timestamped in the past or future — a
+  whole correctness problem in its own right. It's a named roadmap milestone,
+  not something to smuggle into the first windowing step.
+- **What receive-time gives up:** if a client batches or retries, events are
+  bucketed by when we *saw* them, not when they *happened*. For the current
+  demo scenario (live simulated services pushing in real time) the two are
+  nearly identical, so the cost is small and visible.
+- The code carries a comment at the bucketing call marking this as the
+  deliberate simplification and pointing at the event-time milestone.
+
 ## Testing
 
 See `main_test.go`. The strategy:

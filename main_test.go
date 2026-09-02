@@ -12,7 +12,7 @@ import (
 func resetAggs() {
 	mu.Lock()
 	defer mu.Unlock()
-	aggs = make(map[string]*Agg)
+	aggs = make(map[string]map[int64]*Agg)
 }
 
 // --- unit test: the aggregation logic, no HTTP involved ---
@@ -24,9 +24,11 @@ func TestRecordAggregates(t *testing.T) {
 		record(Event{Name: "cpu.load", Value: v})
 	}
 
-	a := aggs["cpu.load"]
-	if a == nil {
-		t.Fatal("expected an Agg for cpu.load, got nil")
+	// Events may land in one or two buckets depending on timing;
+	// mergeBuckets recombines them so the assertions hold either way.
+	a, ok := mergeBuckets(aggs["cpu.load"])
+	if !ok {
+		t.Fatal("expected data for cpu.load, got none")
 	}
 	if a.Count != 3 {
 		t.Errorf("Count = %d, want 3", a.Count)
@@ -49,8 +51,12 @@ func TestRecordSeedsMinMaxFromFirstValue(t *testing.T) {
 	record(Event{Name: "latency", Value: 5})
 	record(Event{Name: "latency", Value: 8})
 
-	if got := aggs["latency"].Min; got != 5 {
-		t.Errorf("Min = %v, want 5 (seeded from first value, not 0)", got)
+	a, ok := mergeBuckets(aggs["latency"])
+	if !ok {
+		t.Fatal("expected data for latency, got none")
+	}
+	if a.Min != 5 {
+		t.Errorf("Min = %v, want 5 (seeded from first value, not 0)", a.Min)
 	}
 }
 
@@ -60,7 +66,9 @@ func TestRecordKeepsMetricsSeparate(t *testing.T) {
 	record(Event{Name: "cpu.load", Value: 1})
 	record(Event{Name: "memory.used", Value: 512})
 
-	if aggs["cpu.load"].Count != 1 || aggs["memory.used"].Count != 1 {
+	cpu, cpuOK := mergeBuckets(aggs["cpu.load"])
+	mem, memOK := mergeBuckets(aggs["memory.used"])
+	if !cpuOK || !memOK || cpu.Count != 1 || mem.Count != 1 {
 		t.Errorf("metrics bled into each other: %+v", aggs)
 	}
 }
@@ -79,7 +87,8 @@ func TestIngestHandlerValid(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
-	if aggs["cpu.load"] == nil || aggs["cpu.load"].Count != 1 {
+	a, ok := mergeBuckets(aggs["cpu.load"])
+	if !ok || a.Count != 1 {
 		t.Errorf("event was not recorded: %+v", aggs)
 	}
 }
