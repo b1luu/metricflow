@@ -133,6 +133,40 @@ func TestStatsHandlerOutput(t *testing.T) {
 	}
 }
 
+// A valid ?window= is accepted and (for freshly recorded events) returns
+// the same data as the default window.
+func TestStatsHandlerAcceptsWindowParam(t *testing.T) {
+	resetAggs()
+	record(Event{Name: "cpu.load", Value: 1})
+
+	req := httptest.NewRequest(http.MethodGet, "/stats?window=30s", nil)
+	rec := httptest.NewRecorder()
+
+	handleStats(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "cpu.load: count=1") {
+		t.Errorf("body = %q, want it to contain cpu.load count=1", rec.Body.String())
+	}
+}
+
+func TestStatsHandlerRejectsBadWindow(t *testing.T) {
+	resetAggs()
+
+	for _, q := range []string{"window=abc", "window=0s", "window=-5s", "window=10m"} {
+		req := httptest.NewRequest(http.MethodGet, "/stats?"+q, nil)
+		rec := httptest.NewRecorder()
+
+		handleStats(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("%s: status = %d, want 400", q, rec.Code)
+		}
+	}
+}
+
 // --- health ---
 
 func TestHealthHandler(t *testing.T) {

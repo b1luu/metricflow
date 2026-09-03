@@ -152,6 +152,25 @@ touched, every time it runs (`evict(series, windowStart())`).
   goroutine that drops empty series and their `aggs` entry — becomes worth the
   extra moving part.
 
+### 11. `/stats?window=` is caller-tunable but capped at retention
+
+`/stats` takes an optional `?window=` (Go duration syntax: `30s`, `1m`,
+`500ms`). With no parameter it uses the full retention window (`window`, 60s).
+
+- **Why cap it at retention instead of clamping silently:** buckets older than
+  `window` are already evicted, so a request for `?window=5m` *cannot* be
+  answered correctly — we'd return 60s of data labelled as 5 minutes. Returning
+  `400 window exceeds retention (1m0s)` is honest; the caller learns the
+  system's real limit instead of getting quietly-wrong numbers.
+- **Why reject `<= 0` and unparseable values:** same principle — a
+  nonsensical window is a client bug, not something to paper over with a
+  default.
+- **Edge behaviour:** because bucket boundaries are 10s, a sub-10s window still
+  returns the whole current bucket. That's the same coarseness trade-off from
+  §8, not a separate bug.
+- `window` is derived (`numBuckets * bucketWidth`), so retention and the
+  default query window move together when the constants change.
+
 ## Testing
 
 See `main_test.go`. The strategy:

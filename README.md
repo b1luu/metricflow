@@ -21,7 +21,10 @@ Listens on `:8080`.
 | ------ | --------- | ------------------------------------------------------ |
 | GET    | `/health` | Liveness check. Returns `ok`.                          |
 | POST   | `/ingest` | Submit one metric event as a JSON body.                |
-| GET    | `/stats`  | Per-metric aggregate over the last 60 seconds.         |
+| GET    | `/stats`  | Per-metric aggregate over a time window (default 60s). |
+
+`/stats` accepts an optional `?window=` (Go duration, e.g. `?window=30s`),
+capped at the 60-second retention window.
 
 Event body:
 
@@ -55,6 +58,6 @@ of event volume. Concurrent writes are serialised with a mutex. See
 
 ## Status
 
-Work in progress. Done: ingest, windowed aggregation, per-metric stats.
-Next: configurable query window, event-time handling, an alerting layer, and a
-load-generation harness.
+Work in progress. Done: ingest, windowed aggregation, per-metric stats with a
+configurable query window.
+Next: event-time handling, an alerting layer, and a load-generation harness.

@@ -30,8 +30,10 @@ type Agg struct {
 }
 
 const (
-	bucketWidth = 10 * time.Second // width of one time bucket
-	numBuckets  = 6                // 6 * 10s = 60s window
+	bucketWidth = 10 * time.Second         // width of one time bucket
+	numBuckets  = 6                        // buckets kept per metric
+	window      = numBuckets * bucketWidth // 60s: default /stats window and
+	//                                        how far back buckets are retained
 )
 
 // aggs maps metric name -> its Agg. *Agg (pointer) so we fetch the real
@@ -74,11 +76,11 @@ func record(ev Event) {
 		a.Max = ev.Value
 	}
 
-	// Drop buckets that have aged out of the window, so a long-lived
-	// metric's map stays bounded to ~numBuckets entries. A metric that
-	// goes silent keeps its last buckets until it resumes - acceptable,
-	// see DESIGN.md §10.
-	evict(series, windowStart())
+	// Drop buckets that have aged out of the retention window, so a
+	// long-lived metric's map stays bounded to ~numBuckets entries. A
+	// metric that goes silent keeps its last buckets until it resumes -
+	// acceptable, see DESIGN.md §10.
+	evict(series, windowStart(window))
 }
 
 // evict deletes buckets older than cutoff from a metric's series.
@@ -115,11 +117,10 @@ func mergeBuckets(series map[int64]*Agg, cutoff int64) (Agg, bool) {
 	return merged, !first
 }
 
-// windowStart returns the key of the oldest bucket still inside the
-// current window: the current bucket, minus (numBuckets-1) older ones.
-func windowStart() int64 {
-	return time.Now().Truncate(bucketWidth).
-		Add(-(numBuckets - 1) * bucketWidth).Unix()
+// windowStart returns the bucket key marking the start of a window of
+// size d ending now: any bucket with a key >= this is inside the window.
+func windowStart(d time.Duration) int64 {
+	return time.Now().Add(-d).Truncate(bucketWidth).Unix()
 }
 
 // handleHealth: GET /health - liveness check, proves the server is up.
@@ -153,9 +154,25 @@ func handleIngest(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "got it")
 }
 
-// handleStats: GET /stats - per-metric aggregate: count, average, min, max.
+// handleStats: GET /stats - per-metric aggregate over a time window.
+// Optional ?window=30s (Go duration syntax); defaults to the full
+// retention window, and may not exceed it (older data is already evicted).
 func handleStats(w http.ResponseWriter, r *http.Request) {
-	cutoff := windowStart()
+	win := window
+	if q := r.URL.Query().Get("window"); q != "" {
+		d, err := time.ParseDuration(q)
+		if err != nil || d <= 0 {
+			http.Error(w, "invalid window (use e.g. 30s, 1m)", http.StatusBadRequest)
+			return
+		}
+		if d > window {
+			http.Error(w, fmt.Sprintf("window exceeds retention (%s)", window), http.StatusBadRequest)
+			return
+		}
+		win = d
+	}
+
+	cutoff := windowStart(win)
 
 	mu.Lock()
 	defer mu.Unlock()
