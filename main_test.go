@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // resetAggs wipes shared state so each test starts clean.
@@ -20,6 +21,22 @@ func resetAggs() {
 // Used by tests that check record()'s output regardless of wall-clock timing.
 func mergeAll(name string) (Agg, bool) {
 	return mergeBuckets(aggs[name], 0)
+}
+
+// seedBucket injects a bucket straight into a metric's series, so a test
+// can place data at a chosen age without waiting on the clock.
+func seedBucket(name string, key int64, a *Agg) {
+	mu.Lock()
+	defer mu.Unlock()
+	if aggs[name] == nil {
+		aggs[name] = map[int64]*Agg{}
+	}
+	aggs[name][key] = a
+}
+
+// bucketAt returns the bucket key for "d ago" (d >= 0).
+func bucketAt(d time.Duration) int64 {
+	return time.Now().Add(-d).Truncate(bucketWidth).Unix()
 }
 
 // --- unit test: the aggregation logic, no HTTP involved ---
@@ -163,6 +180,83 @@ func TestStatsHandlerRejectsBadWindow(t *testing.T) {
 
 		if rec.Code != http.StatusBadRequest {
 			t.Errorf("%s: status = %d, want 400", q, rec.Code)
+		}
+	}
+}
+
+// --- windowing through the handler (deterministic, no sleeping) ---
+
+// A bucket older than the default window must not show up in /stats,
+// even though it's still physically in the map until the next write evicts it.
+func TestStatsHandlerExcludesStaleBuckets(t *testing.T) {
+	resetAggs()
+	seedBucket("cpu.load", bucketAt(0), &Agg{Count: 2, Sum: 4, Min: 2, Max: 2})
+	seedBucket("cpu.load", bucketAt(2*time.Minute), &Agg{Count: 9, Sum: 900, Min: 100, Max: 100})
+
+	req := httptest.NewRequest(http.MethodGet, "/stats", nil)
+	rec := httptest.NewRecorder()
+	handleStats(rec, req)
+
+	want := "cpu.load: count=2 avg=2.00 min=2.00 max=2.00"
+	if !strings.Contains(rec.Body.String(), want) {
+		t.Errorf("stale bucket leaked into stats: %q, want %q", rec.Body.String(), want)
+	}
+}
+
+// A shorter ?window= must actually narrow the result, dropping buckets
+// that the default window would have included.
+func TestStatsHandlerWindowParamNarrows(t *testing.T) {
+	resetAggs()
+	seedBucket("m", bucketAt(0), &Agg{Count: 1, Sum: 1, Min: 1, Max: 1})
+	seedBucket("m", bucketAt(30*time.Second), &Agg{Count: 1, Sum: 5, Min: 5, Max: 5})
+
+	get := func(query string) string {
+		req := httptest.NewRequest(http.MethodGet, "/stats"+query, nil)
+		rec := httptest.NewRecorder()
+		handleStats(rec, req)
+		return rec.Body.String()
+	}
+
+	if got := get(""); !strings.Contains(got, "m: count=2") {
+		t.Errorf("default window: got %q, want count=2", got)
+	}
+	if got := get("?window=15s"); !strings.Contains(got, "m: count=1 avg=1.00") {
+		t.Errorf("15s window: got %q, want count=1 (30s-old bucket excluded)", got)
+	}
+}
+
+// --- /stats shape: empty and multi-metric ---
+
+func TestStatsHandlerEmpty(t *testing.T) {
+	resetAggs()
+
+	req := httptest.NewRequest(http.MethodGet, "/stats", nil)
+	rec := httptest.NewRecorder()
+	handleStats(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if rec.Body.Len() != 0 {
+		t.Errorf("body = %q, want empty", rec.Body.String())
+	}
+}
+
+func TestStatsHandlerMultipleMetrics(t *testing.T) {
+	resetAggs()
+	record(Event{Name: "cpu.load", Value: 1})
+	record(Event{Name: "memory.used", Value: 512})
+
+	req := httptest.NewRequest(http.MethodGet, "/stats", nil)
+	rec := httptest.NewRecorder()
+	handleStats(rec, req)
+
+	out := rec.Body.String()
+	// Map iteration order is random, so check for each line rather than
+	// a fixed full-body string.
+	for _, want := range []string{"cpu.load: count=1", "memory.used: count=1"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("output %q missing %q", out, want)
 		}
 	}
 }
@@ -376,5 +470,43 @@ func TestRecordConcurrent(t *testing.T) {
 	m, ok := mergeAll("cpu.load")
 	if !ok || m.Count != want {
 		t.Errorf("Count = %d, want %d (lost updates - mutex not protecting?)", m.Count, want)
+	}
+}
+
+// Readers (handleStats) running against writers (record) must not panic.
+// Go's runtime detects concurrent map iteration + write and crashes the
+// process even without -race, so this fails hard if handleStats drops the
+// lock. The final count must still be exact.
+func TestRecordAndStatsConcurrent(t *testing.T) {
+	resetAggs()
+
+	const writers, perWriter, readers, perReader = 20, 100, 5, 200
+
+	var wg sync.WaitGroup
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < perWriter; j++ {
+				record(Event{Name: "cpu.load", Value: 1})
+			}
+		}()
+	}
+	for i := 0; i < readers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < perReader; j++ {
+				rec := httptest.NewRecorder()
+				handleStats(rec, httptest.NewRequest(http.MethodGet, "/stats", nil))
+			}
+		}()
+	}
+	wg.Wait()
+
+	want := writers * perWriter
+	m, ok := mergeAll("cpu.load")
+	if !ok || m.Count != want {
+		t.Errorf("Count = %d, want %d", m.Count, want)
 	}
 }
