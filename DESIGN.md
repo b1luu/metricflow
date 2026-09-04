@@ -89,9 +89,10 @@ dead code. (This was an actual bug earlier in development.)
 `{"name":"cpu.load"}` parses fine and leaves `Value`, `TS`, `Type` at their
 zero values.
 
-- We currently accept this — a zero-value event still records.
-- **Future:** explicit validation (reject events with an empty `Name`, etc.)
-  is a separate step, deliberately not folded into parsing.
+- We accept this for `Value`, `TS`, and `Type` — a zero-value event still
+  records, and that's a reasonable default (a gauge reading of exactly `0`
+  is meaningful; an unset numeric field looking like one is a minor cost).
+- `Name` is the exception — see §12.
 
 ### 8. Time-windowed aggregates: 10-second buckets, 6 per window
 
@@ -170,6 +171,24 @@ touched, every time it runs (`evict(series, windowStart())`).
   §8, not a separate bug.
 - `window` is derived (`numBuckets * bucketWidth`), so retention and the
   default query window move together when the constants change.
+
+### 12. `Name` is the one required field
+
+`/ingest` rejects an event whose `Name` is empty (missing from the JSON, or
+explicitly `""`) with `400 name is required`. Every other field keeps the
+zero-value-is-fine behavior from §7.
+
+- **Why `Name` and not the others:** `Name` is the map key everything is
+  aggregated under. A missing `Value`/`TS`/`Type` degrades gracefully to a
+  zero, which is still a coherent (if uninteresting) data point. A missing
+  `Name` doesn't degrade — it silently merges into a `""` bucket, mixing
+  unrelated events together and corrupting every other metric's neighbor in
+  `/stats` output. That's not a lesser version of the data; it's wrong data.
+- **Why check after `Unmarshal` instead of during it:** `json.Unmarshal` only
+  validates syntax (is this valid JSON), never meaning (is this a valid
+  event). Keeping that boundary means the parse step stays generic and the
+  validation step stays the readable, single place where "what makes an
+  event acceptable" is decided — the natural spot to add more rules later.
 
 ## Testing
 

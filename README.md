@@ -24,7 +24,8 @@ Listens on `:8080`.
 | GET    | `/stats`  | Per-metric aggregate over a time window (default 60s). |
 
 `/stats` accepts an optional `?window=` (Go duration, e.g. `?window=30s`),
-capped at the 60-second retention window.
+capped at the 60-second retention window. `/ingest` requires a non-empty
+`name`; other fields default to their zero value if omitted.
 
 Event body:
 

@@ -147,6 +147,15 @@ func handleIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Unmarshal only checks syntax, not meaning: a Name-less event parses
+	// fine and would otherwise record under the empty string. That's the
+	// one field with no sane zero-value default, so it's checked explicitly.
+	// See DESIGN.md §12.
+	if ev.Name == "" {
+		http.Error(w, "name is required", http.StatusBadRequest)
+		return
+	}
+
 	fmt.Printf("parsed event: name=%s value=%.2f type=%s ts=%d\n",
 		ev.Name, ev.Value, ev.Type, ev.TS)
 

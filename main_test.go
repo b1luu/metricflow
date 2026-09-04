@@ -279,8 +279,8 @@ func TestHealthHandler(t *testing.T) {
 
 // --- documented edge behaviors ---
 
-// A body missing fields is NOT rejected (DESIGN.md §7) - the absent fields
-// stay at their zero values and the event still records.
+// A body missing non-Name fields is NOT rejected (DESIGN.md §7) - the
+// absent fields stay at their zero values and the event still records.
 func TestRecordMissingFieldsUsesZeroValues(t *testing.T) {
 	resetAggs()
 
@@ -296,6 +296,26 @@ func TestRecordMissingFieldsUsesZeroValues(t *testing.T) {
 	a, ok := mergeAll("cpu.load")
 	if !ok || a.Count != 1 || a.Sum != 0 {
 		t.Errorf("got %+v, want Count=1 Sum=0 (value defaulted to 0)", a)
+	}
+}
+
+// Name is the one field with no sane zero-value default (DESIGN.md §12) -
+// an event with no name, or an explicitly empty one, is rejected.
+func TestIngestHandlerRejectsMissingName(t *testing.T) {
+	resetAggs()
+
+	for _, body := range []string{`{"value":1}`, `{"name":"","value":1}`} {
+		req := httptest.NewRequest(http.MethodPost, "/ingest", strings.NewReader(body))
+		rec := httptest.NewRecorder()
+
+		handleIngest(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("body %s: status = %d, want 400", body, rec.Code)
+		}
+	}
+	if len(aggs) != 0 {
+		t.Errorf("nothing should have been recorded, got %+v", aggs)
 	}
 }
 
