@@ -1,11 +1,13 @@
 package main
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"testing/iotest"
 	"time"
 )
 
@@ -130,6 +132,56 @@ func TestIngestHandlerInvalidJSON(t *testing.T) {
 	}
 	if len(aggs) != 0 {
 		t.Errorf("nothing should have been recorded, got %+v", aggs)
+	}
+}
+
+// The io.ReadAll error branch: a request body that fails mid-read.
+func TestIngestHandlerBodyReadError(t *testing.T) {
+	resetAggs()
+
+	body := iotest.ErrReader(errors.New("connection reset"))
+	req := httptest.NewRequest(http.MethodPost, "/ingest", body)
+	rec := httptest.NewRecorder()
+
+	handleIngest(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	if len(aggs) != 0 {
+		t.Errorf("nothing should have been recorded, got %+v", aggs)
+	}
+}
+
+// An empty body is not valid JSON ("unexpected end of JSON input").
+func TestIngestHandlerEmptyBody(t *testing.T) {
+	resetAggs()
+
+	req := httptest.NewRequest(http.MethodPost, "/ingest", strings.NewReader(""))
+	rec := httptest.NewRecorder()
+
+	handleIngest(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+}
+
+// "null" is valid JSON and unmarshals to a zero Event - which the name
+// check must then reject, not the JSON check.
+func TestIngestHandlerNullBody(t *testing.T) {
+	resetAggs()
+
+	req := httptest.NewRequest(http.MethodPost, "/ingest", strings.NewReader("null"))
+	rec := httptest.NewRecorder()
+
+	handleIngest(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "name is required") {
+		t.Errorf("body = %q, want the name-required error (not the JSON error)", rec.Body.String())
 	}
 }
 
@@ -528,5 +580,47 @@ func TestRecordAndStatsConcurrent(t *testing.T) {
 	m, ok := mergeAll("cpu.load")
 	if !ok || m.Count != want {
 		t.Errorf("Count = %d, want %d", m.Count, want)
+	}
+}
+
+// --- small helpers, edge cases ---
+
+// windowStart must return a bucketWidth-aligned key no older than
+// (now - d - one bucket).
+func TestWindowStartAligned(t *testing.T) {
+	d := 30 * time.Second
+	got := windowStart(d)
+
+	widthSec := int64(bucketWidth / time.Second)
+	if got%widthSec != 0 {
+		t.Errorf("windowStart(%s) = %d, not aligned to %ds", d, got, widthSec)
+	}
+
+	oldest := time.Now().Add(-d - bucketWidth).Unix()
+	newest := time.Now().Unix()
+	if got < oldest || got > newest {
+		t.Errorf("windowStart(%s) = %d, outside [%d, %d]", d, got, oldest, newest)
+	}
+}
+
+// evict on a nil or empty series is a no-op, not a panic.
+func TestEvictEmpty(t *testing.T) {
+	evict(nil, 100)
+	evict(map[int64]*Agg{}, 100)
+}
+
+// The average in /stats output is rounded to 2 decimals by %.2f.
+func TestStatsHandlerAverageRounding(t *testing.T) {
+	resetAggs()
+	for _, v := range []float64{1, 2, 2} { // sum 5 / 3 = 1.666...
+		record(Event{Name: "cpu.load", Value: v})
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/stats", nil)
+	rec := httptest.NewRecorder()
+	handleStats(rec, req)
+
+	if !strings.Contains(rec.Body.String(), "avg=1.67") {
+		t.Errorf("body = %q, want avg=1.67 (5/3 rounded)", rec.Body.String())
 	}
 }
