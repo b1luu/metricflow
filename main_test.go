@@ -262,6 +262,18 @@ func TestStatsHandlerExcludesStaleBuckets(t *testing.T) {
 	}
 }
 
+// A metric whose every bucket is out of the window (not yet evicted,
+// since eviction is on-write) is omitted from /stats entirely.
+func TestStatsHandlerOmitsFullyStaleMetric(t *testing.T) {
+	s := newStore()
+	seedBucket(s, "cpu.load", bucketAt(3*time.Minute), &Agg{Count: 9, Sum: 900, Min: 100, Max: 100})
+
+	resp := getStats(t, s, "")
+	if _, present := resp.Metrics["cpu.load"]; present {
+		t.Errorf("fully-stale metric appeared in stats: %+v", resp.Metrics)
+	}
+}
+
 // A shorter ?window= must actually narrow the result, dropping buckets
 // that the default window would have included.
 func TestStatsHandlerWindowParamNarrows(t *testing.T) {
