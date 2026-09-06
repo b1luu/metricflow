@@ -29,6 +29,20 @@ type Agg struct {
 	Max   float64 // largest value seen
 }
 
+// Store owns all metric state behind one mutex. Bundling the lock with the
+// map it guards keeps "what's protected by what" obvious, and lets each test
+// (and, later, each shard) hold its own independent state instead of sharing
+// one global.
+type Store struct {
+	mu   sync.Mutex
+	aggs map[string]map[int64]*Agg
+}
+
+// newStore returns a ready-to-use Store with its map initialized.
+func newStore() *Store {
+	return &Store{aggs: make(map[string]map[int64]*Agg)}
+}
+
 const (
 	bucketWidth = 10 * time.Second         // width of one time bucket
 	numBuckets  = 6                        // buckets kept per metric
