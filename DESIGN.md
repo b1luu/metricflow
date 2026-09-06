@@ -10,7 +10,9 @@ survives even when the code changes.
 | --------------- | ------ | ------------------------------------------------ |
 | `/health`       | GET    | Liveness check. Returns `ok`.                    |
 | `/ingest`       | POST   | Accept one metric event as a JSON body.          |
-| `/stats`        | GET    | Per-metric aggregate: count, average, min, max.  |
+| `/stats`        | GET    | Per-metric count/avg/min/max over a time window, as JSON. Optional `?window=`. |
+
+Wrong method on any route → `405` (§13). Details: JSON shape §14, `?window=` §11.
 
 Event shape (see `Event` in `main.go`):
 
@@ -41,9 +43,10 @@ memory as one.
 - **If this needed to persist:** periodic snapshot to disk, or write aggregates
   to a real store (SQLite/Redis) behind the same `record()` function.
 
-### 3. `map[string]*Agg` — pointer values
+### 3. Bucket maps hold `*Agg` — pointer values
 
-The map holds `*Agg`, not `Agg`.
+State is `map[string]map[int64]*Agg` (metric name → bucket start → aggregate;
+the buckets come from §8). The inner map holds `*Agg`, not `Agg`.
 
 - Fetching a value-type `Agg` out of a map returns a **copy**; mutating it
   would not touch the map's copy. With `*Agg` we get the real struct and
@@ -156,21 +159,21 @@ An event's bucket is decided by `time.Now()` when the request is handled —
 
 Once a bucket ages out of the window it is *ignored* by `mergeBuckets`, but it
 still occupies memory. `record` deletes aged-out buckets for the metric it just
-touched, every time it runs (`evict(series, windowStart())`).
+touched, every time it runs (`evict(series, windowStart(now, window))`).
 
 - **Why on-write, not a background goroutine:** the unbounded-growth risk is a
   metric that receives events forever — and on-write eviction caps *that* metric
   at ~`numBuckets` live buckets. It needs no extra goroutine, no second thing
   reasoning about the lock, and no cleanup work while the server is idle. The
-  eviction runs exactly where we already hold `mu` and already have the
+  eviction runs exactly where we already hold `s.mu` and already have the
   metric's `series` in hand.
 - **What it gives up:** a metric that stops receiving events keeps its last
   handful of buckets indefinitely — nothing triggers their cleanup. That is
   bounded (it stopped growing when the writes stopped) and small, so it is
-  accepted. The whole metric entry also stays in `aggs` forever once seen.
+  accepted. The whole metric entry also stays in the map forever once seen.
 - **When to revisit:** if metric *names* churn heavily (many short-lived
   names), the retained-forever entries add up and a periodic sweep — a ticker
-  goroutine that drops empty series and their `aggs` entry — becomes worth the
+  goroutine that drops empty series and their map entry — becomes worth the
   extra moving part.
 
 ### 11. `/stats?window=` is caller-tunable but capped at retention
@@ -221,7 +224,7 @@ header naming the permitted method (the HTTP spec requires that header on a
   returns a handler that does the method check, then calls through. Three
   routes need identical logic and the roadmap adds more, so the decorator
   pays for itself immediately — and it keeps the method policy visible in
-  `main()` at the routing table (`allow(http.MethodPost, handleIngest)`)
+  `main()` at the routing table (`allow(http.MethodPost, s.handleIngest)`)
   rather than buried in handler bodies.
 - **Why exact-match, not "GET implies HEAD":** simpler, and nothing here
   needs HEAD. If a real client needs it later, the wrapper is the one place
@@ -249,17 +252,21 @@ The old line-per-metric plaintext was always a placeholder.
   might want. `min`/`max`/`count` are already exact.
 - **Why build the response under the lock but encode outside it:** copying
   the numbers into a plain struct is fast; JSON-serialising and writing to
-  the socket is not. Holding `mu` across the write would block every
+  the socket is not. Holding `s.mu` across the write would block every
   `record` call for the duration of a slow client's read.
 
 ## Testing
 
-See `main_test.go`. The strategy:
+See `main_test.go`. ~85% coverage — everything but `main()` (route wiring).
+The strategy:
 
-- **Handlers are package-level functions** (`handleIngest`, `handleStats`, …),
-  not closures inside `main()`, specifically so tests can call them directly.
-- **`record(now, ev)`** holds the aggregation logic on its own, unit-tested
-  without any HTTP machinery.
+- **Handlers and `record` are `*Store` methods** (`s.handleIngest`,
+  `s.handleStats`, `s.record`), so a test calls them directly on a store it
+  owns. `handleHealth` and the pure helpers (`mergeBuckets`, `evict`,
+  `windowStart`) are free functions and are tested as such.
+- **Each test gets its own state.** `s := newStore()` at the top of the test;
+  there is no shared global and no reset step, so tests can't leak into each
+  other.
 - **Time is a parameter, not an ambient read.** `record` and `windowStart`
   take `now time.Time`; the handlers call `time.Now()` once and pass it in.
   One operation uses one clock reading, and a test can advance a synthetic
@@ -267,13 +274,16 @@ See `main_test.go`. The strategy:
   (`TestWindowRollsAsClockAdvances`).
 - **`httptest.NewRecorder` / `httptest.NewRequest`** drive the handlers
   in-process — no real socket, no port binding.
-- **`resetAggs()`** clears the shared map at the start of each test so they
-  don't leak state into each other.
+- **Helpers:** `seedBucket(s, name, key, agg)` plants data at a chosen age;
+  `getStats(t, s, query)` calls the handler and decodes the JSON.
 
 Run:
 
 ```
 go test ./...          # all tests
 go test ./... -v       # verbose, one line per test
-go test ./... -race    # with the race detector (verifies the mutex)
+go test ./... -cover   # coverage summary
+go test ./... -race    # data-race detector (needs a 64-bit C toolchain;
+                       # the concurrency tests still catch lost updates and
+                       # Go's own concurrent-map-access panic without it)
 ```
