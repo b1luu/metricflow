@@ -238,8 +238,13 @@ See `main_test.go`. The strategy:
 
 - **Handlers are package-level functions** (`handleIngest`, `handleStats`, …),
   not closures inside `main()`, specifically so tests can call them directly.
-- **`record(ev Event)`** holds the aggregation logic on its own, unit-tested
+- **`record(now, ev)`** holds the aggregation logic on its own, unit-tested
   without any HTTP machinery.
+- **Time is a parameter, not an ambient read.** `record` and `windowStart`
+  take `now time.Time`; the handlers call `time.Now()` once and pass it in.
+  One operation uses one clock reading, and a test can advance a synthetic
+  clock through bucket boundaries with no sleeping
+  (`TestWindowRollsAsClockAdvances`).
 - **`httptest.NewRecorder` / `httptest.NewRequest`** drive the handlers
   in-process — no real socket, no port binding.
 - **`resetAggs()`** clears the shared map at the start of each test so they

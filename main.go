@@ -44,13 +44,14 @@ var (
 	aggs = make(map[string]map[int64]*Agg)
 )
 
-// record folds one event into its metric's running aggregate.
-// Pulled out of the HTTP handler so it can be unit-tested on its own.
-func record(ev Event) {
-	// Bucket by server receive time. Using ev.TS (event time) would mean
-	// handling out-of-order, duplicate, and future-dated events — deferred
-	// to the event-time milestone. See DESIGN.md §9.
-	bucket := time.Now().Truncate(bucketWidth).Unix()
+// record folds one event into its metric's running aggregate. now is the
+// operation's timestamp, passed in (not read here) so one call uses one
+// consistent clock reading and tests can drive it directly.
+// Using ev.TS (event time) instead would mean handling out-of-order,
+// duplicate, and future-dated events — deferred to the event-time
+// milestone. See DESIGN.md §9.
+func record(now time.Time, ev Event) {
+	bucket := now.Truncate(bucketWidth).Unix()
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -80,7 +81,7 @@ func record(ev Event) {
 	// long-lived metric's map stays bounded to ~numBuckets entries. A
 	// metric that goes silent keeps its last buckets until it resumes -
 	// acceptable, see DESIGN.md §10.
-	evict(series, windowStart(window))
+	evict(series, windowStart(now, window))
 }
 
 // evict deletes buckets older than cutoff from a metric's series.
@@ -118,9 +119,9 @@ func mergeBuckets(series map[int64]*Agg, cutoff int64) (Agg, bool) {
 }
 
 // windowStart returns the bucket key marking the start of a window of
-// size d ending now: any bucket with a key >= this is inside the window.
-func windowStart(d time.Duration) int64 {
-	return time.Now().Add(-d).Truncate(bucketWidth).Unix()
+// size d ending at now: any bucket with a key >= this is inside the window.
+func windowStart(now time.Time, d time.Duration) int64 {
+	return now.Add(-d).Truncate(bucketWidth).Unix()
 }
 
 // allow wraps a handler so it only runs for one HTTP method. Anything
@@ -174,7 +175,7 @@ func handleIngest(w http.ResponseWriter, r *http.Request) {
 	fmt.Printf("parsed event: name=%s value=%.2f type=%s ts=%d\n",
 		ev.Name, ev.Value, ev.Type, ev.TS)
 
-	record(ev)
+	record(time.Now(), ev)
 	fmt.Fprintln(w, "got it")
 }
 
@@ -212,7 +213,7 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 		win = d
 	}
 
-	cutoff := windowStart(win)
+	cutoff := windowStart(time.Now(), win)
 	resp := StatsResponse{Window: win.String(), Metrics: map[string]MetricStats{}}
 
 	mu.Lock()

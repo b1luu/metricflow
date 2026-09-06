@@ -64,7 +64,7 @@ func TestRecordAggregates(t *testing.T) {
 	resetAggs()
 
 	for _, v := range []float64{0.8, 0.9, 0.3} {
-		record(Event{Name: "cpu.load", Value: v})
+		record(time.Now(), Event{Name: "cpu.load", Value: v})
 	}
 
 	// Events may land in one or two buckets depending on timing;
@@ -91,8 +91,8 @@ func TestRecordSeedsMinMaxFromFirstValue(t *testing.T) {
 	resetAggs()
 
 	// All values are positive; a buggy seed of 0 would make Min stay 0.
-	record(Event{Name: "latency", Value: 5})
-	record(Event{Name: "latency", Value: 8})
+	record(time.Now(), Event{Name: "latency", Value: 5})
+	record(time.Now(), Event{Name: "latency", Value: 8})
 
 	a, ok := mergeAll("latency")
 	if !ok {
@@ -106,8 +106,8 @@ func TestRecordSeedsMinMaxFromFirstValue(t *testing.T) {
 func TestRecordKeepsMetricsSeparate(t *testing.T) {
 	resetAggs()
 
-	record(Event{Name: "cpu.load", Value: 1})
-	record(Event{Name: "memory.used", Value: 512})
+	record(time.Now(), Event{Name: "cpu.load", Value: 1})
+	record(time.Now(), Event{Name: "memory.used", Value: 512})
 
 	cpu, cpuOK := mergeAll("cpu.load")
 	mem, memOK := mergeAll("memory.used")
@@ -204,8 +204,8 @@ func TestIngestHandlerNullBody(t *testing.T) {
 
 func TestStatsHandlerOutput(t *testing.T) {
 	resetAggs()
-	record(Event{Name: "cpu.load", Value: 0.8})
-	record(Event{Name: "cpu.load", Value: 0.4})
+	record(time.Now(), Event{Name: "cpu.load", Value: 0.8})
+	record(time.Now(), Event{Name: "cpu.load", Value: 0.4})
 
 	m := getStats(t, "").Metrics["cpu.load"]
 	if m.Count != 2 || m.Min != 0.4 || m.Max != 0.8 {
@@ -229,7 +229,7 @@ func TestStatsHandlerContentType(t *testing.T) {
 // A valid ?window= is accepted, echoed back, and returns the metric.
 func TestStatsHandlerAcceptsWindowParam(t *testing.T) {
 	resetAggs()
-	record(Event{Name: "cpu.load", Value: 1})
+	record(time.Now(), Event{Name: "cpu.load", Value: 1})
 
 	resp := getStats(t, "?window=30s")
 	if resp.Window != "30s" {
@@ -299,8 +299,8 @@ func TestStatsHandlerEmpty(t *testing.T) {
 
 func TestStatsHandlerMultipleMetrics(t *testing.T) {
 	resetAggs()
-	record(Event{Name: "cpu.load", Value: 1})
-	record(Event{Name: "memory.used", Value: 512})
+	record(time.Now(), Event{Name: "cpu.load", Value: 1})
+	record(time.Now(), Event{Name: "memory.used", Value: 512})
 
 	m := getStats(t, "").Metrics
 	if m["cpu.load"].Count != 1 || m["memory.used"].Count != 1 {
@@ -372,7 +372,7 @@ func TestRecordAllNegativeValues(t *testing.T) {
 	resetAggs()
 
 	for _, v := range []float64{-5, -2, -9} {
-		record(Event{Name: "temp.delta", Value: v})
+		record(time.Now(), Event{Name: "temp.delta", Value: v})
 	}
 
 	a, ok := mergeAll("temp.delta")
@@ -498,7 +498,7 @@ func TestRecordEvictsStaleBuckets(t *testing.T) {
 	}
 	mu.Unlock()
 
-	record(Event{Name: "cpu.load", Value: 0.5})
+	record(time.Now(), Event{Name: "cpu.load", Value: 0.5})
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -507,6 +507,59 @@ func TestRecordEvictsStaleBuckets(t *testing.T) {
 	}
 	if got := len(aggs["cpu.load"]); got != 1 {
 		t.Errorf("series has %d buckets, want 1 (just the current one)", got)
+	}
+}
+
+// The end-to-end windowing story, driven by a synthetic clock: as time
+// advances, older events roll out of the query window, and a write
+// physically evicts the buckets that have aged past retention.
+// record() and windowStart() take `now` as a parameter, so this needs no
+// real sleeping and no global clock.
+func TestWindowRollsAsClockAdvances(t *testing.T) {
+	resetAggs()
+	base := time.Now().Truncate(bucketWidth)
+
+	countAt := func(now time.Time) (int, bool) {
+		mu.Lock()
+		defer mu.Unlock()
+		m, ok := mergeBuckets(aggs["cpu.load"], windowStart(now, window))
+		return m.Count, ok
+	}
+
+	// t=0: two events land in the base bucket.
+	record(base, Event{Name: "cpu.load", Value: 1})
+	record(base, Event{Name: "cpu.load", Value: 3})
+	if c, ok := countAt(base); !ok || c != 2 {
+		t.Fatalf("t=0: count=%d ok=%v, want 2", c, ok)
+	}
+
+	// t=30s: a third event, new bucket, all three still in the 60s window.
+	t30 := base.Add(30 * time.Second)
+	record(t30, Event{Name: "cpu.load", Value: 5})
+	if c, _ := countAt(t30); c != 3 {
+		t.Errorf("t=30s: count=%d, want 3", c)
+	}
+
+	// t=75s: the base bucket (starts at t=0) is now past the 60s window
+	// once the cutoff is truncated to a bucket boundary -> excluded from
+	// the query, even though no write has evicted it yet.
+	t75 := base.Add(75 * time.Second)
+	if c, ok := countAt(t75); !ok || c != 1 {
+		t.Errorf("t=75s: count=%d ok=%v, want 1 (only the t=30s event)", c, ok)
+	}
+
+	// A write at t=75s evicts the stale base bucket from the map.
+	record(t75, Event{Name: "cpu.load", Value: 9})
+	mu.Lock()
+	_, stale := aggs["cpu.load"][base.Unix()]
+	mu.Unlock()
+	if stale {
+		t.Error("t=75s write did not evict the aged-out base bucket")
+	}
+
+	// t=150s: every remaining bucket is older than 60s -> no data.
+	if _, ok := countAt(base.Add(150 * time.Second)); ok {
+		t.Error("t=150s: ok=true, want false (all data aged out)")
 	}
 }
 
@@ -527,7 +580,7 @@ func TestRecordConcurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < perGoroutine; j++ {
-				record(Event{Name: "cpu.load", Value: 1})
+				record(time.Now(), Event{Name: "cpu.load", Value: 1})
 			}
 		}()
 	}
@@ -555,7 +608,7 @@ func TestRecordAndStatsConcurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < perWriter; j++ {
-				record(Event{Name: "cpu.load", Value: 1})
+				record(time.Now(), Event{Name: "cpu.load", Value: 1})
 			}
 		}()
 	}
@@ -580,21 +633,19 @@ func TestRecordAndStatsConcurrent(t *testing.T) {
 
 // --- small helpers, edge cases ---
 
-// windowStart must return a bucketWidth-aligned key no older than
-// (now - d - one bucket).
+// windowStart must return a bucketWidth-aligned key exactly d back from
+// now (rounded down to a bucket boundary).
 func TestWindowStartAligned(t *testing.T) {
+	now := time.Now()
 	d := 30 * time.Second
-	got := windowStart(d)
+	got := windowStart(now, d)
 
 	widthSec := int64(bucketWidth / time.Second)
 	if got%widthSec != 0 {
-		t.Errorf("windowStart(%s) = %d, not aligned to %ds", d, got, widthSec)
+		t.Errorf("windowStart = %d, not aligned to %ds", got, widthSec)
 	}
-
-	oldest := time.Now().Add(-d - bucketWidth).Unix()
-	newest := time.Now().Unix()
-	if got < oldest || got > newest {
-		t.Errorf("windowStart(%s) = %d, outside [%d, %d]", d, got, oldest, newest)
+	if want := now.Add(-d).Truncate(bucketWidth).Unix(); got != want {
+		t.Errorf("windowStart = %d, want %d", got, want)
 	}
 }
 
@@ -608,7 +659,7 @@ func TestEvictEmpty(t *testing.T) {
 func TestStatsHandlerAvgIsRaw(t *testing.T) {
 	resetAggs()
 	for _, v := range []float64{1, 2, 2} { // sum 5 / 3 = 1.666...
-		record(Event{Name: "cpu.load", Value: v})
+		record(time.Now(), Event{Name: "cpu.load", Value: v})
 	}
 
 	avg := getStats(t, "").Metrics["cpu.load"].Avg
