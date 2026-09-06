@@ -12,28 +12,21 @@ import (
 	"time"
 )
 
-// resetStore gives the package `store` a fresh, empty Store so each test
-// starts clean. (Next refactor step: each test holds its own *Store and
-// this goes away.)
-func resetStore() {
-	store = newStore()
-}
-
 // mergeAll folds every bucket for a metric, ignoring the time window.
 // Used by tests that check record()'s output regardless of wall-clock timing.
-func mergeAll(name string) (Agg, bool) {
-	return mergeBuckets(store.aggs[name], 0)
+func mergeAll(s *Store, name string) (Agg, bool) {
+	return mergeBuckets(s.aggs[name], 0)
 }
 
 // seedBucket injects a bucket straight into a metric's series, so a test
 // can place data at a chosen age without waiting on the clock.
-func seedBucket(name string, key int64, a *Agg) {
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	if store.aggs[name] == nil {
-		store.aggs[name] = map[int64]*Agg{}
+func seedBucket(s *Store, name string, key int64, a *Agg) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.aggs[name] == nil {
+		s.aggs[name] = map[int64]*Agg{}
 	}
-	store.aggs[name][key] = a
+	s.aggs[name][key] = a
 }
 
 // bucketAt returns the bucket key for "d ago" (d >= 0).
@@ -41,12 +34,12 @@ func bucketAt(d time.Duration) int64 {
 	return time.Now().Add(-d).Truncate(bucketWidth).Unix()
 }
 
-// getStats calls handleStats with the given query ("" or "?window=30s")
+// getStats calls s.handleStats with the given query ("" or "?window=30s")
 // and decodes the JSON response, failing the test on a non-200 or bad JSON.
-func getStats(t *testing.T, query string) StatsResponse {
+func getStats(t *testing.T, s *Store, query string) StatsResponse {
 	t.Helper()
 	rec := httptest.NewRecorder()
-	handleStats(rec, httptest.NewRequest(http.MethodGet, "/stats"+query, nil))
+	s.handleStats(rec, httptest.NewRequest(http.MethodGet, "/stats"+query, nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("stats %q: status = %d, want 200", query, rec.Code)
 	}
@@ -60,15 +53,15 @@ func getStats(t *testing.T, query string) StatsResponse {
 // --- unit test: the aggregation logic, no HTTP involved ---
 
 func TestRecordAggregates(t *testing.T) {
-	resetStore()
+	s := newStore()
 
 	for _, v := range []float64{0.8, 0.9, 0.3} {
-		store.record(time.Now(), Event{Name: "cpu.load", Value: v})
+		s.record(time.Now(), Event{Name: "cpu.load", Value: v})
 	}
 
 	// Events may land in one or two buckets depending on timing;
 	// mergeBuckets recombines them so the assertions hold either way.
-	a, ok := mergeAll("cpu.load")
+	a, ok := mergeAll(s, "cpu.load")
 	if !ok {
 		t.Fatal("expected data for cpu.load, got none")
 	}
@@ -87,13 +80,13 @@ func TestRecordAggregates(t *testing.T) {
 }
 
 func TestRecordSeedsMinMaxFromFirstValue(t *testing.T) {
-	resetStore()
+	s := newStore()
 
 	// All values are positive; a buggy seed of 0 would make Min stay 0.
-	store.record(time.Now(), Event{Name: "latency", Value: 5})
-	store.record(time.Now(), Event{Name: "latency", Value: 8})
+	s.record(time.Now(), Event{Name: "latency", Value: 5})
+	s.record(time.Now(), Event{Name: "latency", Value: 8})
 
-	a, ok := mergeAll("latency")
+	a, ok := mergeAll(s, "latency")
 	if !ok {
 		t.Fatal("expected data for latency, got none")
 	}
@@ -103,80 +96,80 @@ func TestRecordSeedsMinMaxFromFirstValue(t *testing.T) {
 }
 
 func TestRecordKeepsMetricsSeparate(t *testing.T) {
-	resetStore()
+	s := newStore()
 
-	store.record(time.Now(), Event{Name: "cpu.load", Value: 1})
-	store.record(time.Now(), Event{Name: "memory.used", Value: 512})
+	s.record(time.Now(), Event{Name: "cpu.load", Value: 1})
+	s.record(time.Now(), Event{Name: "memory.used", Value: 512})
 
-	cpu, cpuOK := mergeAll("cpu.load")
-	mem, memOK := mergeAll("memory.used")
+	cpu, cpuOK := mergeAll(s, "cpu.load")
+	mem, memOK := mergeAll(s, "memory.used")
 	if !cpuOK || !memOK || cpu.Count != 1 || mem.Count != 1 {
-		t.Errorf("metrics bled into each other: %+v", store.aggs)
+		t.Errorf("metrics bled into each other: %+v", s.aggs)
 	}
 }
 
 // --- handler tests: exercise the HTTP layer with httptest ---
 
 func TestIngestHandlerValid(t *testing.T) {
-	resetStore()
+	s := newStore()
 
 	body := `{"name":"cpu.load","value":0.8,"type":"gauge","ts":1735000000123}`
 	req := httptest.NewRequest(http.MethodPost, "/ingest", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 
-	handleIngest(rec, req)
+	s.handleIngest(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
-	a, ok := mergeAll("cpu.load")
+	a, ok := mergeAll(s, "cpu.load")
 	if !ok || a.Count != 1 {
-		t.Errorf("event was not recorded: %+v", store.aggs)
+		t.Errorf("event was not recorded: %+v", s.aggs)
 	}
 }
 
 func TestIngestHandlerInvalidJSON(t *testing.T) {
-	resetStore()
+	s := newStore()
 
 	req := httptest.NewRequest(http.MethodPost, "/ingest", strings.NewReader(`{"name":`))
 	rec := httptest.NewRecorder()
 
-	handleIngest(rec, req)
+	s.handleIngest(rec, req)
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rec.Code)
 	}
-	if len(store.aggs) != 0 {
-		t.Errorf("nothing should have been recorded, got %+v", store.aggs)
+	if len(s.aggs) != 0 {
+		t.Errorf("nothing should have been recorded, got %+v", s.aggs)
 	}
 }
 
 // The io.ReadAll error branch: a request body that fails mid-read.
 func TestIngestHandlerBodyReadError(t *testing.T) {
-	resetStore()
+	s := newStore()
 
 	body := iotest.ErrReader(errors.New("connection reset"))
 	req := httptest.NewRequest(http.MethodPost, "/ingest", body)
 	rec := httptest.NewRecorder()
 
-	handleIngest(rec, req)
+	s.handleIngest(rec, req)
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rec.Code)
 	}
-	if len(store.aggs) != 0 {
-		t.Errorf("nothing should have been recorded, got %+v", store.aggs)
+	if len(s.aggs) != 0 {
+		t.Errorf("nothing should have been recorded, got %+v", s.aggs)
 	}
 }
 
 // An empty body is not valid JSON ("unexpected end of JSON input").
 func TestIngestHandlerEmptyBody(t *testing.T) {
-	resetStore()
+	s := newStore()
 
 	req := httptest.NewRequest(http.MethodPost, "/ingest", strings.NewReader(""))
 	rec := httptest.NewRecorder()
 
-	handleIngest(rec, req)
+	s.handleIngest(rec, req)
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rec.Code)
@@ -186,12 +179,12 @@ func TestIngestHandlerEmptyBody(t *testing.T) {
 // "null" is valid JSON and unmarshals to a zero Event - which the name
 // check must then reject, not the JSON check.
 func TestIngestHandlerNullBody(t *testing.T) {
-	resetStore()
+	s := newStore()
 
 	req := httptest.NewRequest(http.MethodPost, "/ingest", strings.NewReader("null"))
 	rec := httptest.NewRecorder()
 
-	handleIngest(rec, req)
+	s.handleIngest(rec, req)
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rec.Code)
@@ -202,11 +195,11 @@ func TestIngestHandlerNullBody(t *testing.T) {
 }
 
 func TestStatsHandlerOutput(t *testing.T) {
-	resetStore()
-	store.record(time.Now(), Event{Name: "cpu.load", Value: 0.8})
-	store.record(time.Now(), Event{Name: "cpu.load", Value: 0.4})
+	s := newStore()
+	s.record(time.Now(), Event{Name: "cpu.load", Value: 0.8})
+	s.record(time.Now(), Event{Name: "cpu.load", Value: 0.4})
 
-	m := getStats(t, "").Metrics["cpu.load"]
+	m := getStats(t, s, "").Metrics["cpu.load"]
 	if m.Count != 2 || m.Min != 0.4 || m.Max != 0.8 {
 		t.Errorf("got %+v, want count=2 min=0.4 max=0.8", m)
 	}
@@ -216,9 +209,9 @@ func TestStatsHandlerOutput(t *testing.T) {
 }
 
 func TestStatsHandlerContentType(t *testing.T) {
-	resetStore()
+	s := newStore()
 	rec := httptest.NewRecorder()
-	handleStats(rec, httptest.NewRequest(http.MethodGet, "/stats", nil))
+	s.handleStats(rec, httptest.NewRequest(http.MethodGet, "/stats", nil))
 
 	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
 		t.Errorf("Content-Type = %q, want application/json", ct)
@@ -227,10 +220,10 @@ func TestStatsHandlerContentType(t *testing.T) {
 
 // A valid ?window= is accepted, echoed back, and returns the metric.
 func TestStatsHandlerAcceptsWindowParam(t *testing.T) {
-	resetStore()
-	store.record(time.Now(), Event{Name: "cpu.load", Value: 1})
+	s := newStore()
+	s.record(time.Now(), Event{Name: "cpu.load", Value: 1})
 
-	resp := getStats(t, "?window=30s")
+	resp := getStats(t, s, "?window=30s")
 	if resp.Window != "30s" {
 		t.Errorf("Window = %q, want %q", resp.Window, "30s")
 	}
@@ -240,13 +233,13 @@ func TestStatsHandlerAcceptsWindowParam(t *testing.T) {
 }
 
 func TestStatsHandlerRejectsBadWindow(t *testing.T) {
-	resetStore()
+	s := newStore()
 
 	for _, q := range []string{"window=abc", "window=0s", "window=-5s", "window=10m"} {
 		req := httptest.NewRequest(http.MethodGet, "/stats?"+q, nil)
 		rec := httptest.NewRecorder()
 
-		handleStats(rec, req)
+		s.handleStats(rec, req)
 
 		if rec.Code != http.StatusBadRequest {
 			t.Errorf("%s: status = %d, want 400", q, rec.Code)
@@ -259,11 +252,11 @@ func TestStatsHandlerRejectsBadWindow(t *testing.T) {
 // A bucket older than the default window must not show up in /stats,
 // even though it's still physically in the map until the next write evicts it.
 func TestStatsHandlerExcludesStaleBuckets(t *testing.T) {
-	resetStore()
-	seedBucket("cpu.load", bucketAt(0), &Agg{Count: 2, Sum: 4, Min: 2, Max: 2})
-	seedBucket("cpu.load", bucketAt(2*time.Minute), &Agg{Count: 9, Sum: 900, Min: 100, Max: 100})
+	s := newStore()
+	seedBucket(s, "cpu.load", bucketAt(0), &Agg{Count: 2, Sum: 4, Min: 2, Max: 2})
+	seedBucket(s, "cpu.load", bucketAt(2*time.Minute), &Agg{Count: 9, Sum: 900, Min: 100, Max: 100})
 
-	m := getStats(t, "").Metrics["cpu.load"]
+	m := getStats(t, s, "").Metrics["cpu.load"]
 	if m.Count != 2 || m.Avg != 2 || m.Min != 2 || m.Max != 2 {
 		t.Errorf("stale bucket leaked: got %+v, want count=2 avg/min/max=2", m)
 	}
@@ -272,14 +265,14 @@ func TestStatsHandlerExcludesStaleBuckets(t *testing.T) {
 // A shorter ?window= must actually narrow the result, dropping buckets
 // that the default window would have included.
 func TestStatsHandlerWindowParamNarrows(t *testing.T) {
-	resetStore()
-	seedBucket("m", bucketAt(0), &Agg{Count: 1, Sum: 1, Min: 1, Max: 1})
-	seedBucket("m", bucketAt(30*time.Second), &Agg{Count: 1, Sum: 5, Min: 5, Max: 5})
+	s := newStore()
+	seedBucket(s, "m", bucketAt(0), &Agg{Count: 1, Sum: 1, Min: 1, Max: 1})
+	seedBucket(s, "m", bucketAt(30*time.Second), &Agg{Count: 1, Sum: 5, Min: 5, Max: 5})
 
-	if got := getStats(t, "").Metrics["m"].Count; got != 2 {
+	if got := getStats(t, s, "").Metrics["m"].Count; got != 2 {
 		t.Errorf("default window: count = %d, want 2", got)
 	}
-	narrowed := getStats(t, "?window=15s").Metrics["m"]
+	narrowed := getStats(t, s, "?window=15s").Metrics["m"]
 	if narrowed.Count != 1 || narrowed.Avg != 1 {
 		t.Errorf("15s window: got %+v, want count=1 avg=1 (30s-old bucket excluded)", narrowed)
 	}
@@ -288,20 +281,20 @@ func TestStatsHandlerWindowParamNarrows(t *testing.T) {
 // --- /stats shape: empty and multi-metric ---
 
 func TestStatsHandlerEmpty(t *testing.T) {
-	resetStore()
+	s := newStore()
 
-	resp := getStats(t, "")
+	resp := getStats(t, s, "")
 	if len(resp.Metrics) != 0 {
 		t.Errorf("Metrics = %+v, want empty", resp.Metrics)
 	}
 }
 
 func TestStatsHandlerMultipleMetrics(t *testing.T) {
-	resetStore()
-	store.record(time.Now(), Event{Name: "cpu.load", Value: 1})
-	store.record(time.Now(), Event{Name: "memory.used", Value: 512})
+	s := newStore()
+	s.record(time.Now(), Event{Name: "cpu.load", Value: 1})
+	s.record(time.Now(), Event{Name: "memory.used", Value: 512})
 
-	m := getStats(t, "").Metrics
+	m := getStats(t, s, "").Metrics
 	if m["cpu.load"].Count != 1 || m["memory.used"].Count != 1 {
 		t.Errorf("got %+v, want both metrics at count=1", m)
 	}
@@ -328,18 +321,18 @@ func TestHealthHandler(t *testing.T) {
 // A body missing non-Name fields is NOT rejected (DESIGN.md §7) - the
 // absent fields stay at their zero values and the event still records.
 func TestRecordMissingFieldsUsesZeroValues(t *testing.T) {
-	resetStore()
+	s := newStore()
 
 	body := `{"name":"cpu.load"}` // no value, ts, or type
 	req := httptest.NewRequest(http.MethodPost, "/ingest", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 
-	handleIngest(rec, req)
+	s.handleIngest(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (missing fields are allowed)", rec.Code)
 	}
-	a, ok := mergeAll("cpu.load")
+	a, ok := mergeAll(s, "cpu.load")
 	if !ok || a.Count != 1 || a.Sum != 0 {
 		t.Errorf("got %+v, want Count=1 Sum=0 (value defaulted to 0)", a)
 	}
@@ -348,33 +341,33 @@ func TestRecordMissingFieldsUsesZeroValues(t *testing.T) {
 // Name is the one field with no sane zero-value default (DESIGN.md §12) -
 // an event with no name, or an explicitly empty one, is rejected.
 func TestIngestHandlerRejectsMissingName(t *testing.T) {
-	resetStore()
+	s := newStore()
 
 	for _, body := range []string{`{"value":1}`, `{"name":"","value":1}`} {
 		req := httptest.NewRequest(http.MethodPost, "/ingest", strings.NewReader(body))
 		rec := httptest.NewRecorder()
 
-		handleIngest(rec, req)
+		s.handleIngest(rec, req)
 
 		if rec.Code != http.StatusBadRequest {
 			t.Errorf("body %s: status = %d, want 400", body, rec.Code)
 		}
 	}
-	if len(store.aggs) != 0 {
-		t.Errorf("nothing should have been recorded, got %+v", store.aggs)
+	if len(s.aggs) != 0 {
+		t.Errorf("nothing should have been recorded, got %+v", s.aggs)
 	}
 }
 
 // Min/Max must track real extremes even when every value is negative -
 // a seed of 0 would leave Max wrongly at 0 (DESIGN.md §4).
 func TestRecordAllNegativeValues(t *testing.T) {
-	resetStore()
+	s := newStore()
 
 	for _, v := range []float64{-5, -2, -9} {
-		store.record(time.Now(), Event{Name: "temp.delta", Value: v})
+		s.record(time.Now(), Event{Name: "temp.delta", Value: v})
 	}
 
-	a, ok := mergeAll("temp.delta")
+	a, ok := mergeAll(s, "temp.delta")
 	if !ok {
 		t.Fatal("expected data for temp.delta, got none")
 	}
@@ -489,22 +482,22 @@ func TestEvict(t *testing.T) {
 // An ancient bucket is injected, then one live event is recorded; the
 // ancient bucket should be gone and only the current one should remain.
 func TestRecordEvictsStaleBuckets(t *testing.T) {
-	resetStore()
+	s := newStore()
 
-	store.mu.Lock()
-	store.aggs["cpu.load"] = map[int64]*Agg{
+	s.mu.Lock()
+	s.aggs["cpu.load"] = map[int64]*Agg{
 		1000: {Count: 99, Sum: 99, Min: 1, Max: 1}, // ancient
 	}
-	store.mu.Unlock()
+	s.mu.Unlock()
 
-	store.record(time.Now(), Event{Name: "cpu.load", Value: 0.5})
+	s.record(time.Now(), Event{Name: "cpu.load", Value: 0.5})
 
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	if _, ok := store.aggs["cpu.load"][1000]; ok {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.aggs["cpu.load"][1000]; ok {
 		t.Error("ancient bucket 1000 survived a record() call")
 	}
-	if got := len(store.aggs["cpu.load"]); got != 1 {
+	if got := len(s.aggs["cpu.load"]); got != 1 {
 		t.Errorf("series has %d buckets, want 1 (just the current one)", got)
 	}
 }
@@ -515,26 +508,26 @@ func TestRecordEvictsStaleBuckets(t *testing.T) {
 // record() and windowStart() take `now` as a parameter, so this needs no
 // real sleeping and no global clock.
 func TestWindowRollsAsClockAdvances(t *testing.T) {
-	resetStore()
+	s := newStore()
 	base := time.Now().Truncate(bucketWidth)
 
 	countAt := func(now time.Time) (int, bool) {
-		store.mu.Lock()
-		defer store.mu.Unlock()
-		m, ok := mergeBuckets(store.aggs["cpu.load"], windowStart(now, window))
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		m, ok := mergeBuckets(s.aggs["cpu.load"], windowStart(now, window))
 		return m.Count, ok
 	}
 
 	// t=0: two events land in the base bucket.
-	store.record(base, Event{Name: "cpu.load", Value: 1})
-	store.record(base, Event{Name: "cpu.load", Value: 3})
+	s.record(base, Event{Name: "cpu.load", Value: 1})
+	s.record(base, Event{Name: "cpu.load", Value: 3})
 	if c, ok := countAt(base); !ok || c != 2 {
 		t.Fatalf("t=0: count=%d ok=%v, want 2", c, ok)
 	}
 
 	// t=30s: a third event, new bucket, all three still in the 60s window.
 	t30 := base.Add(30 * time.Second)
-	store.record(t30, Event{Name: "cpu.load", Value: 5})
+	s.record(t30, Event{Name: "cpu.load", Value: 5})
 	if c, _ := countAt(t30); c != 3 {
 		t.Errorf("t=30s: count=%d, want 3", c)
 	}
@@ -548,10 +541,10 @@ func TestWindowRollsAsClockAdvances(t *testing.T) {
 	}
 
 	// A write at t=75s evicts the stale base bucket from the map.
-	store.record(t75, Event{Name: "cpu.load", Value: 9})
-	store.mu.Lock()
-	_, stale := store.aggs["cpu.load"][base.Unix()]
-	store.mu.Unlock()
+	s.record(t75, Event{Name: "cpu.load", Value: 9})
+	s.mu.Lock()
+	_, stale := s.aggs["cpu.load"][base.Unix()]
+	s.mu.Unlock()
 	if stale {
 		t.Error("t=75s write did not evict the aged-out base bucket")
 	}
@@ -569,7 +562,7 @@ func TestWindowRollsAsClockAdvances(t *testing.T) {
 // or panics on concurrent map writes; with it, the total is exact.
 // Run with `go test -race` for true data-race detection.
 func TestRecordConcurrent(t *testing.T) {
-	resetStore()
+	s := newStore()
 
 	const goroutines, perGoroutine = 50, 200
 
@@ -579,14 +572,14 @@ func TestRecordConcurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < perGoroutine; j++ {
-				store.record(time.Now(), Event{Name: "cpu.load", Value: 1})
+				s.record(time.Now(), Event{Name: "cpu.load", Value: 1})
 			}
 		}()
 	}
 	wg.Wait()
 
 	want := goroutines * perGoroutine
-	m, ok := mergeAll("cpu.load")
+	m, ok := mergeAll(s, "cpu.load")
 	if !ok || m.Count != want {
 		t.Errorf("Count = %d, want %d (lost updates - mutex not protecting?)", m.Count, want)
 	}
@@ -597,7 +590,7 @@ func TestRecordConcurrent(t *testing.T) {
 // process even without -race, so this fails hard if handleStats drops the
 // lock. The final count must still be exact.
 func TestRecordAndStatsConcurrent(t *testing.T) {
-	resetStore()
+	s := newStore()
 
 	const writers, perWriter, readers, perReader = 20, 100, 5, 200
 
@@ -607,7 +600,7 @@ func TestRecordAndStatsConcurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < perWriter; j++ {
-				store.record(time.Now(), Event{Name: "cpu.load", Value: 1})
+				s.record(time.Now(), Event{Name: "cpu.load", Value: 1})
 			}
 		}()
 	}
@@ -617,14 +610,14 @@ func TestRecordAndStatsConcurrent(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < perReader; j++ {
 				rec := httptest.NewRecorder()
-				handleStats(rec, httptest.NewRequest(http.MethodGet, "/stats", nil))
+				s.handleStats(rec, httptest.NewRequest(http.MethodGet, "/stats", nil))
 			}
 		}()
 	}
 	wg.Wait()
 
 	want := writers * perWriter
-	m, ok := mergeAll("cpu.load")
+	m, ok := mergeAll(s, "cpu.load")
 	if !ok || m.Count != want {
 		t.Errorf("Count = %d, want %d", m.Count, want)
 	}
@@ -656,12 +649,12 @@ func TestEvictEmpty(t *testing.T) {
 
 // Avg is served raw (exact Sum/Count), not rounded - the caller formats it.
 func TestStatsHandlerAvgIsRaw(t *testing.T) {
-	resetStore()
+	s := newStore()
 	for _, v := range []float64{1, 2, 2} { // sum 5 / 3 = 1.666...
-		store.record(time.Now(), Event{Name: "cpu.load", Value: v})
+		s.record(time.Now(), Event{Name: "cpu.load", Value: v})
 	}
 
-	avg := getStats(t, "").Metrics["cpu.load"].Avg
+	avg := getStats(t, s, "").Metrics["cpu.load"].Avg
 	if want := 5.0 / 3.0; avg != want {
 		t.Errorf("avg = %v, want %v (exact, unrounded)", avg, want)
 	}
@@ -671,14 +664,15 @@ func TestStatsHandlerAvgIsRaw(t *testing.T) {
 
 // A wrong method gets 405 plus the Allow header the HTTP spec requires.
 func TestAllowRejectsWrongMethod(t *testing.T) {
+	s := newStore()
 	cases := []struct {
 		name          string
 		handler       http.HandlerFunc
 		allowed, sent string
 	}{
 		{"health", handleHealth, http.MethodGet, http.MethodPost},
-		{"ingest", handleIngest, http.MethodPost, http.MethodGet},
-		{"stats", handleStats, http.MethodGet, http.MethodDelete},
+		{"ingest", s.handleIngest, http.MethodPost, http.MethodGet},
+		{"stats", s.handleStats, http.MethodGet, http.MethodDelete},
 	}
 
 	for _, c := range cases {

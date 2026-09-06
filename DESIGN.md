@@ -65,7 +65,7 @@ When a metric is first seen: `a = &Agg{Min: ev.Value, Max: ev.Value}`.
 
 ### 5. One mutex around the whole map
 
-A `sync.Mutex` guards every read and write of `aggs`.
+A `sync.Mutex` guards every read and write of the aggregate map.
 
 - `net/http` runs each request on its own goroutine. Two concurrent `/ingest`
   calls writing the map — or `/stats` reading while `/ingest` writes — is a
@@ -74,8 +74,28 @@ A `sync.Mutex` guards every read and write of `aggs`.
   "one at a time," which is what removes the race.
 - **Why one coarse lock, not per-metric locks:** the critical sections are a
   handful of arithmetic ops — nanoseconds. Contention isn't a real problem at
-  this scale, and one lock is far easier to reason about. Revisit only if
-  profiling shows lock contention.
+  this scale, and one lock is far easier to reason about.
+- **Known scaling limit:** every ingest and every query contends on this one
+  lock, so it is the throughput ceiling once the load harness arrives — a
+  single global lock serializes exactly the concurrency the project means to
+  showcase. The fix when it matters: shard the map (and its lock) by metric
+  name, so writes to different metrics don't block each other. Not worth the
+  complexity until a profile says so.
+
+### 5a. State lives on a `Store`, not in package globals
+
+`mu` and the aggregate map are fields of a `Store` struct; `record`,
+`handleIngest`, and `handleStats` are methods on `*Store`. `main` creates one
+`Store` and closes the handlers over it.
+
+- **Why:** package-level `var mu, aggs` meant every function reached into
+  shared global state invisibly, and two independent engines (a server plus a
+  test, or two tests) couldn't coexist. A `Store` makes state a value you
+  hold — each test gets a fresh one from `newStore()` with no reset dance, and
+  it's the seam a future lock-shard (§5) would slot into.
+- **What stayed a free function:** `mergeBuckets`, `evict`, `windowStart` —
+  they operate only on their arguments (a bucket map, a cutoff, a time), never
+  on `Store` fields, so a method receiver there would be dead weight.
 
 ### 6. Route registration before `ListenAndServe`
 

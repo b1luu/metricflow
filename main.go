@@ -50,11 +50,6 @@ const (
 	//                                        how far back buckets are retained
 )
 
-// store holds all metric state for the running server. Temporary package
-// global: handlers still reach for it directly until they close over a
-// *Store of their own (next refactor step).
-var store = newStore()
-
 // record folds one event into its metric's running aggregate. now is the
 // operation's timestamp, passed in (not read here) so one call uses one
 // consistent clock reading and tests can drive it directly.
@@ -158,7 +153,7 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleIngest: POST /ingest - accept one metric event as a JSON body.
-func handleIngest(w http.ResponseWriter, r *http.Request) {
+func (s *Store) handleIngest(w http.ResponseWriter, r *http.Request) {
 	// Read the whole request body into a []byte.
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -188,7 +183,7 @@ func handleIngest(w http.ResponseWriter, r *http.Request) {
 	fmt.Printf("parsed event: name=%s value=%.2f type=%s ts=%d\n",
 		ev.Name, ev.Value, ev.Type, ev.TS)
 
-	store.record(time.Now(), ev)
+	s.record(time.Now(), ev)
 	fmt.Fprintln(w, "got it")
 }
 
@@ -211,7 +206,7 @@ type StatsResponse struct {
 // handleStats: GET /stats - per-metric aggregate over a time window, as JSON.
 // Optional ?window=30s (Go duration syntax); defaults to the full
 // retention window, and may not exceed it (older data is already evicted).
-func handleStats(w http.ResponseWriter, r *http.Request) {
+func (s *Store) handleStats(w http.ResponseWriter, r *http.Request) {
 	win := window
 	if q := r.URL.Query().Get("window"); q != "" {
 		d, err := time.ParseDuration(q)
@@ -229,8 +224,8 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 	cutoff := windowStart(time.Now(), win)
 	resp := StatsResponse{Window: win.String(), Metrics: map[string]MetricStats{}}
 
-	store.mu.Lock()
-	for name, series := range store.aggs {
+	s.mu.Lock()
+	for name, series := range s.aggs {
 		m, ok := mergeBuckets(series, cutoff)
 		if !ok {
 			continue // no data inside the window
@@ -242,16 +237,18 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 			Max:   m.Max,
 		}
 	}
-	store.mu.Unlock()
+	s.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
 
 func main() {
+	s := newStore()
+
 	http.HandleFunc("/health", allow(http.MethodGet, handleHealth))
-	http.HandleFunc("/ingest", allow(http.MethodPost, handleIngest))
-	http.HandleFunc("/stats", allow(http.MethodGet, handleStats))
+	http.HandleFunc("/ingest", allow(http.MethodPost, s.handleIngest))
+	http.HandleFunc("/stats", allow(http.MethodGet, s.handleStats))
 
 	// Register routes above, THEN start the server - ListenAndServe
 	// blocks forever, so anything after it would never run.
