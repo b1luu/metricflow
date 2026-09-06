@@ -25,7 +25,8 @@ Listens on `:8080`.
 
 `/stats` accepts an optional `?window=` (Go duration, e.g. `?window=30s`),
 capped at the 60-second retention window. `/ingest` requires a non-empty
-`name`; other fields default to their zero value if omitted.
+`name`; other fields default to their zero value if omitted. Each route
+accepts only the method shown above — anything else returns `405`.
 
 Event body:
 

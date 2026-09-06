@@ -624,3 +624,43 @@ func TestStatsHandlerAverageRounding(t *testing.T) {
 		t.Errorf("body = %q, want avg=1.67 (5/3 rounded)", rec.Body.String())
 	}
 }
+
+// --- method enforcement ---
+
+// A wrong method gets 405 plus the Allow header the HTTP spec requires.
+func TestAllowRejectsWrongMethod(t *testing.T) {
+	cases := []struct {
+		name          string
+		handler       http.HandlerFunc
+		allowed, sent string
+	}{
+		{"health", handleHealth, http.MethodGet, http.MethodPost},
+		{"ingest", handleIngest, http.MethodPost, http.MethodGet},
+		{"stats", handleStats, http.MethodGet, http.MethodDelete},
+	}
+
+	for _, c := range cases {
+		h := allow(c.allowed, c.handler)
+		rec := httptest.NewRecorder()
+		h(rec, httptest.NewRequest(c.sent, "/"+c.name, nil))
+
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Errorf("%s: status = %d, want 405", c.name, rec.Code)
+		}
+		if got := rec.Header().Get("Allow"); got != c.allowed {
+			t.Errorf("%s: Allow = %q, want %q", c.name, got, c.allowed)
+		}
+	}
+}
+
+// The allowed method passes straight through to the wrapped handler.
+func TestAllowPassesThroughCorrectMethod(t *testing.T) {
+	called := false
+	h := allow(http.MethodGet, func(http.ResponseWriter, *http.Request) { called = true })
+
+	h(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/x", nil))
+
+	if !called {
+		t.Error("wrapped handler was not called for the allowed method")
+	}
+}

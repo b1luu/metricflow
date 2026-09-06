@@ -190,6 +190,25 @@ zero-value-is-fine behavior from §7.
   validation step stays the readable, single place where "what makes an
   event acceptable" is decided — the natural spot to add more rules later.
 
+### 13. One method per route, enforced by an `allow` wrapper
+
+Each route accepts exactly one method (`GET /health`, `POST /ingest`,
+`GET /stats`). Anything else returns `405 Method Not Allowed` with an `Allow`
+header naming the permitted method (the HTTP spec requires that header on a
+405).
+
+- **Why a wrapper, not a check in each handler:** `allow(method, handler)`
+  returns a handler that does the method check, then calls through. Three
+  routes need identical logic and the roadmap adds more, so the decorator
+  pays for itself immediately — and it keeps the method policy visible in
+  `main()` at the routing table (`allow(http.MethodPost, handleIngest)`)
+  rather than buried in handler bodies.
+- **Why exact-match, not "GET implies HEAD":** simpler, and nothing here
+  needs HEAD. If a real client needs it later, the wrapper is the one place
+  to teach it.
+- **405 vs 404:** the path exists, the method doesn't — 405 tells the caller
+  "right URL, wrong verb" instead of sending them hunting for a typo.
+
 ## Testing
 
 See `main_test.go`. The strategy:

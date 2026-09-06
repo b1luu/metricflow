@@ -123,6 +123,21 @@ func windowStart(d time.Duration) int64 {
 	return time.Now().Add(-d).Truncate(bucketWidth).Unix()
 }
 
+// allow wraps a handler so it only runs for one HTTP method. Anything
+// else gets 405 with an Allow header, which the HTTP spec requires on a
+// 405 response. This is the decorator pattern: a func that takes a
+// handler and returns a wrapped one.
+func allow(method string, h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != method {
+			w.Header().Set("Allow", method)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		h(w, r)
+	}
+}
+
 // handleHealth: GET /health - liveness check, proves the server is up.
 func handleHealth(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "ok")
@@ -198,9 +213,9 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	http.HandleFunc("/health", handleHealth)
-	http.HandleFunc("/ingest", handleIngest)
-	http.HandleFunc("/stats", handleStats)
+	http.HandleFunc("/health", allow(http.MethodGet, handleHealth))
+	http.HandleFunc("/ingest", allow(http.MethodPost, handleIngest))
+	http.HandleFunc("/stats", allow(http.MethodGet, handleStats))
 
 	// Register routes above, THEN start the server - ListenAndServe
 	// blocks forever, so anything after it would never run.
