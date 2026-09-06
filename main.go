@@ -5,7 +5,7 @@ import (
 	"fmt"           // formatted printing (stdout + http responses)
 	"io"            // io.ReadAll, to slurp the request body
 	"net/http"      // the HTTP server and routing
-	"sync"          // Mutex, to guard the shared aggs map
+	"sync"          // Mutex, to guard the Store's aggs map
 	"time"
 )
 
@@ -50,13 +50,10 @@ const (
 	//                                        how far back buckets are retained
 )
 
-// aggs maps metric name -> its Agg. *Agg (pointer) so we fetch the real
-// struct and modify it in place; a value map would hand back a copy.
-// mu guards aggs - HTTP handlers run concurrently on separate goroutines.
-var (
-	mu   sync.Mutex
-	aggs = make(map[string]map[int64]*Agg)
-)
+// store holds all metric state for the running server. Temporary package
+// global: handlers still reach for it directly until they close over a
+// *Store of their own (next refactor step).
+var store = newStore()
 
 // record folds one event into its metric's running aggregate. now is the
 // operation's timestamp, passed in (not read here) so one call uses one
@@ -64,16 +61,16 @@ var (
 // Using ev.TS (event time) instead would mean handling out-of-order,
 // duplicate, and future-dated events — deferred to the event-time
 // milestone. See DESIGN.md §9.
-func record(now time.Time, ev Event) {
+func (s *Store) record(now time.Time, ev Event) {
 	bucket := now.Truncate(bucketWidth).Unix()
 
-	mu.Lock()
-	defer mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	series := aggs[ev.Name]
+	series := s.aggs[ev.Name]
 	if series == nil {
 		series = make(map[int64]*Agg)
-		aggs[ev.Name] = series
+		s.aggs[ev.Name] = series
 	}
 
 	a := series[bucket]
@@ -99,7 +96,8 @@ func record(now time.Time, ev Event) {
 }
 
 // evict deletes buckets older than cutoff from a metric's series.
-// Deleting keys during a range loop is safe in Go. Caller must hold mu.
+// Deleting keys during a range loop is safe in Go. Caller must hold the
+// Store lock. (Pure map surgery - stays a free function, no Store needed.)
 func evict(series map[int64]*Agg, cutoff int64) {
 	for bucket := range series {
 		if bucket < cutoff {
@@ -111,7 +109,8 @@ func evict(series map[int64]*Agg, cutoff int64) {
 // mergeBuckets folds a metric's per-bucket Aggs into one combined Agg,
 // ignoring any bucket whose key (its start time, unix seconds) is older
 // than cutoff. Pass cutoff <= 0 to include every bucket.
-// The bool is false when no bucket qualifies. Caller must hold mu.
+// The bool is false when no bucket qualifies. Caller must hold the Store
+// lock. (Pure read over the passed map - stays a free function.)
 func mergeBuckets(series map[int64]*Agg, cutoff int64) (Agg, bool) {
 	var merged Agg
 	first := true
@@ -189,7 +188,7 @@ func handleIngest(w http.ResponseWriter, r *http.Request) {
 	fmt.Printf("parsed event: name=%s value=%.2f type=%s ts=%d\n",
 		ev.Name, ev.Value, ev.Type, ev.TS)
 
-	record(time.Now(), ev)
+	store.record(time.Now(), ev)
 	fmt.Fprintln(w, "got it")
 }
 
@@ -230,8 +229,8 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 	cutoff := windowStart(time.Now(), win)
 	resp := StatsResponse{Window: win.String(), Metrics: map[string]MetricStats{}}
 
-	mu.Lock()
-	for name, series := range aggs {
+	store.mu.Lock()
+	for name, series := range store.aggs {
 		m, ok := mergeBuckets(series, cutoff)
 		if !ok {
 			continue // no data inside the window
@@ -243,7 +242,7 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 			Max:   m.Max,
 		}
 	}
-	mu.Unlock()
+	store.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
