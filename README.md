@@ -21,7 +21,7 @@ Listens on `:8080`.
 | ------ | --------- | ------------------------------------------------------ |
 | GET    | `/health` | Liveness check. Returns `ok`.                          |
 | POST   | `/ingest` | Submit one metric event as a JSON body.                |
-| GET    | `/stats`  | Per-metric aggregate over a time window (default 60s). |
+| GET    | `/stats`  | Per-metric aggregate over a time window (JSON, default 60s). |
 
 `/stats` accepts an optional `?window=` (Go duration, e.g. `?window=30s`),
 capped at the 60-second retention window. `/ingest` requires a non-empty
@@ -39,7 +39,7 @@ Event body:
 ```
 curl.exe -X POST localhost:8080/ingest -d '{"name":"cpu.load","value":0.8,"type":"gauge","ts":1735000000123}'
 curl.exe localhost:8080/stats
-# cpu.load: count=1 avg=0.80 min=0.80 max=0.80
+# {"window":"1m0s","metrics":{"cpu.load":{"count":1,"avg":0.8,"min":0.8,"max":0.8}}}
 ```
 
 On Windows PowerShell, use `curl.exe` (not `curl`, which is an alias for

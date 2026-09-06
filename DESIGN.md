@@ -209,6 +209,29 @@ header naming the permitted method (the HTTP spec requires that header on a
 - **405 vs 404:** the path exists, the method doesn't — 405 tells the caller
   "right URL, wrong verb" instead of sending them hunting for a typo.
 
+### 14. `/stats` responds with JSON
+
+`/stats` returns a JSON object — `{"window": "1m0s", "metrics": {"<name>":
+{"count", "avg", "min", "max"}}}` — with `Content-Type: application/json`.
+The old line-per-metric plaintext was always a placeholder.
+
+- **Why JSON, no negotiation:** this is the "fast queries out" side of the
+  system; the consumer is a program (dashboard, alerting loop, the future
+  load harness), not a person reading a terminal. One machine format beats a
+  format the caller has to parse with a regex. `Accept`-header negotiation
+  would be real complexity for a human-readability nicety nothing needs yet.
+- **Why echo `window` back:** the caller may have sent `?window=`, or hit the
+  default, or the value may later get clamped — the response says exactly
+  which window the numbers cover, so the client isn't guessing.
+- **Why `avg` is served raw** (`0.6000000000000001`, not `0.60`): rounding is
+  a display concern and the client owns display. Rounding server-side throws
+  away precision that a caller doing its own math (e.g. alert thresholds)
+  might want. `min`/`max`/`count` are already exact.
+- **Why build the response under the lock but encode outside it:** copying
+  the numbers into a plain struct is fast; JSON-serialising and writing to
+  the socket is not. Holding `mu` across the write would block every
+  `record` call for the duration of a slow client's read.
+
 ## Testing
 
 See `main_test.go`. The strategy:

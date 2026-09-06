@@ -178,7 +178,23 @@ func handleIngest(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "got it")
 }
 
-// handleStats: GET /stats - per-metric aggregate over a time window.
+// MetricStats is one metric's aggregate in a /stats response. Avg is
+// derived (Sum/Count) and served raw; the caller rounds for display.
+type MetricStats struct {
+	Count int     `json:"count"`
+	Avg   float64 `json:"avg"`
+	Min   float64 `json:"min"`
+	Max   float64 `json:"max"`
+}
+
+// StatsResponse is the JSON body of GET /stats. Window echoes back the
+// window actually applied, so the caller knows what it's looking at.
+type StatsResponse struct {
+	Window  string                 `json:"window"`
+	Metrics map[string]MetricStats `json:"metrics"`
+}
+
+// handleStats: GET /stats - per-metric aggregate over a time window, as JSON.
 // Optional ?window=30s (Go duration syntax); defaults to the full
 // retention window, and may not exceed it (older data is already evicted).
 func handleStats(w http.ResponseWriter, r *http.Request) {
@@ -197,19 +213,25 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cutoff := windowStart(win)
+	resp := StatsResponse{Window: win.String(), Metrics: map[string]MetricStats{}}
 
 	mu.Lock()
-	defer mu.Unlock()
-
 	for name, series := range aggs {
 		m, ok := mergeBuckets(series, cutoff)
 		if !ok {
 			continue // no data inside the window
 		}
-		avg := m.Sum / float64(m.Count)
-		fmt.Fprintf(w, "%s: count=%d avg=%.2f min=%.2f max=%.2f\n",
-			name, m.Count, avg, m.Min, m.Max)
+		resp.Metrics[name] = MetricStats{
+			Count: m.Count,
+			Avg:   m.Sum / float64(m.Count),
+			Min:   m.Min,
+			Max:   m.Max,
+		}
 	}
+	mu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
 }
 
 func main() {

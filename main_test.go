@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -39,6 +40,22 @@ func seedBucket(name string, key int64, a *Agg) {
 // bucketAt returns the bucket key for "d ago" (d >= 0).
 func bucketAt(d time.Duration) int64 {
 	return time.Now().Add(-d).Truncate(bucketWidth).Unix()
+}
+
+// getStats calls handleStats with the given query ("" or "?window=30s")
+// and decodes the JSON response, failing the test on a non-200 or bad JSON.
+func getStats(t *testing.T, query string) StatsResponse {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	handleStats(rec, httptest.NewRequest(http.MethodGet, "/stats"+query, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("stats %q: status = %d, want 200", query, rec.Code)
+	}
+	var resp StatsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("stats %q: invalid JSON: %v (body %q)", query, err, rec.Body.String())
+	}
+	return resp
 }
 
 // --- unit test: the aggregation logic, no HTTP involved ---
@@ -190,34 +207,36 @@ func TestStatsHandlerOutput(t *testing.T) {
 	record(Event{Name: "cpu.load", Value: 0.8})
 	record(Event{Name: "cpu.load", Value: 0.4})
 
-	req := httptest.NewRequest(http.MethodGet, "/stats", nil)
-	rec := httptest.NewRecorder()
-
-	handleStats(rec, req)
-
-	out := rec.Body.String()
-	want := "cpu.load: count=2 avg=0.60 min=0.40 max=0.80"
-	if !strings.Contains(out, want) {
-		t.Errorf("stats output = %q, want it to contain %q", out, want)
+	m := getStats(t, "").Metrics["cpu.load"]
+	if m.Count != 2 || m.Min != 0.4 || m.Max != 0.8 {
+		t.Errorf("got %+v, want count=2 min=0.4 max=0.8", m)
+	}
+	if d := m.Avg - 0.6; d < -1e-9 || d > 1e-9 {
+		t.Errorf("avg = %v, want ~0.6", m.Avg)
 	}
 }
 
-// A valid ?window= is accepted and (for freshly recorded events) returns
-// the same data as the default window.
+func TestStatsHandlerContentType(t *testing.T) {
+	resetAggs()
+	rec := httptest.NewRecorder()
+	handleStats(rec, httptest.NewRequest(http.MethodGet, "/stats", nil))
+
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+}
+
+// A valid ?window= is accepted, echoed back, and returns the metric.
 func TestStatsHandlerAcceptsWindowParam(t *testing.T) {
 	resetAggs()
 	record(Event{Name: "cpu.load", Value: 1})
 
-	req := httptest.NewRequest(http.MethodGet, "/stats?window=30s", nil)
-	rec := httptest.NewRecorder()
-
-	handleStats(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rec.Code)
+	resp := getStats(t, "?window=30s")
+	if resp.Window != "30s" {
+		t.Errorf("Window = %q, want %q", resp.Window, "30s")
 	}
-	if !strings.Contains(rec.Body.String(), "cpu.load: count=1") {
-		t.Errorf("body = %q, want it to contain cpu.load count=1", rec.Body.String())
+	if resp.Metrics["cpu.load"].Count != 1 {
+		t.Errorf("cpu.load count = %d, want 1", resp.Metrics["cpu.load"].Count)
 	}
 }
 
@@ -245,13 +264,9 @@ func TestStatsHandlerExcludesStaleBuckets(t *testing.T) {
 	seedBucket("cpu.load", bucketAt(0), &Agg{Count: 2, Sum: 4, Min: 2, Max: 2})
 	seedBucket("cpu.load", bucketAt(2*time.Minute), &Agg{Count: 9, Sum: 900, Min: 100, Max: 100})
 
-	req := httptest.NewRequest(http.MethodGet, "/stats", nil)
-	rec := httptest.NewRecorder()
-	handleStats(rec, req)
-
-	want := "cpu.load: count=2 avg=2.00 min=2.00 max=2.00"
-	if !strings.Contains(rec.Body.String(), want) {
-		t.Errorf("stale bucket leaked into stats: %q, want %q", rec.Body.String(), want)
+	m := getStats(t, "").Metrics["cpu.load"]
+	if m.Count != 2 || m.Avg != 2 || m.Min != 2 || m.Max != 2 {
+		t.Errorf("stale bucket leaked: got %+v, want count=2 avg/min/max=2", m)
 	}
 }
 
@@ -262,18 +277,12 @@ func TestStatsHandlerWindowParamNarrows(t *testing.T) {
 	seedBucket("m", bucketAt(0), &Agg{Count: 1, Sum: 1, Min: 1, Max: 1})
 	seedBucket("m", bucketAt(30*time.Second), &Agg{Count: 1, Sum: 5, Min: 5, Max: 5})
 
-	get := func(query string) string {
-		req := httptest.NewRequest(http.MethodGet, "/stats"+query, nil)
-		rec := httptest.NewRecorder()
-		handleStats(rec, req)
-		return rec.Body.String()
+	if got := getStats(t, "").Metrics["m"].Count; got != 2 {
+		t.Errorf("default window: count = %d, want 2", got)
 	}
-
-	if got := get(""); !strings.Contains(got, "m: count=2") {
-		t.Errorf("default window: got %q, want count=2", got)
-	}
-	if got := get("?window=15s"); !strings.Contains(got, "m: count=1 avg=1.00") {
-		t.Errorf("15s window: got %q, want count=1 (30s-old bucket excluded)", got)
+	narrowed := getStats(t, "?window=15s").Metrics["m"]
+	if narrowed.Count != 1 || narrowed.Avg != 1 {
+		t.Errorf("15s window: got %+v, want count=1 avg=1 (30s-old bucket excluded)", narrowed)
 	}
 }
 
@@ -282,15 +291,9 @@ func TestStatsHandlerWindowParamNarrows(t *testing.T) {
 func TestStatsHandlerEmpty(t *testing.T) {
 	resetAggs()
 
-	req := httptest.NewRequest(http.MethodGet, "/stats", nil)
-	rec := httptest.NewRecorder()
-	handleStats(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rec.Code)
-	}
-	if rec.Body.Len() != 0 {
-		t.Errorf("body = %q, want empty", rec.Body.String())
+	resp := getStats(t, "")
+	if len(resp.Metrics) != 0 {
+		t.Errorf("Metrics = %+v, want empty", resp.Metrics)
 	}
 }
 
@@ -299,17 +302,9 @@ func TestStatsHandlerMultipleMetrics(t *testing.T) {
 	record(Event{Name: "cpu.load", Value: 1})
 	record(Event{Name: "memory.used", Value: 512})
 
-	req := httptest.NewRequest(http.MethodGet, "/stats", nil)
-	rec := httptest.NewRecorder()
-	handleStats(rec, req)
-
-	out := rec.Body.String()
-	// Map iteration order is random, so check for each line rather than
-	// a fixed full-body string.
-	for _, want := range []string{"cpu.load: count=1", "memory.used: count=1"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("output %q missing %q", out, want)
-		}
+	m := getStats(t, "").Metrics
+	if m["cpu.load"].Count != 1 || m["memory.used"].Count != 1 {
+		t.Errorf("got %+v, want both metrics at count=1", m)
 	}
 }
 
@@ -609,19 +604,16 @@ func TestEvictEmpty(t *testing.T) {
 	evict(map[int64]*Agg{}, 100)
 }
 
-// The average in /stats output is rounded to 2 decimals by %.2f.
-func TestStatsHandlerAverageRounding(t *testing.T) {
+// Avg is served raw (exact Sum/Count), not rounded - the caller formats it.
+func TestStatsHandlerAvgIsRaw(t *testing.T) {
 	resetAggs()
 	for _, v := range []float64{1, 2, 2} { // sum 5 / 3 = 1.666...
 		record(Event{Name: "cpu.load", Value: v})
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/stats", nil)
-	rec := httptest.NewRecorder()
-	handleStats(rec, req)
-
-	if !strings.Contains(rec.Body.String(), "avg=1.67") {
-		t.Errorf("body = %q, want avg=1.67 (5/3 rounded)", rec.Body.String())
+	avg := getStats(t, "").Metrics["cpu.load"].Avg
+	if want := 5.0 / 3.0; avg != want {
+		t.Errorf("avg = %v, want %v (exact, unrounded)", avg, want)
 	}
 }
 
