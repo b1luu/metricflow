@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -34,6 +35,18 @@ func seedBucket(s *Store, name string, key int64, a *Agg) {
 // bucketAt returns the bucket key for "d ago" (d >= 0).
 func bucketAt(d time.Duration) int64 {
 	return time.Now().Add(-d).Truncate(bucketWidth).Unix()
+}
+
+// ingestJSON builds an /ingest body with a fresh (now) timestamp.
+func ingestJSON(name string, value float64) string {
+	return fmt.Sprintf(`{"name":%q,"value":%v,"ts":%d}`, name, value, time.Now().UnixMilli())
+}
+
+// postIngest runs handleIngest with the given raw body and returns the recorder.
+func postIngest(s *Store, body string) *httptest.ResponseRecorder {
+	rec := httptest.NewRecorder()
+	s.handleIngest(rec, httptest.NewRequest(http.MethodPost, "/ingest", strings.NewReader(body)))
+	return rec
 }
 
 // getStats calls s.handleStats with the given query ("" or "?window=30s")
@@ -115,11 +128,7 @@ func TestRecordKeepsMetricsSeparate(t *testing.T) {
 func TestIngestHandlerValid(t *testing.T) {
 	s := newStore()
 
-	body := `{"name":"cpu.load","value":0.8,"type":"gauge","ts":1735000000123}`
-	req := httptest.NewRequest(http.MethodPost, "/ingest", strings.NewReader(body))
-	rec := httptest.NewRecorder()
-
-	s.handleIngest(rec, req)
+	rec := postIngest(s, ingestJSON("cpu.load", 0.8))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
@@ -127,6 +136,74 @@ func TestIngestHandlerValid(t *testing.T) {
 	a, ok := mergeAll(s, "cpu.load")
 	if !ok || a.Count != 1 {
 		t.Errorf("event was not recorded: %+v", s.aggs)
+	}
+}
+
+// value and type stay optional (zero-value is fine); ts and name do not.
+func TestIngestHandlerOptionalFieldsDefault(t *testing.T) {
+	s := newStore()
+
+	body := fmt.Sprintf(`{"name":"cpu.load","ts":%d}`, time.Now().UnixMilli())
+	rec := postIngest(s, body)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (value/type optional)", rec.Code)
+	}
+	if a, ok := mergeAll(s, "cpu.load"); !ok || a.Count != 1 || a.Sum != 0 {
+		t.Errorf("got %+v, want Count=1 Sum=0", a)
+	}
+}
+
+func TestIngestHandlerRejectsMissingTS(t *testing.T) {
+	s := newStore()
+
+	for _, body := range []string{
+		`{"name":"cpu.load","value":1}`,        // ts absent
+		`{"name":"cpu.load","value":1,"ts":0}`, // ts explicitly zero
+	} {
+		rec := postIngest(s, body)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("%s: status = %d, want 400", body, rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), "ts is required") {
+			t.Errorf("%s: body = %q, want ts-required error", body, rec.Body.String())
+		}
+	}
+	if len(s.aggs) != 0 {
+		t.Errorf("nothing should have been recorded, got %+v", s.aggs)
+	}
+}
+
+func TestIngestHandlerRejectsTooOldTS(t *testing.T) {
+	s := newStore()
+
+	body := fmt.Sprintf(`{"name":"cpu.load","value":1,"ts":%d}`,
+		time.Now().Add(-5*time.Minute).UnixMilli())
+	rec := postIngest(s, body)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "too old") {
+		t.Errorf("body = %q, want too-old error", rec.Body.String())
+	}
+	if len(s.aggs) != 0 {
+		t.Errorf("nothing should have been recorded, got %+v", s.aggs)
+	}
+}
+
+func TestIngestHandlerAcceptsRecentTS(t *testing.T) {
+	s := newStore()
+
+	body := fmt.Sprintf(`{"name":"cpu.load","value":1,"ts":%d}`,
+		time.Now().Add(-10*time.Second).UnixMilli())
+	rec := postIngest(s, body)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (ts within window)", rec.Code)
+	}
+	if a, ok := mergeAll(s, "cpu.load"); !ok || a.Count != 1 {
+		t.Errorf("recent event not recorded: %+v", s.aggs)
 	}
 }
 
@@ -332,39 +409,18 @@ func TestHealthHandler(t *testing.T) {
 
 // --- documented edge behaviors ---
 
-// A body missing non-Name fields is NOT rejected (DESIGN.md §7) - the
-// absent fields stay at their zero values and the event still records.
-func TestRecordMissingFieldsUsesZeroValues(t *testing.T) {
-	s := newStore()
-
-	body := `{"name":"cpu.load"}` // no value, ts, or type
-	req := httptest.NewRequest(http.MethodPost, "/ingest", strings.NewReader(body))
-	rec := httptest.NewRecorder()
-
-	s.handleIngest(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200 (missing fields are allowed)", rec.Code)
-	}
-	a, ok := mergeAll(s, "cpu.load")
-	if !ok || a.Count != 1 || a.Sum != 0 {
-		t.Errorf("got %+v, want Count=1 Sum=0 (value defaulted to 0)", a)
-	}
-}
-
-// Name is the one field with no sane zero-value default (DESIGN.md §12) -
-// an event with no name, or an explicitly empty one, is rejected.
+// Name has no sane zero-value default (DESIGN.md §12) - an event with no
+// name, or an explicitly empty one, is rejected before the ts check.
 func TestIngestHandlerRejectsMissingName(t *testing.T) {
 	s := newStore()
 
 	for _, body := range []string{`{"value":1}`, `{"name":"","value":1}`} {
-		req := httptest.NewRequest(http.MethodPost, "/ingest", strings.NewReader(body))
-		rec := httptest.NewRecorder()
-
-		s.handleIngest(rec, req)
-
+		rec := postIngest(s, body)
 		if rec.Code != http.StatusBadRequest {
 			t.Errorf("body %s: status = %d, want 400", body, rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), "name is required") {
+			t.Errorf("body %s: %q, want name-required error", body, rec.Body.String())
 		}
 	}
 	if len(s.aggs) != 0 {

@@ -25,26 +25,38 @@ exits; a second `Ctrl-C` kills immediately.
 | GET    | `/stats`  | Per-metric aggregate over a time window (JSON, default 60s). |
 
 `/stats` accepts an optional `?window=` (Go duration, e.g. `?window=30s`),
-capped at the 60-second retention window. `/ingest` requires a non-empty
-`name`; other fields default to their zero value if omitted. Each route
-accepts only the method shown above — anything else returns `405`.
+capped at the 60-second retention window. `/ingest` requires `name` and `ts`
+(unix milliseconds, no older than the 60s window); `value` and `type` default
+to zero if omitted. Each route accepts only the method shown above — anything
+else returns `405`.
 
-Event body:
+Event body (`ts` is unix milliseconds and must be within the last 60s):
 
 ```json
-{ "name": "cpu.load", "value": 0.8, "type": "gauge", "ts": 1735000000123 }
+{ "name": "cpu.load", "value": 0.8, "type": "gauge", "ts": 1757200000000 }
 ```
 
 ## Example
 
-```
-curl.exe -X POST localhost:8080/ingest -d '{"name":"cpu.load","value":0.8,"type":"gauge","ts":1735000000123}'
-curl.exe localhost:8080/stats
-# {"window":"1m0s","metrics":{"cpu.load":{"count":1,"avg":0.8,"min":0.8,"max":0.8}}}
+```powershell
+$ts = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+Invoke-RestMethod -Method Post -Uri http://localhost:8080/ingest `
+  -Body "{""name"":""cpu.load"",""value"":0.8,""ts"":$ts}"
+Invoke-RestMethod http://localhost:8080/stats
+# window  metrics
+# ------  -------
+# 1m0s    @{cpu.load=@{count=1; avg=0.8; min=0.8; max=0.8}}
 ```
 
-On Windows PowerShell, use `curl.exe` (not `curl`, which is an alias for
-`Invoke-WebRequest`) or `Invoke-RestMethod`.
+On non-Windows / with real curl:
+
+```
+curl -XPOST localhost:8080/ingest -d "{\"name\":\"cpu.load\",\"value\":0.8,\"ts\":$(date +%s)000}"
+curl localhost:8080/stats
+```
+
+(PowerShell's `curl` is an alias for `Invoke-WebRequest`, which takes
+different flags — use `curl.exe` or `Invoke-RestMethod` there.)
 
 ## Test
 

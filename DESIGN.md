@@ -106,16 +106,16 @@ A `sync.Mutex` guards every read and write of the aggregate map.
 `http.HandleFunc` call must come before it. A handler registered after it is
 dead code. (This was an actual bug earlier in development.)
 
-### 7. Missing JSON fields are not an error
+### 7. Missing JSON fields are not an error (except `name` and `ts`)
 
 `json.Unmarshal` only fails on *syntactically* invalid JSON. A body like
-`{"name":"cpu.load"}` parses fine and leaves `Value`, `TS`, `Type` at their
-zero values.
+`{"name":"cpu.load","ts":1757200000000}` parses fine with `Value` and `Type`
+left at their zero values.
 
-- We accept this for `Value`, `TS`, and `Type` — a zero-value event still
-  records, and that's a reasonable default (a gauge reading of exactly `0`
-  is meaningful; an unset numeric field looking like one is a minor cost).
-- `Name` is the exception — see §12.
+- We accept that for `Value` and `Type` — a zero-value event still records,
+  and that's a reasonable default (a gauge reading of exactly `0` is
+  meaningful; an unset field looking like one is a minor cost).
+- `Name` and `TS` are the exceptions — see §12.
 
 ### 8. Time-windowed aggregates: 10-second buckets, 6 per window
 
@@ -139,21 +139,19 @@ workload to optimize against — the right move is to pick a sensible default,
 make the width a single named constant, and revisit it once there's an actual
 usage pattern (or a load-harness measurement) to react to.
 
-### 9. Windowing uses server receive time, not event time (for now)
+### 9. Windowing is moving from receive time to event time
 
-An event's bucket is decided by `time.Now()` when the request is handled —
-**not** by the `ts` field in the payload.
+An event's bucket is currently still decided by `time.Now()` when the request
+is handled. Moving it to the payload's `ts` is in progress — see §16 for the
+plan and the pieces landed so far.
 
-- **Why defer event-time:** trusting `ev.TS` means handling out-of-order
-  arrivals, duplicates, and events timestamped in the past or future — a
-  whole correctness problem in its own right. It's a named roadmap milestone,
-  not something to smuggle into the first windowing step.
-- **What receive-time gives up:** if a client batches or retries, events are
-  bucketed by when we *saw* them, not when they *happened*. For the current
-  demo scenario (live simulated services pushing in real time) the two are
-  nearly identical, so the cost is small and visible.
-- The code carries a comment at the bucketing call marking this as the
-  deliberate simplification and pointing at the event-time milestone.
+- **Why it's staged, not one change:** trusting `ev.TS` means handling
+  out-of-order arrivals, duplicates, and events timestamped in the past or
+  future — each its own decision. The first piece (reject events whose `ts` is
+  missing or older than the retention window) is in; the bucketing switch and
+  future-`ts` handling are the next slices.
+- **What receive-time gave up:** a client that batches or retries had its
+  events bucketed by when we *saw* them, not when they *happened*.
 
 ### 10. Bucket eviction happens on write, not on a timer
 
@@ -195,23 +193,27 @@ touched, every time it runs (`evict(series, windowStart(now, window))`).
 - `window` is derived (`numBuckets * bucketWidth`), so retention and the
   default query window move together when the constants change.
 
-### 12. `Name` is the one required field
+### 12. `name` and `ts` are required
 
-`/ingest` rejects an event whose `Name` is empty (missing from the JSON, or
-explicitly `""`) with `400 name is required`. Every other field keeps the
-zero-value-is-fine behavior from §7.
+`/ingest` rejects, with `400`, an event missing `name` (`name is required`) or
+`ts` (`ts is required`). `value` and `type` keep the zero-value-is-fine
+behavior from §7.
 
-- **Why `Name` and not the others:** `Name` is the map key everything is
-  aggregated under. A missing `Value`/`TS`/`Type` degrades gracefully to a
-  zero, which is still a coherent (if uninteresting) data point. A missing
-  `Name` doesn't degrade — it silently merges into a `""` bucket, mixing
-  unrelated events together and corrupting every other metric's neighbor in
-  `/stats` output. That's not a lesser version of the data; it's wrong data.
+- **Why `name`:** it's the map key everything is aggregated under. A missing
+  `value`/`type` degrades gracefully to a zero — still a coherent data point.
+  A missing `name` doesn't degrade: it silently merges into a `""` bucket,
+  mixing unrelated events and corrupting every other metric's neighbor in
+  `/stats`. That's not a lesser version of the data; it's wrong data.
+- **Why `ts`:** it decides the event's time bucket (§16). `ts: 0` is "January
+  1970" — always outside the window, so a zero would just be a confusing way
+  to spell "rejected." Better to say so directly.
 - **Why check after `Unmarshal` instead of during it:** `json.Unmarshal` only
   validates syntax (is this valid JSON), never meaning (is this a valid
   event). Keeping that boundary means the parse step stays generic and the
   validation step stays the readable, single place where "what makes an
   event acceptable" is decided — the natural spot to add more rules later.
+- **Order:** `name` is checked before `ts`, before freshness (§16) — cheapest
+  and most fundamental first.
 
 ### 13. One method per route, enforced by an `allow` wrapper
 
@@ -276,6 +278,24 @@ the context is cancelled, then calls `srv.Shutdown` with a 5-second deadline.
   `127.0.0.1:0` listener, no real signal (`TestRunServesThenStopsOnCancel`).
 - **`routes(s *Store) http.Handler`:** the mux is its own function too, so the
   path→handler + method-gate wiring is unit-tested (`TestRoutesWireHandlers`).
+
+### 16. Event time — freshness guard (first slice)
+
+Moving windowing to `ev.TS` (§9) is staged. Landed so far: `/ingest` rejects
+an event whose `ts` (unix ms) is older than `now - window`, with
+`400 event too old`. `ts` is also now required (§12).
+
+- **Why reject rather than accept-and-drop:** an event older than the window
+  has no bucket to go in — that bucket is already evicted. Silently dropping
+  it would make `count` mismatch what the client sent with no signal. A `400`
+  tells the producer its clock is skewed or its retry is too late.
+- **The bound is `now - window`, inclusive:** exactly the span `/stats` and
+  eviction already work over, so "accepted" and "visible" mean the same thing.
+- **Still using `time.Now()` for the bucket** until the next slice — the guard
+  is in front of unchanged bucketing, so nothing downstream moved yet.
+- **Not yet handled:** `ts` in the *future* (clock skew the other way), and
+  de-duplication. Both are their own slices; future-`ts` pairs naturally with
+  the bucketing switch, dedup is deferred (needs per-event keys).
 
 ## Testing
 

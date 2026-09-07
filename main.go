@@ -177,19 +177,31 @@ func (s *Store) handleIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Unmarshal only checks syntax, not meaning: a Name-less event parses
-	// fine and would otherwise record under the empty string. That's the
-	// one field with no sane zero-value default, so it's checked explicitly.
-	// See DESIGN.md §12.
+	// Unmarshal only checks syntax, not meaning. Name and TS have no sane
+	// zero-value default, so they are checked explicitly. See DESIGN.md §12.
 	if ev.Name == "" {
 		http.Error(w, "name is required", http.StatusBadRequest)
+		return
+	}
+	if ev.TS == 0 {
+		http.Error(w, "ts is required (unix milliseconds)", http.StatusBadRequest)
+		return
+	}
+
+	// TS drives which time bucket the event lands in (once §16 wiring is
+	// done). An event older than the retention window can't be bucketed -
+	// its bucket is already gone - so reject it now rather than silently
+	// dropping it later. See DESIGN.md §16.
+	now := time.Now()
+	if time.UnixMilli(ev.TS).Before(now.Add(-window)) {
+		http.Error(w, fmt.Sprintf("event too old (ts outside the %s window)", window), http.StatusBadRequest)
 		return
 	}
 
 	fmt.Printf("parsed event: name=%s value=%.2f type=%s ts=%d\n",
 		ev.Name, ev.Value, ev.Type, ev.TS)
 
-	s.record(time.Now(), ev)
+	s.record(now, ev)
 	fmt.Fprintln(w, "got it")
 }
 
