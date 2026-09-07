@@ -255,6 +255,28 @@ The old line-per-metric plaintext was always a placeholder.
   the socket is not. Holding `s.mu` across the write would block every
   `record` call for the duration of a slow client's read.
 
+### 15. Graceful shutdown on SIGINT / SIGTERM
+
+`main` builds a signal-cancelled context (`signal.NotifyContext` on
+`os.Interrupt` / `SIGTERM`) and hands it to `run(ctx, ln)`. `run` serves until
+the context is cancelled, then calls `srv.Shutdown` with a 5-second deadline.
+
+- **Why it matters:** the plain `http.ListenAndServe` is killed mid-request on
+  Ctrl-C — an in-flight `/ingest` is just dropped. `Shutdown` stops accepting
+  new connections but lets open ones finish first. Under the load harness,
+  "requests in flight when the process is told to stop" is exactly a failure
+  mode worth handling correctly.
+- **The 5s deadline:** a stuck client shouldn't hold the process open forever.
+  After the deadline `Shutdown` returns an error and `main` exits non-zero.
+- **`stop()` (deferred) after the signal:** restores default handling so a
+  second Ctrl-C kills immediately — the standard "I really mean it" hatch.
+- **Split into `run(ctx, ln)`:** `main` is then just listen + signal wiring +
+  `run` — the part that's pure boilerplate. `run` takes a `net.Listener` so a
+  test drives the entire lifecycle with a cancellable context and a
+  `127.0.0.1:0` listener, no real signal (`TestRunServesThenStopsOnCancel`).
+- **`routes(s *Store) http.Handler`:** the mux is its own function too, so the
+  path→handler + method-gate wiring is unit-tested (`TestRoutesWireHandlers`).
+
 ## Testing
 
 See `main_test.go`. ~85% coverage — everything but `main()` (route wiring).

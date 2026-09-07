@@ -13,7 +13,8 @@ Standard library only (`net/http`), no database, no external services.
 go run main.go
 ```
 
-Listens on `:8080`.
+Listens on `:8080`. `Ctrl-C` (or `SIGTERM`) drains in-flight requests, then
+exits; a second `Ctrl-C` kills immediately.
 
 ## Endpoints
 

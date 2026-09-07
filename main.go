@@ -1,11 +1,17 @@
 package main
 
 import (
+	"context"       // shutdown deadline + signal-cancelled context
 	"encoding/json" // decode JSON request bodies into Go values
 	"fmt"           // formatted printing (stdout + http responses)
 	"io"            // io.ReadAll, to slurp the request body
+	"log"           // server lifecycle messages
+	"net"           // net.Listen, so run() can be handed a test listener
 	"net/http"      // the HTTP server and routing
+	"os"            // os.Interrupt
+	"os/signal"     // catch Ctrl-C / SIGTERM
 	"sync"          // Mutex, to guard the Store's aggs map
+	"syscall"       // SIGTERM
 	"time"
 )
 
@@ -243,15 +249,54 @@ func (s *Store) handleStats(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
+// routes builds the request multiplexer for a Store. Separate from main so
+// tests can exercise the wiring (path -> handler, method gating) directly.
+func routes(s *Store) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", allow(http.MethodGet, handleHealth))
+	mux.HandleFunc("/ingest", allow(http.MethodPost, s.handleIngest))
+	mux.HandleFunc("/stats", allow(http.MethodGet, s.handleStats))
+	return mux
+}
+
+// run serves on ln until ctx is cancelled, then drains in-flight requests
+// (up to 5s) and returns. Split from main so a test can drive the whole
+// lifecycle with a cancellable context instead of a real signal.
+func run(ctx context.Context, ln net.Listener) error {
+	srv := &http.Server{Handler: routes(newStore())}
+
+	errc := make(chan error, 1)
+	go func() {
+		log.Printf("listening on %s", ln.Addr())
+		errc <- srv.Serve(ln)
+	}()
+
+	select {
+	case err := <-errc:
+		return err // Serve fell over before we were asked to stop
+	case <-ctx.Done():
+		log.Println("shutting down, draining in-flight requests...")
+	}
+
+	// Give open requests up to 5s to finish before dropping them.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return srv.Shutdown(shutdownCtx)
+}
+
 func main() {
-	s := newStore()
+	ln, err := net.Listen("tcp", ":8080")
+	if err != nil {
+		log.Fatal(err)
+	}
 
-	http.HandleFunc("/health", allow(http.MethodGet, handleHealth))
-	http.HandleFunc("/ingest", allow(http.MethodPost, s.handleIngest))
-	http.HandleFunc("/stats", allow(http.MethodGet, s.handleStats))
+	// ctx is cancelled on the first Ctrl-C / SIGTERM; stop() then restores
+	// default handling so a second Ctrl-C kills immediately.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	// Register routes above, THEN start the server - ListenAndServe
-	// blocks forever, so anything after it would never run.
-	fmt.Println("Listening on :8080")
-	http.ListenAndServe(":8080", nil)
+	if err := run(ctx, ln); err != nil {
+		log.Fatal(err)
+	}
+	log.Println("stopped cleanly")
 }

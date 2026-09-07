@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -710,5 +712,62 @@ func TestAllowPassesThroughCorrectMethod(t *testing.T) {
 
 	if !called {
 		t.Error("wrapped handler was not called for the allowed method")
+	}
+}
+
+// --- server wiring & shutdown ---
+
+// routes() maps each path to its handler with the right method gate.
+func TestRoutesWireHandlers(t *testing.T) {
+	h := routes(newStore())
+
+	cases := []struct {
+		method, path string
+		wantStatus   int
+	}{
+		{http.MethodGet, "/health", http.StatusOK},
+		{http.MethodGet, "/stats", http.StatusOK},
+		{http.MethodPost, "/ingest", http.StatusBadRequest}, // empty body, but it reached the handler
+		{http.MethodGet, "/ingest", http.StatusMethodNotAllowed},
+		{http.MethodPost, "/stats", http.StatusMethodNotAllowed},
+		{http.MethodGet, "/nope", http.StatusNotFound},
+	}
+	for _, c := range cases {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(c.method, c.path, nil))
+		if rec.Code != c.wantStatus {
+			t.Errorf("%s %s: status = %d, want %d", c.method, c.path, rec.Code, c.wantStatus)
+		}
+	}
+}
+
+// run serves while its context is live and returns cleanly once cancelled -
+// the whole lifecycle main() drives on a signal.
+func TestRunServesThenStopsOnCancel(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- run(ctx, ln) }()
+
+	// It's actually serving.
+	resp, err := http.Get("http://" + ln.Addr().String() + "/health")
+	if err != nil {
+		t.Fatalf("server not reachable: %v", err)
+	}
+	resp.Body.Close()
+
+	cancel() // simulate the signal
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("run returned %v, want nil", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("run did not return after context cancel")
 	}
 }
