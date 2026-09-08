@@ -139,19 +139,17 @@ workload to optimize against — the right move is to pick a sensible default,
 make the width a single named constant, and revisit it once there's an actual
 usage pattern (or a load-harness measurement) to react to.
 
-### 9. Windowing is moving from receive time to event time
+### 9. Windowing is by event time, not receive time
 
-An event's bucket is currently still decided by `time.Now()` when the request
-is handled. Moving it to the payload's `ts` is in progress — see §16 for the
-plan and the pieces landed so far.
+An event's bucket is chosen by its payload `ts`, not by `time.Now()` when the
+request lands. See §16 for the mechanics and what's still open.
 
-- **Why it's staged, not one change:** trusting `ev.TS` means handling
-  out-of-order arrivals, duplicates, and events timestamped in the past or
-  future — each its own decision. The first piece (reject events whose `ts` is
-  missing or older than the retention window) is in; the bucketing switch and
-  future-`ts` handling are the next slices.
-- **What receive-time gave up:** a client that batches or retries had its
-  events bucketed by when we *saw* them, not when they *happened*.
+- **Why it matters:** a client that batches, buffers, or retries has its
+  events bucketed by when they *happened*, not by when we happened to see
+  them — so `avg over the last minute` means the last minute of real time.
+- **Why it was staged, not one change:** trusting `ev.TS` means separate
+  decisions for missing timestamps, stale ones, future ones, and duplicates.
+  Each landed as its own slice (§12, §16).
 
 ### 10. Bucket eviction happens on write, not on a timer
 
@@ -279,28 +277,39 @@ the context is cancelled, then calls `srv.Shutdown` with a 5-second deadline.
 - **`routes(s *Store) http.Handler`:** the mux is its own function too, so the
   path→handler + method-gate wiring is unit-tested (`TestRoutesWireHandlers`).
 
-### 16. Event time — freshness guard (first slice)
+### 16. Event time — bucketing and the accepted-`ts` range
 
-Moving windowing to `ev.TS` (§9) is staged. Landed so far: `/ingest` rejects
-an event whose `ts` (unix ms) is older than `now - window`, with
-`400 event too old`. `ts` is also now required (§12).
+`record` buckets an event by `time.UnixMilli(ev.TS).Truncate(bucketWidth)` —
+event time, not arrival time. Eviction still runs off `now` (wall clock): it's
+about memory pressure, not semantics, so it stays on the real clock. `record`
+therefore takes both — `now` for eviction, `ev.TS` for the bucket.
 
-- **Why reject rather than accept-and-drop:** an event older than the window
-  has no bucket to go in — that bucket is already evicted. Silently dropping
-  it would make `count` mismatch what the client sent with no signal. A `400`
-  tells the producer its clock is skewed or its retry is too late.
-- **The bound is `now - window`, inclusive:** exactly the span `/stats` and
-  eviction already work over, so "accepted" and "visible" mean the same thing.
-- **Still using `time.Now()` for the bucket** until the next slice — the guard
-  is in front of unchanged bucketing, so nothing downstream moved yet.
-- **Not yet handled:** `ts` in the *future* (clock skew the other way), and
-  de-duplication. Both are their own slices; future-`ts` pairs naturally with
-  the bucketing switch, dedup is deferred (needs per-event keys).
+`/ingest` accepts `ts` only in **`[now - window, now + bucketWidth]`**:
+
+- **Too old → `400 event too old`.** Its bucket is already evicted; adding to
+  it is impossible. Silently dropping would make `count` disagree with what
+  the client sent, with no signal — a `400` tells the producer its clock or
+  its retry is behind.
+- **Too far future → `400 ts too far in the future`.** A future `ts` lands in
+  a bucket that stays visible in `/stats` until wall time catches up — for a
+  badly-wrong clock, effectively forever. One `bucketWidth` of slack absorbs
+  ordinary client/server skew; beyond that is a client bug.
+- **The lower bound is exactly `now - window`**, the same span `/stats` and
+  eviction work over, so "accepted" and "visible" line up.
+- **The guard is only on the HTTP boundary.** `record` itself trusts its
+  caller — a direct call with an out-of-range `ts` just has its bucket
+  evicted (too old) or left to age in (near future). The untrusted-input
+  check belongs at the edge, not in the core (same split as §12).
+- **Not yet handled:** de-duplication. Two events with identical
+  `{name, value, ts}` are counted as two — for a metrics firehose that's
+  almost always two real observations, not a resend. Real dedup needs
+  per-event idempotency keys and a seen-set with its own eviction; deferred
+  as its own milestone.
 
 ## Testing
 
-See `main_test.go`. ~85% coverage — everything but `main()` (route wiring).
-The strategy:
+See `main_test.go`. ~91% coverage — everything but `main()` (listen + signal
+wiring). The strategy:
 
 - **Handlers and `record` are `*Store` methods** (`s.handleIngest`,
   `s.handleStats`, `s.record`), so a test calls them directly on a store it
@@ -309,14 +318,17 @@ The strategy:
 - **Each test gets its own state.** `s := newStore()` at the top of the test;
   there is no shared global and no reset step, so tests can't leak into each
   other.
-- **Time is a parameter, not an ambient read.** `record` and `windowStart`
-  take `now time.Time`; the handlers call `time.Now()` once and pass it in.
-  One operation uses one clock reading, and a test can advance a synthetic
-  clock through bucket boundaries with no sleeping
-  (`TestWindowRollsAsClockAdvances`).
+- **Time is data, not an ambient read.** `record` takes `now` (for eviction)
+  and reads the bucket from `ev.TS`; `windowStart` takes `now`. The handlers
+  call `time.Now()` once and pass it in. So a test drives event time and
+  wall clock independently — advancing a synthetic clock through bucket
+  boundaries (`TestWindowRollsAsClockAdvances`) or feeding an out-of-order
+  `ts` (`TestRecordBucketsByEventTime`) with no sleeping.
 - **`httptest.NewRecorder` / `httptest.NewRequest`** drive the handlers
   in-process — no real socket, no port binding.
-- **Helpers:** `seedBucket(s, name, key, agg)` plants data at a chosen age;
+- **Helpers:** `recordNow(s, name, value)` records a here-and-now event;
+  `seedBucket(s, name, key, agg)` plants data at a chosen bucket;
+  `postIngest(s, body)` / `ingestJSON(name, value)` for the HTTP path;
   `getStats(t, s, query)` calls the handler and decodes the JSON.
 
 Run:

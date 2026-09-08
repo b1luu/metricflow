@@ -42,6 +42,13 @@ func ingestJSON(name string, value float64) string {
 	return fmt.Sprintf(`{"name":%q,"value":%v,"ts":%d}`, name, value, time.Now().UnixMilli())
 }
 
+// recordNow records an event stamped and clocked at time.Now() - the common
+// case for tests that don't care about event-time mechanics.
+func recordNow(s *Store, name string, value float64) {
+	now := time.Now()
+	s.record(now, Event{Name: name, Value: value, TS: now.UnixMilli()})
+}
+
 // postIngest runs handleIngest with the given raw body and returns the recorder.
 func postIngest(s *Store, body string) *httptest.ResponseRecorder {
 	rec := httptest.NewRecorder()
@@ -71,7 +78,7 @@ func TestRecordAggregates(t *testing.T) {
 	s := newStore()
 
 	for _, v := range []float64{0.8, 0.9, 0.3} {
-		s.record(time.Now(), Event{Name: "cpu.load", Value: v})
+		recordNow(s, "cpu.load", v)
 	}
 
 	// Events may land in one or two buckets depending on timing;
@@ -98,8 +105,8 @@ func TestRecordSeedsMinMaxFromFirstValue(t *testing.T) {
 	s := newStore()
 
 	// All values are positive; a buggy seed of 0 would make Min stay 0.
-	s.record(time.Now(), Event{Name: "latency", Value: 5})
-	s.record(time.Now(), Event{Name: "latency", Value: 8})
+	recordNow(s, "latency", 5)
+	recordNow(s, "latency", 8)
 
 	a, ok := mergeAll(s, "latency")
 	if !ok {
@@ -113,8 +120,8 @@ func TestRecordSeedsMinMaxFromFirstValue(t *testing.T) {
 func TestRecordKeepsMetricsSeparate(t *testing.T) {
 	s := newStore()
 
-	s.record(time.Now(), Event{Name: "cpu.load", Value: 1})
-	s.record(time.Now(), Event{Name: "memory.used", Value: 512})
+	recordNow(s, "cpu.load", 1)
+	recordNow(s, "memory.used", 512)
 
 	cpu, cpuOK := mergeAll(s, "cpu.load")
 	mem, memOK := mergeAll(s, "memory.used")
@@ -207,6 +214,37 @@ func TestIngestHandlerAcceptsRecentTS(t *testing.T) {
 	}
 }
 
+func TestIngestHandlerRejectsFutureTS(t *testing.T) {
+	s := newStore()
+
+	body := fmt.Sprintf(`{"name":"cpu.load","value":1,"ts":%d}`,
+		time.Now().Add(5*time.Minute).UnixMilli())
+	rec := postIngest(s, body)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "future") {
+		t.Errorf("body = %q, want future-ts error", rec.Body.String())
+	}
+	if len(s.aggs) != 0 {
+		t.Errorf("nothing should have been recorded, got %+v", s.aggs)
+	}
+}
+
+// A few seconds of clock skew (within one bucketWidth) is tolerated.
+func TestIngestHandlerAcceptsSmallClockSkew(t *testing.T) {
+	s := newStore()
+
+	body := fmt.Sprintf(`{"name":"cpu.load","value":1,"ts":%d}`,
+		time.Now().Add(3*time.Second).UnixMilli())
+	rec := postIngest(s, body)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (small skew tolerated)", rec.Code)
+	}
+}
+
 func TestIngestHandlerInvalidJSON(t *testing.T) {
 	s := newStore()
 
@@ -275,8 +313,8 @@ func TestIngestHandlerNullBody(t *testing.T) {
 
 func TestStatsHandlerOutput(t *testing.T) {
 	s := newStore()
-	s.record(time.Now(), Event{Name: "cpu.load", Value: 0.8})
-	s.record(time.Now(), Event{Name: "cpu.load", Value: 0.4})
+	recordNow(s, "cpu.load", 0.8)
+	recordNow(s, "cpu.load", 0.4)
 
 	m := getStats(t, s, "").Metrics["cpu.load"]
 	if m.Count != 2 || m.Min != 0.4 || m.Max != 0.8 {
@@ -300,7 +338,7 @@ func TestStatsHandlerContentType(t *testing.T) {
 // A valid ?window= is accepted, echoed back, and returns the metric.
 func TestStatsHandlerAcceptsWindowParam(t *testing.T) {
 	s := newStore()
-	s.record(time.Now(), Event{Name: "cpu.load", Value: 1})
+	recordNow(s, "cpu.load", 1)
 
 	resp := getStats(t, s, "?window=30s")
 	if resp.Window != "30s" {
@@ -382,8 +420,8 @@ func TestStatsHandlerEmpty(t *testing.T) {
 
 func TestStatsHandlerMultipleMetrics(t *testing.T) {
 	s := newStore()
-	s.record(time.Now(), Event{Name: "cpu.load", Value: 1})
-	s.record(time.Now(), Event{Name: "memory.used", Value: 512})
+	recordNow(s, "cpu.load", 1)
+	recordNow(s, "memory.used", 512)
 
 	m := getStats(t, s, "").Metrics
 	if m["cpu.load"].Count != 1 || m["memory.used"].Count != 1 {
@@ -434,7 +472,7 @@ func TestRecordAllNegativeValues(t *testing.T) {
 	s := newStore()
 
 	for _, v := range []float64{-5, -2, -9} {
-		s.record(time.Now(), Event{Name: "temp.delta", Value: v})
+		recordNow(s, "temp.delta", v)
 	}
 
 	a, ok := mergeAll(s, "temp.delta")
@@ -560,7 +598,7 @@ func TestRecordEvictsStaleBuckets(t *testing.T) {
 	}
 	s.mu.Unlock()
 
-	s.record(time.Now(), Event{Name: "cpu.load", Value: 0.5})
+	recordNow(s, "cpu.load", 0.5)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -575,12 +613,16 @@ func TestRecordEvictsStaleBuckets(t *testing.T) {
 // The end-to-end windowing story, driven by a synthetic clock: as time
 // advances, older events roll out of the query window, and a write
 // physically evicts the buckets that have aged past retention.
-// record() and windowStart() take `now` as a parameter, so this needs no
-// real sleeping and no global clock.
+// Here each event's ts matches its wall-clock moment; out-of-order
+// bucketing is covered separately by TestRecordBucketsByEventTime.
 func TestWindowRollsAsClockAdvances(t *testing.T) {
 	s := newStore()
 	base := time.Now().Truncate(bucketWidth)
 
+	// happen records an event whose event-time and wall clock are both `at`.
+	happen := func(at time.Time, value float64) {
+		s.record(at, Event{Name: "cpu.load", Value: value, TS: at.UnixMilli()})
+	}
 	countAt := func(now time.Time) (int, bool) {
 		s.mu.Lock()
 		defer s.mu.Unlock()
@@ -589,15 +631,15 @@ func TestWindowRollsAsClockAdvances(t *testing.T) {
 	}
 
 	// t=0: two events land in the base bucket.
-	s.record(base, Event{Name: "cpu.load", Value: 1})
-	s.record(base, Event{Name: "cpu.load", Value: 3})
+	happen(base, 1)
+	happen(base, 3)
 	if c, ok := countAt(base); !ok || c != 2 {
 		t.Fatalf("t=0: count=%d ok=%v, want 2", c, ok)
 	}
 
 	// t=30s: a third event, new bucket, all three still in the 60s window.
 	t30 := base.Add(30 * time.Second)
-	s.record(t30, Event{Name: "cpu.load", Value: 5})
+	happen(t30, 5)
 	if c, _ := countAt(t30); c != 3 {
 		t.Errorf("t=30s: count=%d, want 3", c)
 	}
@@ -611,7 +653,7 @@ func TestWindowRollsAsClockAdvances(t *testing.T) {
 	}
 
 	// A write at t=75s evicts the stale base bucket from the map.
-	s.record(t75, Event{Name: "cpu.load", Value: 9})
+	happen(t75, 9)
 	s.mu.Lock()
 	_, stale := s.aggs["cpu.load"][base.Unix()]
 	s.mu.Unlock()
@@ -622,6 +664,43 @@ func TestWindowRollsAsClockAdvances(t *testing.T) {
 	// t=150s: every remaining bucket is older than 60s -> no data.
 	if _, ok := countAt(base.Add(150 * time.Second)); ok {
 		t.Error("t=150s: ok=true, want false (all data aged out)")
+	}
+}
+
+// An event is bucketed by ev.TS (when it happened), not by when record()
+// runs - so a late arrival lands in the past bucket it belongs to.
+func TestRecordBucketsByEventTime(t *testing.T) {
+	s := newStore()
+	now := time.Now().Truncate(bucketWidth)
+	past := now.Add(-30 * time.Second) // still in window, different bucket
+
+	// arrives now, but happened 30s ago
+	s.record(now, Event{Name: "cpu.load", Value: 5, TS: past.UnixMilli()})
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.aggs["cpu.load"][past.Unix()]; !ok {
+		t.Errorf("event not in its event-time bucket %d; series=%v", past.Unix(), s.aggs["cpu.load"])
+	}
+	if _, ok := s.aggs["cpu.load"][now.Unix()]; ok {
+		t.Error("event landed in the arrival-time bucket instead")
+	}
+}
+
+// Two events with the same event-time recorded at different wall-clock
+// moments merge into one bucket.
+func TestRecordMergesSameEventTime(t *testing.T) {
+	s := newStore()
+	happened := time.Now().Truncate(bucketWidth).Add(-20 * time.Second)
+
+	s.record(time.Now().Add(-12*time.Second), Event{Name: "m", Value: 2, TS: happened.UnixMilli()})
+	s.record(time.Now(), Event{Name: "m", Value: 8, TS: happened.UnixMilli()})
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a := s.aggs["m"][happened.Unix()]
+	if a == nil || a.Count != 2 || a.Sum != 10 {
+		t.Errorf("got %+v, want Count=2 Sum=10 in bucket %d", a, happened.Unix())
 	}
 }
 
@@ -642,7 +721,7 @@ func TestRecordConcurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < perGoroutine; j++ {
-				s.record(time.Now(), Event{Name: "cpu.load", Value: 1})
+				recordNow(s, "cpu.load", 1)
 			}
 		}()
 	}
@@ -670,7 +749,7 @@ func TestRecordAndStatsConcurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < perWriter; j++ {
-				s.record(time.Now(), Event{Name: "cpu.load", Value: 1})
+				recordNow(s, "cpu.load", 1)
 			}
 		}()
 	}
@@ -721,7 +800,7 @@ func TestEvictEmpty(t *testing.T) {
 func TestStatsHandlerAvgIsRaw(t *testing.T) {
 	s := newStore()
 	for _, v := range []float64{1, 2, 2} { // sum 5 / 3 = 1.666...
-		s.record(time.Now(), Event{Name: "cpu.load", Value: v})
+		recordNow(s, "cpu.load", v)
 	}
 
 	avg := getStats(t, s, "").Metrics["cpu.load"].Avg

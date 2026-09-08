@@ -56,14 +56,17 @@ const (
 	//                                        how far back buckets are retained
 )
 
-// record folds one event into its metric's running aggregate. now is the
-// operation's timestamp, passed in (not read here) so one call uses one
-// consistent clock reading and tests can drive it directly.
-// Using ev.TS (event time) instead would mean handling out-of-order,
-// duplicate, and future-dated events — deferred to the event-time
-// milestone. See DESIGN.md §9.
+// record folds one event into its metric's running aggregate.
+//   - the bucket is chosen by ev.TS (event time, unix ms), so an event that
+//     arrives late still lands in the bucket for when it happened.
+//   - now (wall clock, passed in) drives eviction — that's about memory
+//     pressure, not event time, so it stays on the real clock.
+//
+// handleIngest validates ev.TS is in [now-window, now+bucketWidth] before
+// calling here; a direct caller that skips that just gets its out-of-range
+// bucket evicted on the spot. See DESIGN.md §16.
 func (s *Store) record(now time.Time, ev Event) {
-	bucket := now.Truncate(bucketWidth).Unix()
+	bucket := time.UnixMilli(ev.TS).Truncate(bucketWidth).Unix()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -188,13 +191,20 @@ func (s *Store) handleIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// TS drives which time bucket the event lands in (once §16 wiring is
-	// done). An event older than the retention window can't be bucketed -
-	// its bucket is already gone - so reject it now rather than silently
-	// dropping it later. See DESIGN.md §16.
+	// ev.TS picks the event's time bucket (see record / DESIGN.md §16).
+	// Too old -> its bucket is already evicted, nothing to add to.
+	// Too far future -> it would sit in a bucket that stays visible for
+	// however long the clock is wrong. Either way, reject rather than
+	// silently mis-record; one bucketWidth of future slack covers normal
+	// client/server clock skew.
 	now := time.Now()
-	if time.UnixMilli(ev.TS).Before(now.Add(-window)) {
-		http.Error(w, fmt.Sprintf("event too old (ts outside the %s window)", window), http.StatusBadRequest)
+	ts := time.UnixMilli(ev.TS)
+	switch {
+	case ts.Before(now.Add(-window)):
+		http.Error(w, fmt.Sprintf("event too old (ts before now-%s)", window), http.StatusBadRequest)
+		return
+	case ts.After(now.Add(bucketWidth)):
+		http.Error(w, fmt.Sprintf("ts too far in the future (after now+%s)", bucketWidth), http.StatusBadRequest)
 		return
 	}
 

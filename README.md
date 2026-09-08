@@ -26,11 +26,12 @@ exits; a second `Ctrl-C` kills immediately.
 
 `/stats` accepts an optional `?window=` (Go duration, e.g. `?window=30s`),
 capped at the 60-second retention window. `/ingest` requires `name` and `ts`
-(unix milliseconds, no older than the 60s window); `value` and `type` default
-to zero if omitted. Each route accepts only the method shown above — anything
-else returns `405`.
+(unix milliseconds; the event is bucketed by `ts`, which must fall between 60s
+ago and ~10s ahead); `value` and `type` default to zero if omitted. Each route
+accepts only the method shown above — anything else returns `405`.
 
-Event body (`ts` is unix milliseconds and must be within the last 60s):
+Event body (`ts` is unix milliseconds; events are aggregated by `ts`, so a
+late arrival still counts toward the minute it happened in):
 
 ```json
 { "name": "cpu.load", "value": 0.8, "type": "gauge", "ts": 1757200000000 }
