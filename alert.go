@@ -8,6 +8,9 @@ package main
 import (
 	"errors"
 	"fmt"
+	"log"
+	"sort"
+	"sync"
 	"time"
 )
 
@@ -144,4 +147,106 @@ func evaluate(r Rule, a Agg, ok bool) (State, float64) {
 		return StateFiring, v
 	}
 	return StateOK, v
+}
+
+// AlertState is where one rule currently stands. Since marks when the rule
+// entered this state - it only moves on a transition, so "firing for how
+// long" is answerable (and it's the field a `for` duration will need).
+type AlertState struct {
+	Rule   string    `json:"rule"`
+	Metric string    `json:"metric"`
+	State  State     `json:"state"`
+	Value  float64   `json:"value"` // observed at the last evaluation
+	Since  time.Time `json:"since"`
+}
+
+// Alerter evaluates a fixed set of rules against a Store on demand.
+// It reads the Store and never the reverse: aggregation knows nothing about
+// alerting. Its own mutex guards only its own state.
+type Alerter struct {
+	mu     sync.Mutex
+	states map[string]*AlertState // by rule name
+
+	store *Store // read-only from here
+	rules []Rule // fixed after construction, so needs no lock
+}
+
+// newAlerter validates every rule up front and seeds each one's state.
+// Rules are defined in code, so a bad rule is a startup failure, not a
+// surprise at evaluation time.
+func newAlerter(now time.Time, s *Store, rules []Rule) (*Alerter, error) {
+	states := make(map[string]*AlertState, len(rules))
+	for _, r := range rules {
+		if err := r.Validate(); err != nil {
+			return nil, err
+		}
+		// Name keys the state map, so a duplicate would silently make two
+		// rules share one state instead of failing loudly.
+		if _, dup := states[r.Name]; dup {
+			return nil, fmt.Errorf("duplicate rule name %q", r.Name)
+		}
+		states[r.Name] = &AlertState{
+			Rule:   r.Name,
+			Metric: r.Metric,
+			State:  StateNoData, // nothing observed yet, which is the truth
+			Since:  now,
+		}
+	}
+	return &Alerter{states: states, store: s, rules: rules}, nil
+}
+
+// evaluateAll re-checks every rule against the store and logs the ones that
+// changed state. Steady state is silent: only transitions are events, so a
+// firing rule logs once, not on every tick.
+func (a *Alerter) evaluateAll(now time.Time) {
+	for _, r := range a.rules {
+		// Read the store outside a.mu - it has its own lock, and nesting
+		// the two would be a deadlock waiting to happen.
+		agg, ok := a.store.aggFor(r.Metric, windowStart(now, r.lookback()))
+		state, value := evaluate(r, agg, ok)
+
+		a.mu.Lock()
+		st := a.states[r.Name]
+		from := st.State
+		changed := from != state
+		if changed {
+			st.State = state
+			st.Since = now
+		}
+		st.Value = value
+		a.mu.Unlock()
+
+		// Log outside the lock: writing to stdout while holding a mutex
+		// would put I/O latency into every other caller's critical path.
+		if changed {
+			logTransition(r, from, state, value)
+		}
+	}
+}
+
+// logTransition is, for now, the whole notification story - and the single
+// seam a webhook or pager would plug into later. There's no Notifier
+// interface yet because there's only one implementation to hide behind it.
+func logTransition(r Rule, from, to State, value float64) {
+	if to == StateNoData {
+		log.Printf("ALERT [%s] %s -> %s: %s has no data in %s",
+			r.Name, from, to, r.Metric, r.lookback())
+		return
+	}
+	log.Printf("ALERT [%s] %s -> %s: %s %s=%g (threshold %s %g)",
+		r.Name, from, to, r.Metric, r.Stat, value, r.Op, r.Value)
+}
+
+// Snapshot copies out the current state of every rule, ordered by rule name
+// so callers (and tests) get a stable listing rather than map order.
+func (a *Alerter) Snapshot() []AlertState {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	out := make([]AlertState, 0, len(a.states))
+	for _, st := range a.states {
+		out = append(out, *st) // copy: callers must not hold our pointers
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Rule < out[j].Rule })
+	return out
 }

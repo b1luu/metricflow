@@ -360,13 +360,36 @@ the buckets are gone and the question can't be answered honestly. The
 `switch` defaults in `statValue`/`breached` are unreachable for a validated
 rule but degrade quietly rather than panic — tested, so that stays true.
 
-**Still to come:** an `Alerter` holding per-rule state and logging
-transitions, a ticker goroutine to drive it, and `GET /alerts`. Evaluation
-will run **on an interval, not on ingest** — alerting cost should scale with
-the number of rules, not the number of events, and the ingest path is the one
-§17 just cleared out. Notification is a log line at the transition point;
-that transition is the single seam a webhook would plug into later, so no
-`Notifier` interface until there's a second implementation to justify it.
+**The `Alerter` owns the state, the `Store` knows nothing about it.**
+`Alerter` holds the rules, a per-rule `AlertState`, and its own mutex; it
+reads the `Store` and never the reverse. Aggregation is a lower layer that
+alerting consumes — the same separation §5a drew between state and handlers.
+
+- **`Since` moves only on a transition.** That's what makes "firing for how
+  long" answerable, and it's exactly the field a `for` duration will need.
+  `Value` refreshes on every evaluation; `Since` does not.
+- **Only transitions are logged.** Steady state is silent, so a firing rule
+  logs once rather than every ten seconds. `logTransition` is the whole
+  notification story for now, and the single seam a webhook or pager would
+  plug into — no `Notifier` interface until there is a second implementation
+  to justify hiding behind one.
+- **Duplicate rule names are a construction error.** The name keys the state
+  map, so a duplicate would silently make two rules share one state.
+- **Each rule is read separately, not from one shared snapshot.** Rules carry
+  their own windows, so they have their own cutoffs; one snapshot can't serve
+  them all. Hence `(*Store).aggFor(name, cutoff)` alongside `handleStats`'s
+  all-metrics loop — and the two genuinely can't share a path, since ranging
+  under `s.mu` while calling a method that takes `s.mu` would deadlock (Go
+  mutexes aren't reentrant). The upside is that each rule holds the store
+  lock for one short merge instead of one long one, which matters given §5.
+- **The store is read outside `a.mu`, and logging happens outside it too.**
+  Nesting the two locks invites deadlock; doing stdout I/O under a lock puts
+  write latency into every other caller's critical path.
+
+**Still to come:** a ticker goroutine to drive `evaluateAll`, and
+`GET /alerts` over `Snapshot()`. Evaluation runs **on an interval, not on
+ingest** — alerting cost should scale with the number of rules, not the
+number of events, and the ingest path is the one §17 just cleared out.
 
 ## Testing
 

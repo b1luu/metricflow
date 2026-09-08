@@ -140,6 +140,16 @@ func mergeBuckets(series map[int64]*Agg, cutoff int64) (Agg, bool) {
 	return merged, !first
 }
 
+// aggFor merges one metric's buckets at or after cutoff, taking the lock
+// itself. The alerter needs a per-metric read because each rule carries its
+// own window (and so its own cutoff); handleStats keeps its own loop because
+// it wants every metric at one cutoff under a single lock.
+func (s *Store) aggFor(name string, cutoff int64) (Agg, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return mergeBuckets(s.aggs[name], cutoff)
+}
+
 // windowStart returns the bucket key marking the start of a window of
 // size d ending at now: any bucket with a key >= this is inside the window.
 func windowStart(now time.Time, d time.Duration) int64 {
