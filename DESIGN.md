@@ -324,6 +324,50 @@ request can't degrade the whole server:
   it fires the status and headers are already sent and the only cause is a
   client that hung up mid-read — nothing the server can or should act on.
 
+### 18. Alerting: rules over the windowed aggregates
+
+A `Rule` is one predicate over a metric's window: *"`cpu.load`'s `avg` over
+`30s` is `>` `0.9`"* — metric, stat, op, threshold, window. Which **stat**
+carries most of the meaning: `max` catches spikes, `avg` catches sustained
+load, `count` catches a metric that has gone quiet. Same machinery, very
+different alerts.
+
+Lives in `alert.go`, not `main.go` — same package, but a separate concern
+from ingest and storage, and `main.go` was already doing two jobs.
+
+**Three states, not a boolean.** `ok`, `firing`, and `nodata`.
+
+- **Why `nodata` is its own state:** `mergeBuckets` already reports whether
+  any bucket fell inside the window, so the information is free — discarding
+  it is the extra step. Folding it into `ok` is actively dangerous: a service
+  that stopped reporting would read as healthy. Folding it into `firing`
+  means every low-frequency metric alarms forever. With no observations
+  there is nothing to compare, and saying so is the only honest answer.
+- A zero `Count` is treated as `nodata` too, which is also what keeps
+  `avg = Sum/Count` from producing `NaN`.
+
+**`evaluate(rule, agg, ok)` is pure** — no clock, no locks, no side effects,
+no I/O. All the timing and transition bookkeeping is deliberately kept out of
+it, which is what makes the comparison logic exhaustively table-testable
+(every stat × every op, including exactly *on* the threshold, where `>` and
+`>=` diverge).
+
+**Validation happens once, at construction.** Rules are defined in code, so a
+bad stat or op is a programming error that should surface at startup, not
+evaluate to nonsense at 3am. `Rule.Validate` also caps a rule's window at the
+retention window for the same reason `/stats?window=` does (§11): past that
+the buckets are gone and the question can't be answered honestly. The
+`switch` defaults in `statValue`/`breached` are unreachable for a validated
+rule but degrade quietly rather than panic — tested, so that stays true.
+
+**Still to come:** an `Alerter` holding per-rule state and logging
+transitions, a ticker goroutine to drive it, and `GET /alerts`. Evaluation
+will run **on an interval, not on ingest** — alerting cost should scale with
+the number of rules, not the number of events, and the ingest path is the one
+§17 just cleared out. Notification is a log line at the transition point;
+that transition is the single seam a webhook would plug into later, so no
+`Notifier` interface until there's a second implementation to justify it.
+
 ## Testing
 
 See `main_test.go`. ~91% coverage — everything but `main()` (listen + signal
