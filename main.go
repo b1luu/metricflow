@@ -3,6 +3,7 @@ package main
 import (
 	"context"       // shutdown deadline + signal-cancelled context
 	"encoding/json" // decode JSON request bodies into Go values
+	"errors"        // errors.As, to classify a read failure
 	"fmt"           // formatted printing (stdout + http responses)
 	"io"            // io.ReadAll, to slurp the request body
 	"log"           // server lifecycle messages
@@ -54,6 +55,10 @@ const (
 	numBuckets  = 6                        // buckets kept per metric
 	window      = numBuckets * bucketWidth // 60s: default /stats window and
 	//                                        how far back buckets are retained
+
+	// maxIngestBody caps the /ingest request body. One event is a few
+	// hundred bytes; anything past this is a mistake or an attack.
+	maxIngestBody = 4 << 10 // 4 KiB
 )
 
 // record folds one event into its metric's running aggregate.
@@ -163,9 +168,16 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 
 // handleIngest: POST /ingest - accept one metric event as a JSON body.
 func (s *Store) handleIngest(w http.ResponseWriter, r *http.Request) {
-	// Read the whole request body into a []byte.
+	// Read the whole body, but refuse to buffer an unbounded amount -
+	// MaxBytesReader makes ReadAll fail once the limit is passed.
+	r.Body = http.MaxBytesReader(w, r.Body, maxIngestBody)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "could not read body", http.StatusBadRequest)
 		return
 	}
@@ -207,9 +219,6 @@ func (s *Store) handleIngest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("ts too far in the future (after now+%s)", bucketWidth), http.StatusBadRequest)
 		return
 	}
-
-	fmt.Printf("parsed event: name=%s value=%.2f type=%s ts=%d\n",
-		ev.Name, ev.Value, ev.Type, ev.TS)
 
 	s.record(now, ev)
 	fmt.Fprintln(w, "got it")
@@ -268,7 +277,9 @@ func (s *Store) handleStats(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	// Nothing useful to do if this fails: the client hung up mid-read, or
+	// the socket broke. Status and headers are already sent. Ignore it.
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 // routes builds the request multiplexer for a Store. Separate from main so

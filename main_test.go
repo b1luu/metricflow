@@ -279,6 +279,24 @@ func TestIngestHandlerBodyReadError(t *testing.T) {
 	}
 }
 
+// A body past maxIngestBody is refused with 413 before any parsing.
+func TestIngestHandlerRejectsOversizedBody(t *testing.T) {
+	s := newStore()
+
+	// valid JSON, but a huge "type" pads it past the limit
+	body := fmt.Sprintf(`{"name":"cpu.load","value":1,"ts":%d,"type":%q}`,
+		time.Now().UnixMilli(), strings.Repeat("x", maxIngestBody))
+
+	rec := postIngest(s, body)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413", rec.Code)
+	}
+	if len(s.aggs) != 0 {
+		t.Errorf("nothing should have been recorded, got %+v", s.aggs)
+	}
+}
+
 // An empty body is not valid JSON ("unexpected end of JSON input").
 func TestIngestHandlerEmptyBody(t *testing.T) {
 	s := newStore()

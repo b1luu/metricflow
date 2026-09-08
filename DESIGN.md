@@ -306,6 +306,24 @@ therefore takes both — `now` for eviction, `ev.TS` for the bucket.
   per-event idempotency keys and a seen-set with its own eviction; deferred
   as its own milestone.
 
+### 17. `/ingest` hardening for the hot path
+
+Ahead of the load harness, `/ingest` is tightened so a single bad or hostile
+request can't degrade the whole server:
+
+- **`http.MaxBytesReader`, 4 KiB.** One event is a few hundred bytes.
+  Without a cap, `io.ReadAll` would buffer an arbitrarily large body into
+  memory — a trivial DoS. Over the limit → `413`, before any parsing.
+- **No per-request logging.** The handler used to `fmt.Printf` every parsed
+  event. `os.Stdout` writes are synchronised and slow; at firehose rates
+  that line *is* the bottleneck, and the benchmark would be measuring
+  `Printf`, not the engine. Request-level observability, when it's needed,
+  belongs in a logging decorator (like `allow`) that can be toggled — not
+  hard-wired into the handler.
+- **`/stats` ignores the `Encode` error explicitly** (`_ = ...`). By the time
+  it fires the status and headers are already sent and the only cause is a
+  client that hung up mid-read — nothing the server can or should act on.
+
 ## Testing
 
 See `main_test.go`. ~91% coverage — everything but `main()` (listen + signal
