@@ -302,11 +302,43 @@ func routes(s *Store) http.Handler {
 	return mux
 }
 
+// defaultRules is this program's alert configuration. Rules live in code on
+// purpose: a POST /rules CRUD surface would add a lot of endpoint and
+// nothing to the aggregation story. Note there is no "metric went silent"
+// rule here - a metric with no events has no aggregate to compare, so that
+// case surfaces as StateNoData rather than as a count rule (§18).
+func defaultRules() []Rule {
+	return []Rule{
+		// Sustained load: the average over half a minute.
+		{Name: "cpu-hot", Metric: "cpu.load", Stat: StatAvg, Op: OpGT, Value: 0.9, Window: 30 * time.Second},
+		// A single spike the average would smooth away.
+		{Name: "cpu-spike", Metric: "cpu.load", Stat: StatMax, Op: OpGT, Value: 0.99},
+		{Name: "slow-requests", Metric: "http.latency_ms", Stat: StatMax, Op: OpGT, Value: 500},
+	}
+}
+
 // run serves on ln until ctx is cancelled, then drains in-flight requests
 // (up to 5s) and returns. Split from main so a test can drive the whole
 // lifecycle with a cancellable context instead of a real signal.
 func run(ctx context.Context, ln net.Listener) error {
-	srv := &http.Server{Handler: routes(newStore())}
+	store := newStore()
+
+	// Bad rules are a programming error, so fail before serving a single
+	// request rather than discovering it on the first tick.
+	alerter, err := newAlerter(time.Now(), store, defaultRules())
+	if err != nil {
+		return fmt.Errorf("alert rules: %w", err)
+	}
+
+	// The alerter shares the server's shutdown signal. alertDone lets us
+	// wait for it to actually stop, so the process never exits mid-evaluation.
+	alertDone := make(chan struct{})
+	go func() {
+		defer close(alertDone)
+		alerter.Run(ctx, evalInterval)
+	}()
+
+	srv := &http.Server{Handler: routes(store)}
 
 	errc := make(chan error, 1)
 	go func() {
@@ -324,7 +356,10 @@ func run(ctx context.Context, ln net.Listener) error {
 	// Give open requests up to 5s to finish before dropping them.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	return srv.Shutdown(shutdownCtx)
+	shutdownErr := srv.Shutdown(shutdownCtx)
+
+	<-alertDone // ctx is already cancelled, so this returns promptly
+	return shutdownErr
 }
 
 func main() {

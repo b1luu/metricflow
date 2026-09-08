@@ -386,10 +386,33 @@ alerting consumes — the same separation §5a drew between state and handlers.
   Nesting the two locks invites deadlock; doing stdout I/O under a lock puts
   write latency into every other caller's critical path.
 
-**Still to come:** a ticker goroutine to drive `evaluateAll`, and
-`GET /alerts` over `Snapshot()`. Evaluation runs **on an interval, not on
-ingest** — alerting cost should scale with the number of rules, not the
-number of events, and the ingest path is the one §17 just cleared out.
+**Evaluation runs on a ticker, not on ingest.** `(*Alerter).Run(ctx, every)`
+re-evaluates every rule on an interval until the context is cancelled.
+
+- **Why not on ingest:** alerting cost should scale with the number of
+  *rules*, not the number of *events*. Evaluating inside `record` would put
+  that work on the hot path §17 just cleared, inside the critical section,
+  lengthening exactly the lock §5 names as the throughput ceiling — and it
+  would re-check thousands of times a second a threshold that meaningfully
+  moves about once. Detection lag is instead bounded by one `evalInterval`.
+- **Why not lazily on `GET /alerts`:** nothing would exist until someone
+  looked, so nothing could ever be notified and "was it firing at 3am" would
+  be unanswerable. That's a query endpoint, not alerting.
+- **`every` is a parameter, not the constant.** Same reasoning as `run`
+  taking a `net.Listener`: a test drives the loop at millisecond speed and
+  proves the ticker really calls `evaluateAll`, rather than only that it
+  starts and stops.
+- **The alerter shares the server's shutdown signal** and `run` waits on a
+  done channel before returning, so the process never exits mid-evaluation.
+- **Rules live in code** (`defaultRules`). A `POST /rules` CRUD surface would
+  add a lot of endpoint and nothing to the aggregation story. There is
+  deliberately no "metric went silent" rule: a metric with no events has no
+  aggregate to compare, so `count < n` can't catch it — silence surfaces as
+  `nodata`. A test loads `defaultRules` so a typo fails at test time rather
+  than at startup.
+
+**Still to come:** `GET /alerts` over `Snapshot()`, then a `for` duration to
+suppress flapping.
 
 ## Testing
 

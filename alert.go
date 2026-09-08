@@ -6,6 +6,7 @@ package main
 // live with the Alerter (next slice). See DESIGN.md §18.
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -235,6 +236,33 @@ func logTransition(r Rule, from, to State, value float64) {
 	}
 	log.Printf("ALERT [%s] %s -> %s: %s %s=%g (threshold %s %g)",
 		r.Name, from, to, r.Metric, r.Stat, value, r.Op, r.Value)
+}
+
+// evalInterval is how often the alerter re-checks its rules: one bucket
+// width, so detection lag stays inside a single bucket of the data's own
+// resolution. Evaluation costs O(rules) per tick regardless of event rate,
+// so this is cheap - but like §8's bucket width it's a sensible default,
+// not a tuned value.
+const evalInterval = bucketWidth
+
+// Run re-evaluates every rule on a ticker until ctx is cancelled. every is a
+// parameter rather than the constant so tests can drive it far faster than
+// real time, the same way run() takes a listener instead of an address.
+//
+// The ticker's own timestamp is used as `now`: it is the honest moment the
+// evaluation belongs to, and it saves a redundant clock read.
+func (a *Alerter) Run(ctx context.Context, every time.Duration) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-t.C:
+			a.evaluateAll(now)
+		}
+	}
 }
 
 // Snapshot copies out the current state of every rule, ordered by rule name

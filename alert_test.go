@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"log"
 	"strings"
 	"testing"
@@ -411,5 +412,71 @@ func TestAlerterSnapshotIsSortedAndCopied(t *testing.T) {
 	got[0].State = StateFiring
 	if a.Snapshot()[0].State == StateFiring {
 		t.Error("Snapshot() handed out a live pointer, not a copy")
+	}
+}
+
+// --- Alerter: the ticker loop ---
+
+func TestAlerterRunStopsOnContextCancel(t *testing.T) {
+	a, err := newAlerter(time.Now(), newStore(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); a.Run(ctx, time.Hour) }()
+
+	cancel() // must not wait for the (one hour) tick
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run did not return after context cancel")
+	}
+}
+
+// The ticker actually drives evaluateAll - not just starts and stops.
+// A millisecond interval keeps it fast; evaluateAll itself is tested
+// directly elsewhere.
+func TestAlerterRunEvaluatesOnTick(t *testing.T) {
+	s := newStore()
+	seedBucket(s, "cpu.load", bucketAt(0), &Agg{Count: 1, Sum: 9, Min: 9, Max: 9})
+
+	a, err := newAlerter(time.Now(), s, []Rule{
+		{Name: "hot", Metric: "cpu.load", Stat: StatAvg, Op: OpGT, Value: 5},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); a.Run(ctx, time.Millisecond) }()
+	// Stop the loop and wait for it, so no goroutine outlives this test.
+	defer func() { cancel(); <-done }()
+
+	deadline := time.After(3 * time.Second)
+	for {
+		if a.Snapshot()[0].State == StateFiring {
+			return // the ticker evaluated
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("rule never fired; state = %+v", a.Snapshot()[0])
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
+// The rules this program actually ships with must load. Catches a typo in
+// defaultRules at test time instead of at startup.
+func TestDefaultRulesAreValid(t *testing.T) {
+	rules := defaultRules()
+	if len(rules) == 0 {
+		t.Fatal("defaultRules() is empty")
+	}
+	if _, err := newAlerter(time.Now(), newStore(), rules); err != nil {
+		t.Fatalf("defaultRules() rejected: %v", err)
 	}
 }
