@@ -292,13 +292,14 @@ func (s *Store) handleStats(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-// routes builds the request multiplexer for a Store. Separate from main so
-// tests can exercise the wiring (path -> handler, method gating) directly.
-func routes(s *Store) http.Handler {
+// routes builds the request multiplexer. Separate from main so tests can
+// exercise the wiring (path -> handler, method gating) directly.
+func routes(s *Store, a *Alerter) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", allow(http.MethodGet, handleHealth))
 	mux.HandleFunc("/ingest", allow(http.MethodPost, s.handleIngest))
 	mux.HandleFunc("/stats", allow(http.MethodGet, s.handleStats))
+	mux.HandleFunc("/alerts", allow(http.MethodGet, a.handleAlerts))
 	return mux
 }
 
@@ -338,7 +339,7 @@ func run(ctx context.Context, ln net.Listener) error {
 		alerter.Run(ctx, evalInterval)
 	}()
 
-	srv := &http.Server{Handler: routes(store)}
+	srv := &http.Server{Handler: routes(store, alerter)}
 
 	errc := make(chan error, 1)
 	go func() {

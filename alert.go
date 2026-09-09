@@ -7,9 +7,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"sort"
 	"sync"
 	"time"
@@ -277,4 +279,25 @@ func (a *Alerter) Snapshot() []AlertState {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Rule < out[j].Rule })
 	return out
+}
+
+// AlertsResponse is the JSON body of GET /alerts. An object rather than a
+// bare array so fields can be added later without breaking every caller's
+// parser.
+type AlertsResponse struct {
+	Alerts []AlertState `json:"alerts"`
+}
+
+// handleAlerts: GET /alerts - the current state of every configured rule.
+//
+// It reads a snapshot; it does not evaluate. Evaluation is the ticker's job
+// (§18), which keeps this a cheap read: polling it hard costs a lock and a
+// copy, never a full re-evaluation of every rule.
+func (a *Alerter) handleAlerts(w http.ResponseWriter, r *http.Request) {
+	// Snapshot() always returns a non-nil slice, so an empty rule set
+	// encodes as [] rather than null.
+	resp := AlertsResponse{Alerts: a.Snapshot()}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp) // see §17: nothing to do on failure
 }

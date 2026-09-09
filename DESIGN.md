@@ -11,8 +11,10 @@ survives even when the code changes.
 | `/health`       | GET    | Liveness check. Returns `ok`.                    |
 | `/ingest`       | POST   | Accept one metric event as a JSON body.          |
 | `/stats`        | GET    | Per-metric count/avg/min/max over a time window, as JSON. Optional `?window=`. |
+| `/alerts`       | GET    | Current state of every alert rule, as JSON.      |
 
-Wrong method on any route → `405` (§13). Details: JSON shape §14, `?window=` §11.
+Wrong method on any route → `405` (§13). Details: JSON shape §14, `?window=`
+§11, alerting §18.
 
 Event shape (see `Event` in `main.go`):
 
@@ -411,8 +413,22 @@ re-evaluates every rule on an interval until the context is cancelled.
   `nodata`. A test loads `defaultRules` so a typo fails at test time rather
   than at startup.
 
-**Still to come:** `GET /alerts` over `Snapshot()`, then a `for` duration to
-suppress flapping.
+**`GET /alerts` reads, it does not evaluate.** It serves `Snapshot()` as
+`{"alerts": [...]}`, one entry per configured rule.
+
+- **Why a read and not an evaluation:** evaluation is the ticker's job, so
+  polling this endpoint hard costs a lock and a copy — never a full re-check
+  of every rule against the store. An endpoint that evaluated on demand would
+  be a denial-of-service lever pointed at the ingest lock.
+- **An object, not a bare array**, so fields can be added later without
+  breaking every caller's parser. `Snapshot()` returns a non-nil slice, so an
+  empty rule set encodes as `[]` rather than `null` and clients can range
+  over it without a nil check.
+- **Every rule appears, including ones that have never fired.** `since` on a
+  `nodata` entry is the alerter's start time — visible proof that `Since`
+  tracks the transition, not the last evaluation.
+
+**Still to come:** a `for` duration to suppress flapping.
 
 ## Testing
 

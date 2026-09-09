@@ -872,7 +872,11 @@ func TestAllowPassesThroughCorrectMethod(t *testing.T) {
 
 // routes() maps each path to its handler with the right method gate.
 func TestRoutesWireHandlers(t *testing.T) {
-	h := routes(newStore())
+	a, err := newAlerter(time.Now(), newStore(), defaultRules())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := routes(newStore(), a)
 
 	cases := []struct {
 		method, path string
@@ -880,9 +884,11 @@ func TestRoutesWireHandlers(t *testing.T) {
 	}{
 		{http.MethodGet, "/health", http.StatusOK},
 		{http.MethodGet, "/stats", http.StatusOK},
+		{http.MethodGet, "/alerts", http.StatusOK},
 		{http.MethodPost, "/ingest", http.StatusBadRequest}, // empty body, but it reached the handler
 		{http.MethodGet, "/ingest", http.StatusMethodNotAllowed},
 		{http.MethodPost, "/stats", http.StatusMethodNotAllowed},
+		{http.MethodPost, "/alerts", http.StatusMethodNotAllowed},
 		{http.MethodGet, "/nope", http.StatusNotFound},
 	}
 	for _, c := range cases {

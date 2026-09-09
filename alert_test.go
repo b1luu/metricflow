@@ -3,7 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"log"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -478,5 +481,78 @@ func TestDefaultRulesAreValid(t *testing.T) {
 	}
 	if _, err := newAlerter(time.Now(), newStore(), rules); err != nil {
 		t.Fatalf("defaultRules() rejected: %v", err)
+	}
+}
+
+// --- GET /alerts ---
+
+// getAlerts calls handleAlerts and decodes the response.
+func getAlerts(t *testing.T, a *Alerter) AlertsResponse {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	a.handleAlerts(rec, httptest.NewRequest(http.MethodGet, "/alerts", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	var resp AlertsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("invalid JSON: %v (body %q)", err, rec.Body.String())
+	}
+	return resp
+}
+
+func TestAlertsHandlerReportsState(t *testing.T) {
+	s := newStore()
+	seedBucket(s, "cpu.load", bucketAt(0), &Agg{Count: 1, Sum: 9, Min: 9, Max: 9})
+
+	now := time.Now()
+	a, err := newAlerter(now, s, []Rule{
+		{Name: "hot", Metric: "cpu.load", Stat: StatAvg, Op: OpGT, Value: 5},
+		{Name: "quiet", Metric: "nothing.here", Stat: StatAvg, Op: OpGT, Value: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.evaluateAll(now)
+
+	got := getAlerts(t, a)
+	if len(got.Alerts) != 2 {
+		t.Fatalf("got %d alerts, want 2", len(got.Alerts))
+	}
+
+	// Snapshot orders by rule name, so "hot" precedes "quiet".
+	hot := got.Alerts[0]
+	if hot.Rule != "hot" || hot.Metric != "cpu.load" {
+		t.Errorf("first alert = %+v, want the hot rule", hot)
+	}
+	if hot.State != StateFiring || hot.Value != 9 {
+		t.Errorf("hot = %+v, want firing with value 9", hot)
+	}
+	if hot.Since.IsZero() {
+		t.Error("hot.Since is zero, want the transition time")
+	}
+
+	// A rule whose metric has never reported is nodata, not ok.
+	if quiet := got.Alerts[1]; quiet.State != StateNoData {
+		t.Errorf("quiet = %+v, want %q", quiet, StateNoData)
+	}
+}
+
+// No rules must encode as [] rather than null, so clients can range over it
+// without a nil check.
+func TestAlertsHandlerEmptyEncodesAsArray(t *testing.T) {
+	a, err := newAlerter(time.Now(), newStore(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	a.handleAlerts(rec, httptest.NewRequest(http.MethodGet, "/alerts", nil))
+
+	if body := strings.TrimSpace(rec.Body.String()); body != `{"alerts":[]}` {
+		t.Errorf("body = %s, want {\"alerts\":[]}", body)
 	}
 }

@@ -23,6 +23,13 @@ exits; a second `Ctrl-C` kills immediately.
 | GET    | `/health` | Liveness check. Returns `ok`.                          |
 | POST   | `/ingest` | Submit one metric event as a JSON body.                |
 | GET    | `/stats`  | Per-metric aggregate over a time window (JSON, default 60s). |
+| GET    | `/alerts` | Current state of every alert rule (JSON).              |
+
+`/alerts` reports each rule as `ok`, `firing`, or `nodata`, with the value it
+last saw and when it entered that state. Rules are defined in code
+(`defaultRules` in `main.go`) and re-evaluated every 10 seconds, so a
+threshold crossing shows up within one interval — and a rule whose metric has
+no data reads as `nodata`, never as healthy.
 
 `/stats` accepts an optional `?window=` (Go duration, e.g. `?window=30s`),
 capped at the 60-second retention window. `/ingest` requires `name` and `ts`
@@ -47,6 +54,13 @@ Invoke-RestMethod http://localhost:8080/stats
 # window  metrics
 # ------  -------
 # 1m0s    @{cpu.load=@{count=1; avg=0.8; min=0.8; max=0.8}}
+
+(Invoke-RestMethod http://localhost:8080/alerts).alerts
+# rule          metric          state  value since
+# ----          ------          -----  ----- -----
+# cpu-hot       cpu.load        ok       0.8 2026-09-09T13:48:00
+# cpu-spike     cpu.load        ok       0.8 2026-09-09T13:48:00
+# slow-requests http.latency_ms nodata     0 2026-09-09T13:47:50
 ```
 
 On non-Windows / with real curl:
