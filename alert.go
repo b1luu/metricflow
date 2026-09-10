@@ -45,13 +45,19 @@ type State string
 const (
 	StateOK     State = "ok"
 	StateFiring State = "firing"
+	// StatePending means the threshold is breached but has not held for the
+	// rule's For duration yet. It is deliberately pre-announcement: visible
+	// at /alerts, but it produces no log line, which is the whole point of
+	// For - a metric flapping across the threshold never announces anything.
+	StatePending State = "pending"
 	// StateNoData means the metric had no observations in the rule's
 	// window, so there is nothing to compare. Deliberately not folded into
 	// StateOK: a service that stopped reporting must not read as healthy.
 	StateNoData State = "nodata"
 )
 
-// Rule is one alerting predicate: "<metric>'s <stat> over <window> <op> <value>".
+// Rule is one alerting predicate: "<metric>'s <stat> over <window> <op> <value>",
+// optionally required to hold for a while before it counts.
 type Rule struct {
 	Name   string        // unique label; keys the rule's alert state
 	Metric string        // metric name to watch
@@ -59,6 +65,7 @@ type Rule struct {
 	Op     Op            // how to compare it
 	Value  float64       // threshold
 	Window time.Duration // lookback; zero means the full retention window
+	For    time.Duration // how long the breach must hold; zero fires at once
 }
 
 // lookback is the rule's effective window. Zero means "the default", so a
@@ -97,6 +104,12 @@ func (r Rule) Validate() error {
 	// never be answered honestly - same limit /stats?window= enforces (§11).
 	if r.Window < 0 || r.Window > window {
 		return fmt.Errorf("rule %q: window %s must be >= 0 and <= %s", r.Name, r.Window, window)
+	}
+
+	// For has no upper bound: it counts how long a breach has persisted
+	// across evaluations, which is unrelated to how much data is retained.
+	if r.For < 0 {
+		return fmt.Errorf("rule %q: for %s must be >= 0", r.Name, r.For)
 	}
 	return nil
 }
@@ -152,9 +165,42 @@ func evaluate(r Rule, a Agg, ok bool) (State, float64) {
 	return StateOK, v
 }
 
+// applyFor folds the instantaneous verdict from evaluate into the durable
+// state machine, holding a fresh breach in StatePending until it has lasted
+// r.For. current and since are the rule's stored state.
+//
+// Pure, like evaluate: everything it needs is an argument, so the whole
+// ok -> pending -> firing walk is table-testable without a clock or a lock.
+//
+//	           breach                held for For
+//	ok/nodata ────────> pending ──────────────────> firing
+//	    ^                  │                           │
+//	    └──────────────────┴───────────────────────────┘
+//	                 breach ends
+func applyFor(r Rule, now time.Time, current State, since time.Time, want State) State {
+	// Only a breach can be held back, and only if the rule asks for it.
+	if want != StateFiring || r.For <= 0 {
+		return want
+	}
+
+	switch current {
+	case StateFiring:
+		return StateFiring // already promoted; For is spent
+	case StatePending:
+		// since is when the breach began, because pending is only ever
+		// entered at that moment.
+		if now.Sub(since) >= r.For {
+			return StateFiring
+		}
+		return StatePending
+	default: // ok or nodata - the breach starts now
+		return StatePending
+	}
+}
+
 // AlertState is where one rule currently stands. Since marks when the rule
 // entered this state - it only moves on a transition, so "firing for how
-// long" is answerable (and it's the field a `for` duration will need).
+// long" is answerable, and it doubles as "breaching since" while pending.
 type AlertState struct {
 	Rule   string    `json:"rule"`
 	Metric string    `json:"metric"`
@@ -206,11 +252,12 @@ func (a *Alerter) evaluateAll(now time.Time) {
 		// Read the store outside a.mu - it has its own lock, and nesting
 		// the two would be a deadlock waiting to happen.
 		agg, ok := a.store.aggFor(r.Metric, windowStart(now, r.lookback()))
-		state, value := evaluate(r, agg, ok)
+		want, value := evaluate(r, agg, ok)
 
 		a.mu.Lock()
 		st := a.states[r.Name]
 		from := st.State
+		state := applyFor(r, now, st.State, st.Since, want)
 		changed := from != state
 		if changed {
 			st.State = state
@@ -221,10 +268,28 @@ func (a *Alerter) evaluateAll(now time.Time) {
 
 		// Log outside the lock: writing to stdout while holding a mutex
 		// would put I/O latency into every other caller's critical path.
-		if changed {
+		if changed && announce(from, state) {
 			logTransition(r, from, state, value)
 		}
 	}
+}
+
+// announce reports whether a transition is worth notifying about.
+//
+// Pending is pre-announcement: entering it says nothing, and leaving it only
+// matters if the breach actually survived For and became firing. Suppressing
+// pending -> ok is the point of the feature - a metric flapping across the
+// threshold produces no notification at all, rather than a fire/resolve pair
+// every tick. The consequence to accept is that pending -> nodata is silent
+// too; that state is still visible at /alerts.
+func announce(from, to State) bool {
+	if to == StatePending {
+		return false
+	}
+	if from == StatePending {
+		return to == StateFiring
+	}
+	return true
 }
 
 // logTransition is, for now, the whole notification story - and the single

@@ -310,9 +310,13 @@ func routes(s *Store, a *Alerter) http.Handler {
 // case surfaces as StateNoData rather than as a count rule (§18).
 func defaultRules() []Rule {
 	return []Rule{
-		// Sustained load: the average over half a minute.
-		{Name: "cpu-hot", Metric: "cpu.load", Stat: StatAvg, Op: OpGT, Value: 0.9, Window: 30 * time.Second},
-		// A single spike the average would smooth away.
+		// Sustained load: the average over half a minute, and it has to
+		// stay bad for a couple of evaluations before it's worth saying.
+		{Name: "cpu-hot", Metric: "cpu.load", Stat: StatAvg, Op: OpGT, Value: 0.9,
+			Window: 30 * time.Second, For: 20 * time.Second},
+		// A single spike the average would smooth away. No For: a spike is
+		// instantaneous by nature, so waiting for it to persist would mean
+		// never reporting the thing this rule exists to catch.
 		{Name: "cpu-spike", Metric: "cpu.load", Stat: StatMax, Op: OpGT, Value: 0.99},
 		{Name: "slow-requests", Metric: "http.latency_ms", Stat: StatMax, Op: OpGT, Value: 500},
 	}

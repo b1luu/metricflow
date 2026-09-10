@@ -25,11 +25,15 @@ exits; a second `Ctrl-C` kills immediately.
 | GET    | `/stats`  | Per-metric aggregate over a time window (JSON, default 60s). |
 | GET    | `/alerts` | Current state of every alert rule (JSON).              |
 
-`/alerts` reports each rule as `ok`, `firing`, or `nodata`, with the value it
-last saw and when it entered that state. Rules are defined in code
-(`defaultRules` in `main.go`) and re-evaluated every 10 seconds, so a
+`/alerts` reports each rule as `ok`, `pending`, `firing`, or `nodata`, with
+the value it last saw and when it entered that state. Rules are defined in
+code (`defaultRules` in `main.go`) and re-evaluated every 10 seconds, so a
 threshold crossing shows up within one interval — and a rule whose metric has
 no data reads as `nodata`, never as healthy.
+
+A rule may set `For`, requiring the breach to hold that long before it counts;
+until then it sits in `pending` and logs nothing, so a metric flapping across
+its threshold never raises an alert at all.
 
 `/stats` accepts an optional `?window=` (Go duration, e.g. `?window=30s`),
 capped at the 60-second retention window. `/ingest` requires `name` and `ts`

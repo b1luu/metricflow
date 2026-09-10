@@ -206,6 +206,7 @@ func TestRuleValidate(t *testing.T) {
 		{"unknown op", func(r *Rule) { r.Op = "~" }, "unknown op"},
 		{"negative window", func(r *Rule) { r.Window = -time.Second }, "window"},
 		{"window past retention", func(r *Rule) { r.Window = window + time.Second }, "window"},
+		{"negative for", func(r *Rule) { r.For = -time.Second }, "for"},
 	}
 	for _, c := range bad {
 		t.Run(c.name, func(t *testing.T) {
@@ -554,5 +555,146 @@ func TestAlertsHandlerEmptyEncodesAsArray(t *testing.T) {
 
 	if body := strings.TrimSpace(rec.Body.String()); body != `{"alerts":[]}` {
 		t.Errorf("body = %s, want {\"alerts\":[]}", body)
+	}
+}
+
+// --- For duration / flap suppression ---
+
+func TestApplyFor(t *testing.T) {
+	base := time.Now()
+	withFor := Rule{For: 30 * time.Second}
+	noFor := Rule{}
+
+	cases := []struct {
+		name    string
+		rule    Rule
+		now     time.Time
+		current State
+		since   time.Time
+		want    State // the instantaneous verdict from evaluate
+		expect  State
+	}{
+		// For == 0 passes everything straight through: existing behaviour.
+		{"no For fires at once", noFor, base, StateOK, base, StateFiring, StateFiring},
+		{"no For stays ok", noFor, base, StateOK, base, StateOK, StateOK},
+
+		// Non-breaches are never held back, whatever For says.
+		{"ok is never pending", withFor, base, StateFiring, base, StateOK, StateOK},
+		{"nodata is never pending", withFor, base, StatePending, base, StateNoData, StateNoData},
+
+		// A fresh breach waits.
+		{"breach from ok starts pending", withFor, base, StateOK, base, StateFiring, StatePending},
+		{"breach from nodata starts pending", withFor, base, StateNoData, base, StateFiring, StatePending},
+
+		// Pending is promoted only once For has elapsed.
+		{"pending before For holds", withFor, base.Add(29 * time.Second), StatePending, base, StateFiring, StatePending},
+		{"pending exactly at For promotes", withFor, base.Add(30 * time.Second), StatePending, base, StateFiring, StateFiring},
+		{"pending past For promotes", withFor, base.Add(31 * time.Second), StatePending, base, StateFiring, StateFiring},
+
+		// Once firing, For is spent - it must not re-enter pending.
+		{"firing stays firing", withFor, base.Add(time.Hour), StateFiring, base, StateFiring, StateFiring},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := applyFor(c.rule, c.now, c.current, c.since, c.want); got != c.expect {
+				t.Errorf("applyFor = %q, want %q", got, c.expect)
+			}
+		})
+	}
+}
+
+func TestAnnounce(t *testing.T) {
+	cases := []struct {
+		from, to State
+		want     bool
+	}{
+		{StateOK, StatePending, false},     // a breach starting says nothing
+		{StateNoData, StatePending, false}, //
+		{StatePending, StateOK, false},     // the flap we exist to suppress
+		{StatePending, StateNoData, false}, // accepted consequence
+		{StatePending, StateFiring, true},  // the promotion must be heard
+		{StateOK, StateFiring, true},       // For == 0 path
+		{StateFiring, StateOK, true},       // resolved
+		{StateFiring, StateNoData, true},   // resolved into silence
+		{StateOK, StateNoData, true},       // unchanged from before For existed
+	}
+	for _, c := range cases {
+		if got := announce(c.from, c.to); got != c.want {
+			t.Errorf("announce(%q, %q) = %v, want %v", c.from, c.to, got, c.want)
+		}
+	}
+}
+
+// End to end through the alerter: a breach sits in pending, gets promoted
+// once For elapses, and only the promotion is announced.
+func TestAlerterHoldsPendingUntilFor(t *testing.T) {
+	s := newStore()
+	seedBucket(s, "cpu.load", bucketAt(0), &Agg{Count: 1, Sum: 9, Min: 9, Max: 9})
+
+	t0 := time.Now()
+	a, err := newAlerter(t0, s, []Rule{
+		{Name: "hot", Metric: "cpu.load", Stat: StatAvg, Op: OpGT, Value: 5, For: 30 * time.Second},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// First breach: pending, and silent.
+	quiet := captureLog(t, func() { a.evaluateAll(t0.Add(time.Second)) })
+	if st := a.Snapshot()[0]; st.State != StatePending {
+		t.Fatalf("State = %q, want %q", st.State, StatePending)
+	}
+	if quiet != "" {
+		t.Errorf("entering pending logged %q, want silence", quiet)
+	}
+
+	// Still breaching but not long enough: no change, still silent.
+	a.evaluateAll(t0.Add(20 * time.Second))
+	if st := a.Snapshot()[0]; st.State != StatePending {
+		t.Errorf("State = %q, want it still %q", st.State, StatePending)
+	}
+
+	// Past For: promoted, and announced.
+	loud := captureLog(t, func() { a.evaluateAll(t0.Add(40 * time.Second)) })
+	if st := a.Snapshot()[0]; st.State != StateFiring {
+		t.Fatalf("State = %q, want %q", st.State, StateFiring)
+	}
+	if !strings.Contains(loud, "firing") {
+		t.Errorf("promotion logged %q, want a firing line", loud)
+	}
+}
+
+// The flap this feature exists to suppress: breach, recover, breach,
+// recover - all inside For - must produce no notification at all.
+func TestAlerterSuppressesFlapping(t *testing.T) {
+	s := newStore()
+	t0 := time.Now()
+
+	a, err := newAlerter(t0, s, []Rule{
+		{Name: "hot", Metric: "cpu.load", Stat: StatAvg, Op: OpGT, Value: 5, For: time.Minute},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	setAvg := func(v float64) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.aggs["cpu.load"] = map[int64]*Agg{bucketAt(0): {Count: 1, Sum: v, Min: v, Max: v}}
+	}
+
+	out := captureLog(t, func() {
+		for i, v := range []float64{9, 1, 9, 1} { // over, under, over, under
+			setAvg(v)
+			a.evaluateAll(t0.Add(time.Duration(i+1) * time.Second))
+		}
+	})
+
+	if out != "" {
+		t.Errorf("flapping logged %q, want silence", out)
+	}
+	if st := a.Snapshot()[0]; st.State != StateOK {
+		t.Errorf("final State = %q, want %q", st.State, StateOK)
 	}
 }

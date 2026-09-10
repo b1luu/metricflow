@@ -428,7 +428,46 @@ re-evaluates every rule on an interval until the context is cancelled.
   `nodata` entry is the alerter's start time — visible proof that `Since`
   tracks the transition, not the last evaluation.
 
-**Still to come:** a `for` duration to suppress flapping.
+**`For` suppresses flapping via a fourth state.** A rule may require its
+breach to hold for `For` before it counts. Until then the rule sits in
+`pending`:
+
+```
+ok/nodata ──breach──> pending ──held for For──> firing
+    ^                    │                         │
+    └────────────────────┴─────────────────────────┘
+                    breach ends
+```
+
+- **Why it's needed:** a metric oscillating around the threshold would
+  otherwise fire and resolve on every tick. `For` turns "is it bad right
+  now" into "has it been bad long enough to be worth saying".
+- **`pending` is pre-announcement.** Entering it logs nothing; leaving it
+  logs only if it became `firing`. So a flap produces *no notification at
+  all*, rather than a fire/resolve pair every ten seconds. The state is
+  still visible at `/alerts`. `announce(from, to)` is the one predicate that
+  decides this, so the policy lives in a single testable place. The
+  consequence to accept: `pending → nodata` is silent too.
+- **`For: 0` fires immediately**, which is what every rule did before this
+  existed — so the feature is opt-in and adds no behaviour to rules that
+  don't want it. `defaultRules` uses both: `cpu-hot` waits, because
+  sustained load is the point; `cpu-spike` doesn't, because a spike is
+  instantaneous by nature and waiting for it to persist would mean never
+  reporting the thing the rule exists to catch.
+- **`applyFor` is pure, like `evaluate`.** `evaluate` still returns the
+  *instantaneous* verdict and its slice-1 tests were untouched; `applyFor`
+  maps that onto the durable state machine given the stored state. Splitting
+  it that way meant adding `For` required no changes to the comparison core,
+  and the whole `ok → pending → firing` walk is table-testable with no clock
+  and no lock.
+- **`Since` needs no new field.** It already meant "when this state began",
+  and `pending` is only ever entered at the moment a breach starts — so
+  while pending it *is* "breaching since", which is exactly what the
+  promotion check needs. Designing that in at slice 2 is what made this
+  slice additive rather than a rewrite.
+- **`For` has no upper bound** (unlike `Window`, §11): it counts how long a
+  breach persisted across evaluations, which is unrelated to how much data
+  is retained. A five-minute `For` over a sixty-second window is coherent.
 
 ## Testing
 
