@@ -80,12 +80,28 @@ A `sync.Mutex` guards every read and write of the aggregate map.
 - **Why one coarse lock, not per-metric locks:** the critical sections are a
   handful of arithmetic ops — nanoseconds. Contention isn't a real problem at
   this scale, and one lock is far easier to reason about.
-- **Known scaling limit:** every ingest and every query contends on this one
-  lock, so it is the throughput ceiling once the load harness arrives — a
+- **Known scaling limit — now measured, not predicted.** Every ingest and
+  every query contends on this one lock, so it is the throughput ceiling: a
   single global lock serializes exactly the concurrency the project means to
-  showcase. The fix when it matters: shard the map (and its lock) by metric
-  name, so writes to different metrics don't block each other. Not worth the
-  complexity until a profile says so.
+  showcase. §19's benchmarks make it visible (Ryzen 7 7800X3D, 16 threads):
+
+  | benchmark | ns/op | ≈ events/sec |
+  | --- | --- | --- |
+  | `Record` (1 goroutine) | 68.4 | 14.6 M |
+  | `RecordParallelSameMetric` (16) | 108.7 | 9.2 M |
+  | `RecordParallelDistinctMetrics` (16) | 130.0 | 7.7 M |
+
+  Writes to *distinct* metrics touch disjoint data — the only thing they
+  share is `s.mu`. With a sharded lock that row should scale with cores.
+  Instead it is no faster than the same-metric case and **slower than a
+  single goroutine**: adding parallelism costs throughput, because every
+  goroutine serializes on one mutex and pays contention overhead on top of
+  the work. That is the ceiling, quantified.
+- **The fix when it matters:** shard the map and its lock by metric name, so
+  writes to different metrics don't block each other. Still not worth the
+  complexity — 7.7 M events/sec is orders of magnitude past anything this
+  project ingests, and the honest engineering answer is that a measured
+  bottleneck nobody is hitting is a note, not a task.
 
 ### 5a. State lives on a `Store`, not in package globals
 
@@ -468,6 +484,49 @@ ok/nodata ──breach──> pending ──held for For──> firing
 - **`For` has no upper bound** (unlike `Window`, §11): it counts how long a
   breach persisted across evaluations, which is unrelated to how much data
   is retained. A five-minute `For` over a sixty-second window is coherent.
+
+### 19. The load harness is `go test -bench`, not a separate load generator
+
+`bench_test.go` measures the engine through the ordinary Go benchmark
+machinery:
+
+```
+go test -run=^$ -bench=. -benchmem
+go test -run=^$ -bench=Record -cpuprofile=cpu.out
+```
+
+- **Why not a `cmd/loadgen` binary firing real HTTP:** it would measure the
+  machine's network stack as much as the engine, vary run to run, and produce
+  nothing assertable. Benchmarks are reproducible, run in CI, and plug
+  straight into `-cpuprofile` / `-benchmem` — which is what turns "the global
+  lock is the bottleneck" from a claim into evidence. A load generator is a
+  better *demo*; this is better *proof*.
+- **The design is the comparison, not the number.**
+  `RecordParallelSameMetric` and `RecordParallelDistinctMetrics` exist as a
+  pair: distinct metrics touch disjoint data, so the only thing they share is
+  `s.mu`. Either the second scales with cores (the lock isn't the limit) or
+  it doesn't (it is). It doesn't — see the table in §5. A single benchmark
+  number couldn't have shown that.
+- **Benchmark hygiene that mattered:**
+  - `record` takes `now` as a parameter, so the clock is hoisted out of the
+    hot loop — the measurement is the update path, not `time.Now()`.
+  - `handleIngest` reads the clock itself and rejects a stale `ts` (§16), so
+    a fixed body would silently start measuring the *reject* path on a long
+    `-benchtime`. The body's timestamp is refreshed every 1024 iterations
+    (under `StopTimer`), and the status is checked every iteration so the
+    failure would be loud rather than silent.
+  - `discardWriter` replaces `httptest.NewRecorder`, which buffers every
+    response body — reusing one across a benchmark would measure its buffer
+    growth as much as the handler.
+  - `BenchmarkEvaluateAll` warms up once before timing: the first evaluation
+    is a `nodata → ok` transition for every rule and would put 50 log writes
+    inside the measurement. A tick costs ~4.3 µs for 50 rules, against a
+    10-second interval — confirming §18's claim that alerting cost scales
+    with rule count and is free at any event rate.
+
+**Still to come:** correctness invariants under concurrency — exact counts
+with many writers plus concurrent readers, and a mixed valid/invalid stream
+where only accepted events may be counted.
 
 ## Testing
 
