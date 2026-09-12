@@ -524,9 +524,55 @@ go test -run=^$ -bench=Record -cpuprofile=cpu.out
     10-second interval — confirming §18's claim that alerting cost scales
     with rule count and is free at any event rate.
 
-**Still to come:** correctness invariants under concurrency — exact counts
-with many writers plus concurrent readers, and a mixed valid/invalid stream
-where only accepted events may be counted.
+### 20. Correctness under load: exactness, and tests with teeth
+
+`harness_test.go` is the other half. The benchmarks answer *how fast*; these
+answer *still right*. The invariant is always **exactness** — every accepted
+event counted once, nothing else counted at all — because "approximately the
+right count under load" is indistinguishable from a lost-update bug.
+
+- **`TestConcurrentRecordIsExact`** — 64 goroutines × 1000 events on one
+  metric; `Count`, `Sum`, `Min`, `Max` must all be exact.
+- **`TestConcurrentReadersAndWritersStayExact`** — writers against every
+  production reader at once: `/stats`, `/alerts`, and the alerter's own
+  `evaluateAll`. Go panics on concurrent map access even without `-race`, so
+  a dropped lock anywhere fails loudly; the exact final count proves nothing
+  was lost while the readers hammered.
+- **`TestMixedStreamCountsOnlyAcceptedEvents`** — the injected-failure case.
+  A concurrent stream mixing valid requests with all six rejectable kinds
+  (malformed JSON, no name, no ts, ts too old, ts too far future, body over
+  the 4 KiB cap). The store's count must equal exactly the number of `200`
+  responses. The bad bodies deliberately carry the *same metric name* as the
+  good traffic, so anything that leaked through would inflate that metric
+  rather than hide under a name of its own.
+
+**These tests were verified to fail.** Temporarily removing `s.mu` from
+`record` produced, immediately:
+
+```
+--- FAIL: TestConcurrentRecordIsExact
+    Count = 63666, want 64000 (lost or duplicated updates)
+    Sum = 347071, want 352000
+fatal error: concurrent map writes
+```
+
+334 lost increments out of 64,000, caught as a legible assertion rather than
+a vague flake. A concurrency test that has never been seen to fail is a
+guess; this one has a known failure mode and a known signature.
+
+**On `float64` and interleaving.** Addition is not associative, so a
+concurrent `Sum` over arbitrary values could legitimately differ in its low
+bits purely by goroutine ordering — an exact-equality assertion on it would
+be flaky for a *correct* implementation. The harness sidesteps that rather
+than papering over it with an epsilon: all values are integer-valued floats
+whose running total stays far below 2⁵³, where every intermediate is exactly
+representable and any order yields the identical result. `Count`, `Min` and
+`Max` are order-independent regardless, so they need no such care.
+
+**Not covered:** `go test -race`, which needs a 64-bit C toolchain this
+machine doesn't have. These tests catch lost updates and Go's own
+concurrent-map panic, but not subtler races the detector would find — worth
+running under WSL or CI before claiming the concurrency is proven.
 
 ## Testing
 
