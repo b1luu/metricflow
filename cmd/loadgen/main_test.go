@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -359,5 +360,117 @@ func TestBadFractionIsHonoured(t *testing.T) {
 	frac := float64(tal.sent()-tal.good) / float64(tal.sent())
 	if frac < 0.4 || frac > 0.6 {
 		t.Errorf("bad fraction = %.2f, want ~0.50 (sent %d, good %d)", frac, tal.sent(), tal.good)
+	}
+}
+
+// --- end-to-end verification ---
+
+// statsServer is a stand-in for MetricFlow's /stats, reporting whatever
+// counts the test dictates.
+func statsServer(t *testing.T, window string, counts map[string]int) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		type m struct {
+			Count int `json:"count"`
+		}
+		body := struct {
+			Window  string       `json:"window"`
+			Metrics map[string]m `json:"metrics"`
+		}{Window: window, Metrics: map[string]m{}}
+		for name, c := range counts {
+			body.Metrics[name] = m{Count: c}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(body)
+	}))
+}
+
+func TestVerifyAgreesWhenCountsMatch(t *testing.T) {
+	cfg := config{metrics: 2, runID: "abc", duration: time.Second}
+	srv := statsServer(t, "1m0s", map[string]int{
+		cfg.metricName(0): 60,
+		cfg.metricName(1): 40,
+	})
+	defer srv.Close()
+	cfg.target = srv.URL
+
+	tal := newTally()
+	tal.byStatus[http.StatusOK] = 100
+
+	var buf bytes.Buffer
+	if err := verify(newClient(1), cfg, tal, time.Second, &buf); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if !strings.Contains(buf.String(), "OK") {
+		t.Errorf("output = %q, want an OK line", buf.String())
+	}
+}
+
+// The whole reason this exists: a server that drops an accepted event must
+// be caught, and caught as an error so CI can gate on it.
+func TestVerifyCatchesADroppedEvent(t *testing.T) {
+	cfg := config{metrics: 1, runID: "abc", duration: time.Second}
+	srv := statsServer(t, "1m0s", map[string]int{cfg.metricName(0): 99})
+	defer srv.Close()
+	cfg.target = srv.URL
+
+	tal := newTally()
+	tal.byStatus[http.StatusOK] = 100 // the server said yes 100 times
+
+	err := verify(newClient(1), cfg, tal, time.Second, io.Discard)
+	if err == nil {
+		t.Fatal("verify accepted a 99/100 mismatch")
+	}
+	if !strings.Contains(err.Error(), "100") || !strings.Contains(err.Error(), "99") {
+		t.Errorf("error = %q, want both counts named", err)
+	}
+}
+
+// Only this run's metrics are counted. A warm server holding an earlier
+// run's data must not inflate the total.
+func TestVerifyIgnoresOtherMetrics(t *testing.T) {
+	cfg := config{metrics: 1, runID: "run2", duration: time.Second}
+	srv := statsServer(t, "1m0s", map[string]int{
+		cfg.metricName(0): 10,
+		"metric.run1.0":   9999, // a previous run, still inside the window
+		"something.else":  5,
+	})
+	defer srv.Close()
+	cfg.target = srv.URL
+
+	tal := newTally()
+	tal.byStatus[http.StatusOK] = 10
+
+	if err := verify(newClient(1), cfg, tal, time.Second, io.Discard); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+}
+
+// A run at least as long as the server's window has already had its earliest
+// events evicted. Asserting equality then would be the harness lying, so it
+// declines to judge - and says why.
+func TestVerifySkipsWhenRunOutlastsWindow(t *testing.T) {
+	cfg := config{metrics: 1, runID: "abc"}
+	srv := statsServer(t, "1m0s", map[string]int{cfg.metricName(0): 1})
+	defer srv.Close()
+	cfg.target = srv.URL
+
+	tal := newTally()
+	tal.byStatus[http.StatusOK] = 999999 // wildly different, and that's fine
+
+	var buf bytes.Buffer
+	if err := verify(newClient(1), cfg, tal, 2*time.Minute, &buf); err != nil {
+		t.Fatalf("verify should decline, not fail: %v", err)
+	}
+	if !strings.Contains(buf.String(), "skipped") {
+		t.Errorf("output = %q, want it to say it skipped and why", buf.String())
+	}
+}
+
+func TestVerifyReportsAnUnreachableServer(t *testing.T) {
+	cfg := config{target: "http://127.0.0.1:1", metrics: 1, duration: time.Second}
+	err := verify(newClient(1), cfg, newTally(), time.Second, io.Discard)
+	if err == nil {
+		t.Fatal("verify succeeded against a dead server")
 	}
 }

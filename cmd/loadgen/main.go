@@ -13,12 +13,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -31,6 +33,19 @@ type config struct {
 	metrics  int           // how many distinct metric names to spread across
 	badFrac  float64       // fraction of requests that should be rejectable
 	verify   bool          // cross-check the server's count afterwards
+	runID    string        // makes this run's metric names unique
+}
+
+// metricName is the metric a given worker reports under. The run ID keeps
+// two runs against the same warm server from sharing metric names - without
+// it the second run would find the first run's events still inside the
+// window and verification would count them twice.
+func (c config) metricName(worker int) string {
+	n := worker % c.metrics
+	if c.runID == "" {
+		return fmt.Sprintf("metric.%d", n)
+	}
+	return fmt.Sprintf("metric.%s.%d", c.runID, n)
 }
 
 func parseFlags(args []string) (config, error) {
@@ -218,7 +233,7 @@ var badBodies = []func(metric string, now time.Time) string{
 // way real reporters would.
 func sendUntil(ctx context.Context, client *http.Client, cfg config, workerID int) tally {
 	t := newTally()
-	metric := fmt.Sprintf("metric.%d", workerID%cfg.metrics)
+	metric := cfg.metricName(workerID)
 	url := strings.TrimSuffix(cfg.target, "/") + "/ingest"
 
 	nBad := 0
@@ -350,6 +365,69 @@ func (t tally) report(w io.Writer, elapsed time.Duration) {
 // digits than a microsecond would be invented.
 func round(d time.Duration) time.Duration { return d.Round(time.Microsecond) }
 
+// statsResponse mirrors GET /stats. Declared here rather than shared with
+// the server: this is the wire contract, and a client that reuses the
+// server's own struct cannot notice if that contract changes.
+type statsResponse struct {
+	Window  string `json:"window"`
+	Metrics map[string]struct {
+		Count int     `json:"count"`
+		Avg   float64 `json:"avg"`
+		Min   float64 `json:"min"`
+		Max   float64 `json:"max"`
+	} `json:"metrics"`
+}
+
+// verify is the claim the in-process benchmarks cannot make: after a real
+// run over a real socket, the server recorded exactly as many events as it
+// told us it accepted. Returns an error if they disagree.
+func verify(client *http.Client, cfg config, total tally, elapsed time.Duration, w io.Writer) error {
+	resp, err := client.Get(strings.TrimSuffix(cfg.target, "/") + "/stats")
+	if err != nil {
+		return fmt.Errorf("fetching /stats: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("/stats returned %d", resp.StatusCode)
+	}
+
+	var stats statsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&stats); err != nil {
+		return fmt.Errorf("decoding /stats: %w", err)
+	}
+
+	// The server reports the window it applied, so we can tell whether this
+	// comparison is even sound rather than hardcoding its retention. A run
+	// longer than the window has already had its early events evicted -
+	// the server would be *correct* to report fewer, so asserting equality
+	// would be the harness lying, not the server.
+	win, err := time.ParseDuration(stats.Window)
+	if err != nil {
+		return fmt.Errorf("unparseable window %q from /stats: %w", stats.Window, err)
+	}
+	if elapsed >= win {
+		fmt.Fprintf(w, "verify: skipped - the run (%s) is at least as long as the server's "+
+			"%s window, so the earliest events have already aged out\n",
+			elapsed.Round(time.Millisecond), win)
+		return nil
+	}
+
+	recorded := 0
+	for i := 0; i < cfg.metrics; i++ {
+		recorded += stats.Metrics[cfg.metricName(i)].Count
+	}
+
+	accepted := total.byStatus[http.StatusOK]
+	if recorded != accepted {
+		return fmt.Errorf("server accepted %d events but recorded %d (difference %d)",
+			accepted, recorded, accepted-recorded)
+	}
+
+	fmt.Fprintf(w, "verify: OK - %d accepted, %d recorded\n", accepted, recorded)
+	return nil
+}
+
 func main() {
 	cfg, err := parseFlags(os.Args[1:])
 	if err != nil {
@@ -357,9 +435,23 @@ func main() {
 		os.Exit(2)
 	}
 
-	fmt.Printf("target=%s workers=%d duration=%s metrics=%d bad=%.0f%% verify=%v\n",
-		cfg.target, cfg.workers, cfg.duration, cfg.metrics, cfg.badFrac*100, cfg.verify)
+	// A per-run ID scopes this run's metric names, so verification against
+	// a server that is already warm from an earlier run can't count that
+	// run's still-in-window events as ours.
+	cfg.runID = strconv.FormatInt(time.Now().UnixNano()%1e9, 36)
+
+	fmt.Printf("target=%s workers=%d duration=%s metrics=%d bad=%.0f%% verify=%v run=%s\n",
+		cfg.target, cfg.workers, cfg.duration, cfg.metrics, cfg.badFrac*100, cfg.verify, cfg.runID)
 
 	total, elapsed := runLoad(context.Background(), cfg)
 	total.report(os.Stdout, elapsed)
+
+	if cfg.verify {
+		if err := verify(newClient(1), cfg, total, elapsed, os.Stdout); err != nil {
+			// A mismatch is a real finding, not a warning: exit non-zero so
+			// this is usable as a CI gate.
+			fmt.Fprintln(os.Stderr, "verify:", err)
+			os.Exit(1)
+		}
+	}
 }
