@@ -18,6 +18,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -147,14 +148,18 @@ func sendUntil(ctx context.Context, client *http.Client, cfg config, workerID in
 	return t
 }
 
-// runLoad drives cfg.workers senders for cfg.duration and returns the total.
-func runLoad(ctx context.Context, cfg config) tally {
+// runLoad drives cfg.workers senders for cfg.duration. The elapsed time is
+// measured rather than assumed to equal cfg.duration: workers overrun the
+// deadline slightly by design (see sendUntil), and dividing by the wrong
+// denominator would quietly overstate throughput.
+func runLoad(ctx context.Context, cfg config) (tally, time.Duration) {
 	ctx, cancel := context.WithTimeout(ctx, cfg.duration)
 	defer cancel()
 
 	client := newClient(cfg.workers)
 	results := make(chan tally, cfg.workers)
 
+	start := time.Now()
 	var wg sync.WaitGroup
 	for w := 0; w < cfg.workers; w++ {
 		wg.Add(1)
@@ -164,13 +169,46 @@ func runLoad(ctx context.Context, cfg config) tally {
 		}(w)
 	}
 	wg.Wait()
+	elapsed := time.Since(start)
 	close(results)
 
 	total := newTally()
 	for t := range results {
 		total.merge(t)
 	}
-	return total
+	return total, elapsed
+}
+
+// report writes a human-readable summary. Status codes are sorted so two
+// runs are diffable; map order would make them gratuitously different.
+func (t tally) report(w io.Writer, elapsed time.Duration) {
+	sent := t.sent()
+	fmt.Fprintf(w, "\n%d requests in %s", sent, elapsed.Round(time.Millisecond))
+	if secs := elapsed.Seconds(); secs > 0 {
+		fmt.Fprintf(w, "  (%.0f req/s)", float64(sent)/secs)
+	}
+	fmt.Fprintln(w)
+
+	pct := func(n int) float64 {
+		if sent == 0 {
+			return 0
+		}
+		return 100 * float64(n) / float64(sent)
+	}
+
+	codes := make([]int, 0, len(t.byStatus))
+	for c := range t.byStatus {
+		codes = append(codes, c)
+	}
+	sort.Ints(codes)
+
+	for _, c := range codes {
+		n := t.byStatus[c]
+		fmt.Fprintf(w, "  %3d %9d  %5.1f%%\n", c, n, pct(n))
+	}
+	if t.failed > 0 {
+		fmt.Fprintf(w, "  err %9d  %5.1f%%  (no response)\n", t.failed, pct(t.failed))
+	}
 }
 
 func main() {
@@ -183,6 +221,6 @@ func main() {
 	fmt.Printf("target=%s workers=%d duration=%s metrics=%d bad=%.0f%% verify=%v\n",
 		cfg.target, cfg.workers, cfg.duration, cfg.metrics, cfg.badFrac*100, cfg.verify)
 
-	total := runLoad(context.Background(), cfg)
-	fmt.Printf("sent=%d failed=%d byStatus=%v\n", total.sent(), total.failed, total.byStatus)
+	total, elapsed := runLoad(context.Background(), cfg)
+	total.report(os.Stdout, elapsed)
 }

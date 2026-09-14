@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net/http"
@@ -113,7 +114,7 @@ func TestRunLoadStopsAtDuration(t *testing.T) {
 	cfg := config{target: srv.URL, workers: 4, duration: 50 * time.Millisecond, metrics: 2}
 
 	start := time.Now()
-	total := runLoad(context.Background(), cfg)
+	total, _ := runLoad(context.Background(), cfg)
 	elapsed := time.Since(start)
 
 	if total.sent() == 0 {
@@ -141,5 +142,61 @@ func TestTallyMerge(t *testing.T) {
 	}
 	if a.sent() != 11 { // 5 + 5 + 1 failed
 		t.Errorf("sent() = %d, want 11", a.sent())
+	}
+}
+
+func TestTallyReport(t *testing.T) {
+	tal := newTally()
+	tal.byStatus[400] = 25
+	tal.byStatus[200] = 75
+	tal.failed = 0
+
+	var buf bytes.Buffer
+	tal.report(&buf, 2*time.Second)
+	out := buf.String()
+
+	for _, want := range []string{
+		"100 requests", // total
+		"2s",           // elapsed
+		"50 req/s",     // 100 / 2s
+		"200",          // status lines present
+		"75.0%",
+		"400",
+		"25.0%",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("report missing %q:\n%s", want, out)
+		}
+	}
+
+	// Codes are sorted so two runs diff cleanly; map order would not be.
+	if strings.Index(out, "200") > strings.Index(out, "400") {
+		t.Errorf("status codes not in ascending order:\n%s", out)
+	}
+	// No transport errors, so no err line.
+	if strings.Contains(out, "no response") {
+		t.Errorf("reported an err line with failed=0:\n%s", out)
+	}
+}
+
+func TestTallyReportShowsTransportFailures(t *testing.T) {
+	tal := newTally()
+	tal.byStatus[200] = 1
+	tal.failed = 3
+
+	var buf bytes.Buffer
+	tal.report(&buf, time.Second)
+
+	if !strings.Contains(buf.String(), "no response") {
+		t.Errorf("failures not reported:\n%s", buf.String())
+	}
+}
+
+// An empty run must not divide by zero.
+func TestTallyReportEmpty(t *testing.T) {
+	var buf bytes.Buffer
+	newTally().report(&buf, 0)
+	if buf.Len() == 0 {
+		t.Error("report wrote nothing")
 	}
 }
