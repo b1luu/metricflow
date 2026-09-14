@@ -77,6 +77,27 @@ curl localhost:8080/stats
 (PowerShell's `curl` is an alias for `Invoke-WebRequest`, which takes
 different flags — use `curl.exe` or `Invoke-RestMethod` there.)
 
+## Load testing
+
+With the server running, drive it over real HTTP:
+
+```
+go run ./cmd/loadgen -duration 3s -workers 8 -bad 0.25
+```
+```
+141625 requests in 3s  (47206 req/s)
+  200    106215   75.0%
+  400     29511   20.8%
+  413      5899    4.2%
+latency  p50 <557µs  p90 <557µs  p99 1.042ms  max 23.891ms
+         (clock resolution 557µs - faster than that is unresolvable)
+verify: OK - 106215 accepted, 106215 recorded
+```
+
+`-bad` mixes in deliberately invalid requests. After the run, loadgen fetches
+`/stats` and checks the server recorded exactly as many events as it answered
+`200` to, exiting non-zero if not — so it works as a CI gate, not just a demo.
+
 ## Test
 
 ```

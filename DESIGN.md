@@ -574,6 +574,62 @@ machine doesn't have. These tests catch lost updates and Go's own
 concurrent-map panic, but not subtler races the detector would find — worth
 running under WSL or CI before claiming the concurrency is proven.
 
+### 21. `cmd/loadgen`: the claim that needs a real socket
+
+The benchmarks (§19) measure the engine and the harness (§20) proves it stays
+exact under concurrency — but both run in-process. `cmd/loadgen` exists for
+the one claim they structurally cannot make: **over real HTTP, the server
+recorded exactly as many events as it told the client it accepted.**
+
+```
+go run ./cmd/loadgen -duration 3s -workers 8 -bad 0.25
+```
+```
+141625 requests in 3s  (47206 req/s)
+  200    106215   75.0%
+  400     29511   20.8%
+  413      5899    4.2%
+latency  p50 <557µs  p90 <557µs  p99 1.042ms  max 23.891ms
+         (clock resolution 557µs - faster than that is unresolvable)
+verify: OK - 106215 accepted, 106215 recorded
+```
+
+- **A separate `main` package with no access to the server's internals.** A
+  load generator linked against the thing it measures can test the wrong
+  side of the wire; `statsResponse` is redeclared rather than shared,
+  because that *is* the wire contract and a client reusing the server's
+  struct could never notice it changing.
+- **Verification is the point, not the throughput number.** `-bad 0.25`
+  mixes in all six rejectable shapes under the same metric name as the good
+  traffic, so anything that leaked past validation would inflate that
+  metric. A mismatch exits non-zero, making this usable as a CI gate.
+- **Two guards keep the comparison sound.** Metric names are scoped by a
+  per-run ID, or a second run against a warm server would count the first
+  run's still-in-window events as its own. And the server reports the window
+  it applied, so loadgen reads that instead of hardcoding retention: a run
+  at least as long as the window has already had its earliest events
+  evicted, and the server would be *right* to report fewer. It declines to
+  judge rather than assert something false.
+
+**Three things this cost, all worth recording:**
+
+- **Requests must not carry the run's context.** Binding it cancels whatever
+  is in flight at the deadline — the server may already have recorded that
+  event while the client scores it a failure. This surfaced immediately as a
+  flaky "client counted N, server saw N+1". The deadline stops us *issuing*;
+  outstanding requests finish.
+- **The default transport keeps two idle connections per host**, so past two
+  workers the run measures TCP handshakes. Response bodies must also be
+  drained and closed, or the connection never returns to the idle pool and
+  the tuning is silently undone.
+- **`time.Now()` on this machine ticks every ~530–580µs** — 9999 of 10000
+  back-to-back reads return an identical value. The first working version
+  proudly reported `p50 0s`, which would mean instant responses; it actually
+  meant most requests finished inside a single clock tick. `clockResolution()`
+  now probes the tick and the report refuses to state a figure beneath it,
+  printing `<557µs`. Same principle as `StateNoData` (§18): an instrument
+  should say "I can't tell" rather than something confident and wrong.
+
 ## Testing
 
 See `main_test.go`. ~91% coverage — everything but `main()` (listen + signal
