@@ -200,3 +200,80 @@ func TestTallyReportEmpty(t *testing.T) {
 		t.Error("report wrote nothing")
 	}
 }
+
+// --- latency histogram ---
+
+func TestLatencyQuantiles(t *testing.T) {
+	l := newLatencies()
+	// 100 samples: 1µs..100µs, one each. The q-th percentile is then q*100 µs.
+	for i := 1; i <= 100; i++ {
+		l.add(time.Duration(i) * time.Microsecond)
+	}
+
+	cases := []struct {
+		q    float64
+		want time.Duration
+	}{
+		{0.50, 51 * time.Microsecond},
+		{0.90, 91 * time.Microsecond},
+		{0.99, 100 * time.Microsecond},
+	}
+	for _, c := range cases {
+		if got := l.quantile(c.q); got != c.want {
+			t.Errorf("quantile(%.2f) = %s, want %s", c.q, got, c.want)
+		}
+	}
+	if l.max != 100*time.Microsecond {
+		t.Errorf("max = %s, want 100µs", l.max)
+	}
+	if l.count != 100 {
+		t.Errorf("count = %d, want 100", l.count)
+	}
+}
+
+// Samples past the cap are counted, bounded at the cap by quantile, but must
+// still show their true size through max - a long tail is never hidden.
+func TestLatencyOverCap(t *testing.T) {
+	l := newLatencies()
+	l.add(time.Millisecond)
+	l.add(latencyCap + time.Second)
+
+	if l.over != 1 {
+		t.Errorf("over = %d, want 1", l.over)
+	}
+	if got := l.quantile(0.99); got != latencyCap {
+		t.Errorf("quantile past the cap = %s, want %s", got, latencyCap)
+	}
+	if want := latencyCap + time.Second; l.max != want {
+		t.Errorf("max = %s, want %s (the tail must stay visible)", l.max, want)
+	}
+}
+
+func TestLatencyMergeAndEmpty(t *testing.T) {
+	if got := newLatencies().quantile(0.5); got != 0 {
+		t.Errorf("empty quantile = %s, want 0", got)
+	}
+
+	a, b := newLatencies(), newLatencies()
+	a.add(10 * time.Microsecond)
+	b.add(20 * time.Microsecond)
+	b.add(latencyCap * 2)
+	a.merge(b)
+
+	if a.count != 3 || a.over != 1 {
+		t.Errorf("after merge count=%d over=%d, want 3 and 1", a.count, a.over)
+	}
+	if a.max != latencyCap*2 {
+		t.Errorf("merged max = %s, want %s", a.max, latencyCap*2)
+	}
+}
+
+// Recording a sample must not allocate: an allocation inside the request
+// loop would add jitter to the thing being measured.
+func TestLatencyAddDoesNotAllocate(t *testing.T) {
+	l := newLatencies()
+	got := testing.AllocsPerRun(1000, func() { l.add(42 * time.Microsecond) })
+	if got != 0 {
+		t.Errorf("add allocated %v times per call, want 0", got)
+	}
+}

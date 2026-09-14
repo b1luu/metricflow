@@ -77,20 +77,92 @@ func newClient(workers int) *http.Client {
 	return &http.Client{Transport: t, Timeout: 10 * time.Second}
 }
 
+// Latency is kept as a fixed histogram rather than a slice of every sample.
+// Two reasons, and the second is the important one:
+//
+//   - Memory stays flat however long the run goes.
+//   - Recording a sample allocates nothing. Appending to a growing slice
+//     inside the request loop would allocate and copy, adding jitter to the
+//     very thing being measured.
+//
+// It is the same trade the server itself makes with Agg (§1): keep the
+// conclusion, not the events. The cost is resolution - one microsecond, and
+// anything past latencyCap is only known to be "at least that".
+const (
+	latencyRes     = time.Microsecond
+	latencyCap     = 100 * time.Millisecond
+	latencyBuckets = int(latencyCap / latencyRes)
+)
+
+type latencies struct {
+	bucket []int32 // index i holds samples in [i, i+1) * latencyRes
+	over   int     // samples >= latencyCap
+	count  int
+	max    time.Duration
+}
+
+func newLatencies() *latencies {
+	return &latencies{bucket: make([]int32, latencyBuckets)}
+}
+
+func (l *latencies) add(d time.Duration) {
+	l.count++
+	if d > l.max {
+		l.max = d
+	}
+	if i := int(d / latencyRes); i >= 0 && i < len(l.bucket) {
+		l.bucket[i]++
+	} else {
+		l.over++
+	}
+}
+
+func (l *latencies) merge(o *latencies) {
+	for i, n := range o.bucket {
+		l.bucket[i] += n
+	}
+	l.over += o.over
+	l.count += o.count
+	if o.max > l.max {
+		l.max = o.max
+	}
+}
+
+// quantile returns the duration below which q of the samples fall. Samples
+// past latencyCap can only be reported as latencyCap - the histogram
+// genuinely does not know where they landed, and max is printed alongside
+// so a long tail is never hidden.
+func (l *latencies) quantile(q float64) time.Duration {
+	if l.count == 0 {
+		return 0
+	}
+	rank := int(q * float64(l.count))
+	seen := 0
+	for i, n := range l.bucket {
+		seen += int(n)
+		if seen > rank {
+			return time.Duration(i) * latencyRes
+		}
+	}
+	return latencyCap
+}
+
 // tally is one worker's view of a run. Workers accumulate locally and the
 // totals are merged at the end, so the hot loop needs no shared state.
 type tally struct {
 	byStatus map[int]int // HTTP responses, by status code
 	failed   int         // transport errors: no response at all
+	lat      *latencies
 }
 
-func newTally() tally { return tally{byStatus: map[int]int{}} }
+func newTally() tally { return tally{byStatus: map[int]int{}, lat: newLatencies()} }
 
 func (t *tally) merge(o tally) {
 	for code, n := range o.byStatus {
 		t.byStatus[code] += n
 	}
 	t.failed += o.failed
+	t.lat.merge(o.lat)
 }
 
 func (t tally) sent() int {
@@ -131,11 +203,13 @@ func sendUntil(ctx context.Context, client *http.Client, cfg config, workerID in
 			continue
 		}
 
+		start := time.Now()
 		resp, err := client.Do(req)
 		if err != nil {
 			t.failed++
 			continue
 		}
+		t.lat.add(time.Since(start))
 
 		// Drain and close, always. An undrained body keeps its connection
 		// out of the idle pool, so the next request opens a new socket and
