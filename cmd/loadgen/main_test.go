@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -149,7 +150,9 @@ func TestTallyReport(t *testing.T) {
 	tal := newTally()
 	tal.byStatus[400] = 25
 	tal.byStatus[200] = 75
+	tal.good = 75 // the 400s were meant to be rejected: no mismatch
 	tal.failed = 0
+	tal.lat.add(5 * time.Millisecond)
 
 	var buf bytes.Buffer
 	tal.report(&buf, 2*time.Second)
@@ -163,6 +166,7 @@ func TestTallyReport(t *testing.T) {
 		"75.0%",
 		"400",
 		"25.0%",
+		"p50", "p99", "max", // percentiles actually reach the output
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("report missing %q:\n%s", want, out)
@@ -275,5 +279,85 @@ func TestLatencyAddDoesNotAllocate(t *testing.T) {
 	got := testing.AllocsPerRun(1000, func() { l.add(42 * time.Microsecond) })
 	if got != 0 {
 		t.Errorf("add allocated %v times per call, want 0", got)
+	}
+}
+
+// A valid request refused, or a broken one accepted, must be shouted about
+// rather than buried in the status table.
+func TestTallyReportFlagsMismatch(t *testing.T) {
+	tal := newTally()
+	tal.byStatus[200] = 9
+	tal.good = 10 // one valid request was refused
+	tal.lat.add(time.Millisecond)
+
+	var buf bytes.Buffer
+	tal.report(&buf, time.Second)
+
+	if !strings.Contains(buf.String(), "MISMATCH") {
+		t.Errorf("mismatch not reported:\n%s", buf.String())
+	}
+}
+
+// --- bad-request injection ---
+
+// The injected failures must stay genuinely distinct. If two collapsed into
+// the same shape, -bad would exercise fewer of the server's reject branches
+// than it claims to - a silent weakening of the whole point of the flag.
+func TestBadBodiesAreDistinctShapes(t *testing.T) {
+	now := time.Now()
+	seen := map[string]int{}
+
+	for i, build := range badBodies {
+		body := build("cpu.load", now)
+		if body == "" {
+			t.Errorf("badBodies[%d] produced an empty body", i)
+		}
+		if prev, dup := seen[body]; dup {
+			t.Errorf("badBodies[%d] duplicates [%d]: %.50s", i, prev, body)
+		}
+		seen[body] = i
+	}
+
+	// One per reject branch the server documents: malformed JSON, no name,
+	// no ts, ts too old, ts too far future, body too large.
+	if len(badBodies) != 6 {
+		t.Errorf("%d bad shapes, want 6 - one per server reject branch", len(badBodies))
+	}
+}
+
+// The bad fraction is a deterministic quota, so a run is reproducible and
+// two runs with the same flags are comparable.
+func TestBadFractionIsHonoured(t *testing.T) {
+	var mu sync.Mutex
+	var total, rejected int
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		total++
+		// Our valid bodies always carry all three fields.
+		if !strings.Contains(string(body), `"name"`) ||
+			!strings.Contains(string(body), `"ts"`) ||
+			len(body) > 4096 {
+			rejected++
+			mu.Unlock()
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	cfg := config{target: srv.URL, workers: 1, duration: 100 * time.Millisecond,
+		metrics: 1, badFrac: 0.5}
+	tal, _ := runLoad(context.Background(), cfg)
+
+	if tal.sent() < 10 {
+		t.Fatalf("only %d requests; too few to judge the ratio", tal.sent())
+	}
+	frac := float64(tal.sent()-tal.good) / float64(tal.sent())
+	if frac < 0.4 || frac > 0.6 {
+		t.Errorf("bad fraction = %.2f, want ~0.50 (sent %d, good %d)", frac, tal.sent(), tal.good)
 	}
 }

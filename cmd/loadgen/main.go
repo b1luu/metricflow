@@ -152,6 +152,7 @@ func (l *latencies) quantile(q float64) time.Duration {
 type tally struct {
 	byStatus map[int]int // HTTP responses, by status code
 	failed   int         // transport errors: no response at all
+	good     int         // requests the generator intended to be valid
 	lat      *latencies
 }
 
@@ -162,6 +163,7 @@ func (t *tally) merge(o tally) {
 		t.byStatus[code] += n
 	}
 	t.failed += o.failed
+	t.good += o.good
 	t.lat.merge(o.lat)
 }
 
@@ -178,6 +180,39 @@ func eventBody(metric string, value float64, now time.Time) string {
 	return fmt.Sprintf(`{"name":%q,"value":%v,"ts":%d}`, metric, value, now.UnixMilli())
 }
 
+// badBodies are the rejectable shapes the server must refuse, one per
+// validation branch. Cycling them exercises the whole reject path instead of
+// hammering a single kind.
+//
+// They reuse the same metric name as the good traffic on purpose: anything
+// that leaked through would inflate that metric's count rather than hide
+// under a name of its own, so the verification step catches it.
+//
+// Note the sizes and bounds here are chosen to be *obviously* out of range,
+// not read from the server's constants - loadgen is an external client and
+// doesn't get to peek at them.
+var badBodies = []func(metric string, now time.Time) string{
+	func(string, time.Time) string {
+		return `{"name":` // truncated JSON
+	},
+	func(_ string, now time.Time) string {
+		return fmt.Sprintf(`{"value":1,"ts":%d}`, now.UnixMilli()) // no name
+	},
+	func(m string, _ time.Time) string {
+		return fmt.Sprintf(`{"name":%q,"value":1}`, m) // no ts
+	},
+	func(m string, now time.Time) string {
+		return eventBody(m, 1, now.Add(-time.Hour)) // ts long expired
+	},
+	func(m string, now time.Time) string {
+		return eventBody(m, 1, now.Add(time.Hour)) // ts far in the future
+	},
+	func(m string, now time.Time) string {
+		return fmt.Sprintf(`{"name":%q,"value":1,"ts":%d,"type":%q}`,
+			m, now.UnixMilli(), strings.Repeat("x", 16<<10)) // oversized
+	},
+}
+
 // sendUntil fires requests as fast as it can until ctx is done. Each worker
 // sticks to one metric name so the load spreads across the store's map the
 // way real reporters would.
@@ -186,8 +221,21 @@ func sendUntil(ctx context.Context, client *http.Client, cfg config, workerID in
 	metric := fmt.Sprintf("metric.%d", workerID%cfg.metrics)
 	url := strings.TrimSuffix(cfg.target, "/") + "/ingest"
 
+	nBad := 0
 	for i := 0; ctx.Err() == nil; i++ {
-		body := eventBody(metric, float64(i%10+1), time.Now())
+		now := time.Now()
+
+		// A greedy quota rather than randomness: send a bad request
+		// whenever we're below the requested fraction. Two runs with the
+		// same flags then send the same mix, which makes them comparable.
+		var body string
+		if float64(nBad) < cfg.badFrac*float64(i+1) {
+			body = badBodies[nBad%len(badBodies)](metric, now)
+			nBad++
+		} else {
+			body = eventBody(metric, float64(i%10+1), now)
+			t.good++
+		}
 
 		// Deliberately NOT http.NewRequestWithContext(ctx, ...): ctx ends
 		// the run, and binding it to the request would cancel whatever is
@@ -283,7 +331,24 @@ func (t tally) report(w io.Writer, elapsed time.Duration) {
 	if t.failed > 0 {
 		fmt.Fprintf(w, "  err %9d  %5.1f%%  (no response)\n", t.failed, pct(t.failed))
 	}
+
+	if t.lat.count > 0 {
+		fmt.Fprintf(w, "latency  p50 %s  p90 %s  p99 %s  max %s\n",
+			round(t.lat.quantile(0.50)), round(t.lat.quantile(0.90)),
+			round(t.lat.quantile(0.99)), round(t.lat.max))
+	}
+
+	// The generator knows which requests it meant to be valid, so it can
+	// check the server agreed. A mismatch either way is a real finding: a
+	// good request refused, or a deliberately broken one waved through.
+	if ok := t.byStatus[http.StatusOK]; ok != t.good {
+		fmt.Fprintf(w, "MISMATCH: sent %d valid requests but %d were accepted\n", t.good, ok)
+	}
 }
+
+// round trims percentile output to the histogram's actual resolution; more
+// digits than a microsecond would be invented.
+func round(d time.Duration) time.Duration { return d.Round(time.Microsecond) }
 
 func main() {
 	cfg, err := parseFlags(os.Args[1:])
