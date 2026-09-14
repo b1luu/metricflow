@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Formatting and static analysis are cheap and unambiguous, so they run
+  # first and on their own: a gofmt failure shouldn't be buried under a
+  # test log.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt'd:"
+            echo "$unformatted"
+            gofmt -d .
+            exit 1
+          fi
+
+      - run: go vet ./...
+      - run: go build ./...
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - run: go test ./... -count=1
+
+      # The reason this workflow exists. The race detector needs a 64-bit C
+      # toolchain, which the development machine (Windows) doesn't have - so
+      # until now DESIGN §20 could only say the concurrency tests catch lost
+      # updates and Go's own concurrent-map panic, not the subtler races a
+      # detector would find. Linux runners have it, so the claim gets
+      # checked here instead of being permanently caveated.
+      - name: go test -race
+        run: go test ./... -race -count=1
+
+      # Benchmarks aren't a performance gate - runner hardware is far too
+      # noisy for that, and a threshold would just flap. This only proves
+      # they still compile and run, so a refactor can't quietly break the
+      # measurement code that DESIGN §5's numbers depend on.
+      - name: benchmarks compile and run
+        run: go test ./... -run='^$' -bench=. -benchtime=10x
+
+  # The end-to-end claim from DESIGN §21: over a real socket, the server
+  # records exactly as many events as it accepted. loadgen exits non-zero on
+  # a mismatch, which is what makes it usable as a gate rather than a demo.
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - run: go build -o metricflow .
+      - run: go build -o loadgen ./cmd/loadgen
+
+      - name: start the server
+        run: |
+          ./metricflow > server.log 2>&1 &
+          echo $! > server.pid
+          # Poll rather than sleep: a fixed sleep is either flaky or slow.
+          for i in $(seq 1 50); do
+            if curl -sf localhost:8080/health > /dev/null; then
+              echo "server up after ${i} attempts"
+              exit 0
+            fi
+            sleep 0.2
+          done
+          echo "server never became healthy"; cat server.log; exit 1
+
+      - name: clean traffic must verify
+        run: ./loadgen -duration 3s -workers 8
+
+      - name: traffic with injected failures must still verify
+        run: ./loadgen -duration 3s -workers 8 -bad 0.25
+
+      - name: shut down cleanly
+        run: |
+          kill -TERM "$(cat server.pid)"
+          # Graceful shutdown (DESIGN §15) should drain and exit on its own.
+          for i in $(seq 1 25); do
+            if ! kill -0 "$(cat server.pid)" 2>/dev/null; then
+              echo "exited cleanly"
+              cat server.log
+              exit 0
+            fi
+            sleep 0.2
+          done
+          echo "server did not exit within 5s of SIGTERM"; cat server.log; exit 1

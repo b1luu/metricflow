@@ -569,10 +569,11 @@ whose running total stays far below 2⁵³, where every intermediate is exactly
 representable and any order yields the identical result. `Count`, `Min` and
 `Max` are order-independent regardless, so they need no such care.
 
-**Not covered:** `go test -race`, which needs a 64-bit C toolchain this
-machine doesn't have. These tests catch lost updates and Go's own
-concurrent-map panic, but not subtler races the detector would find — worth
-running under WSL or CI before claiming the concurrency is proven.
+**On `go test -race`:** it needs a 64-bit C toolchain, which this development
+machine (Windows, 32-bit gcc) doesn't have — the tests above catch lost
+updates and Go's own concurrent-map panic, but not the subtler races a
+detector would find. That gap is closed in CI rather than caveated forever;
+see §22.
 
 ### 21. `cmd/loadgen`: the claim that needs a real socket
 
@@ -629,6 +630,36 @@ verify: OK - 106215 accepted, 106215 recorded
   now probes the tick and the report refuses to state a figure beneath it,
   printing `<557µs`. Same principle as `StateNoData` (§18): an instrument
   should say "I can't tell" rather than something confident and wrong.
+
+### 22. CI exists to run the things this machine can't
+
+`.github/workflows/ci.yml` is not box-ticking. Every job is there because it
+checks something the development environment structurally cannot.
+
+- **`go test -race` is the whole point.** The race detector needs a 64-bit C
+  toolchain; this machine's gcc is 32-bit, so §20's concurrency tests have
+  only ever proven they catch *lost updates* and Go's own concurrent-map
+  panic. Linux runners have the toolchain. Rather than caveat that
+  permanently, the claim gets checked on every push.
+- **`gofmt -l` catches what the local check can't see.** Git normalises to
+  LF on commit but checks out CRLF on Windows, so local `gofmt -l` flags
+  every file and the signal is useless. On a Linux runner it is exact. (The
+  committed content was verified clean before this landed, by extracting the
+  blobs and formatting those rather than the working copy.)
+- **Benchmarks run, but are not a gate.** Runner hardware is far too noisy
+  for a performance threshold — it would flap and get ignored, which is
+  worse than no check. `-benchtime=10x` proves only that the measurement
+  code still compiles and runs, so a refactor cannot quietly break the thing
+  §5's numbers depend on.
+- **The e2e job is `loadgen -verify` used as designed.** §21 claimed the
+  non-zero exit made it a CI gate; this is that claim being cashed rather
+  than asserted. It also exercises graceful shutdown (§15) for real: SIGTERM,
+  then wait for the process to drain and exit on its own, failing if it
+  doesn't within 5s.
+
+The startup and shutdown waits poll rather than `sleep`. A fixed sleep is
+either flaky on a slow runner or wasted time on a fast one, and there is a
+readiness endpoint (`/health`) precisely so nobody has to guess.
 
 ## Testing
 

@@ -1,5 +1,7 @@
 # MetricFlow
 
+[![CI](https://github.com/b1luu/metricflow/actions/workflows/ci.yml/badge.svg)](https://github.com/b1luu/metricflow/actions/workflows/ci.yml)
+
 A small real-time metrics ingestion and aggregation engine in Go — a mini
 Datadog. Events are pushed in over HTTP; per-metric aggregates (count, average,
 min, max) are kept live in memory over a rolling time window and served back on
@@ -101,8 +103,14 @@ verify: OK - 106215 accepted, 106215 recorded
 ## Test
 
 ```
-go test ./...
+go test ./...                              # unit + concurrency tests
+go test ./... -race                        # needs a 64-bit C toolchain
+go test -run=^$ -bench=. -benchmem         # throughput of the engine
 ```
+
+CI runs all three on every push, plus an end-to-end job that starts the
+server, drives it with `loadgen`, and checks it shuts down cleanly on
+`SIGTERM`.
 
 ## Design
 
@@ -113,6 +121,15 @@ of event volume. Concurrent writes are serialised with a mutex. See
 
 ## Status
 
-Work in progress. Done: ingest, windowed aggregation, per-metric stats with a
-configurable query window.
-Next: event-time handling, an alerting layer, and a load-generation harness.
+Done: ingest with validation, windowed aggregation over event time, per-metric
+stats with a configurable query window, an alerting layer with flap
+suppression, graceful shutdown, and a load harness (benchmarks, concurrency
+invariants, and an HTTP load generator that verifies the server recorded
+exactly what it accepted).
+
+Known limits, all deliberate and argued in [DESIGN.md](DESIGN.md): state is
+in-memory and resets on restart (§2); only count/sum/min/max are kept, so
+percentiles are impossible after the fact (§1); and a single mutex guards the
+whole store, which the benchmarks show is the throughput ceiling at ~7.7M
+events/sec — measured, and not worth fixing until something actually hits it
+(§5).
