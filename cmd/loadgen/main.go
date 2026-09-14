@@ -109,6 +109,31 @@ const (
 	latencyBuckets = int(latencyCap / latencyRes)
 )
 
+// clockResolution measures the smallest change time.Now() can actually
+// observe, by spinning until it moves.
+//
+// This is not paranoia. On this development machine (Windows) the clock
+// ticks every ~530µs, which is far coarser than a loopback request: over
+// half of them complete inside a single tick and are timed as exactly zero.
+// A report that prints "p50 0s" without saying so claims an impossibly fast
+// server, when what it has really measured is the limit of its own
+// instrument. Same principle as StateNoData in the alerter (§18) - say "I
+// can't tell" rather than something confident and wrong.
+func clockResolution() time.Duration {
+	var worst time.Duration
+	for i := 0; i < 5; i++ {
+		start := time.Now()
+		var d time.Duration
+		for d == 0 {
+			d = time.Since(start)
+		}
+		if d > worst {
+			worst = d
+		}
+	}
+	return worst
+}
+
 type latencies struct {
 	bucket []int32 // index i holds samples in [i, i+1) * latencyRes
 	over   int     // samples >= latencyCap
@@ -318,7 +343,7 @@ func runLoad(ctx context.Context, cfg config) (tally, time.Duration) {
 
 // report writes a human-readable summary. Status codes are sorted so two
 // runs are diffable; map order would make them gratuitously different.
-func (t tally) report(w io.Writer, elapsed time.Duration) {
+func (t tally) report(w io.Writer, elapsed, clockRes time.Duration) {
 	sent := t.sent()
 	fmt.Fprintf(w, "\n%d requests in %s", sent, elapsed.Round(time.Millisecond))
 	if secs := elapsed.Seconds(); secs > 0 {
@@ -349,8 +374,13 @@ func (t tally) report(w io.Writer, elapsed time.Duration) {
 
 	if t.lat.count > 0 {
 		fmt.Fprintf(w, "latency  p50 %s  p90 %s  p99 %s  max %s\n",
-			round(t.lat.quantile(0.50)), round(t.lat.quantile(0.90)),
-			round(t.lat.quantile(0.99)), round(t.lat.max))
+			show(t.lat.quantile(0.50), clockRes), show(t.lat.quantile(0.90), clockRes),
+			show(t.lat.quantile(0.99), clockRes), show(t.lat.max, clockRes))
+
+		if clockRes > 0 {
+			fmt.Fprintf(w, "         (clock resolution %s - faster than that is "+
+				"unresolvable, shown as <%s)\n", round(clockRes), round(clockRes))
+		}
 	}
 
 	// The generator knows which requests it meant to be valid, so it can
@@ -364,6 +394,16 @@ func (t tally) report(w io.Writer, elapsed time.Duration) {
 // round trims percentile output to the histogram's actual resolution; more
 // digits than a microsecond would be invented.
 func round(d time.Duration) time.Duration { return d.Round(time.Microsecond) }
+
+// show renders a measured duration, refusing to state a figure the clock
+// could not have resolved. "<531µs" is the honest reading of a request that
+// finished inside one tick; "0s" would be a claim.
+func show(d, clockRes time.Duration) string {
+	if clockRes > 0 && d < clockRes {
+		return "<" + round(clockRes).String()
+	}
+	return round(d).String()
+}
 
 // statsResponse mirrors GET /stats. Declared here rather than shared with
 // the server: this is the wire contract, and a client that reuses the
@@ -443,8 +483,12 @@ func main() {
 	fmt.Printf("target=%s workers=%d duration=%s metrics=%d bad=%.0f%% verify=%v run=%s\n",
 		cfg.target, cfg.workers, cfg.duration, cfg.metrics, cfg.badFrac*100, cfg.verify, cfg.runID)
 
+	// Probe before the run: the report must be able to say which of its own
+	// numbers the clock was too coarse to resolve.
+	clockRes := clockResolution()
+
 	total, elapsed := runLoad(context.Background(), cfg)
-	total.report(os.Stdout, elapsed)
+	total.report(os.Stdout, elapsed, clockRes)
 
 	if cfg.verify {
 		if err := verify(newClient(1), cfg, total, elapsed, os.Stdout); err != nil {

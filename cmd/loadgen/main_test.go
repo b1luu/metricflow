@@ -156,7 +156,7 @@ func TestTallyReport(t *testing.T) {
 	tal.lat.add(5 * time.Millisecond)
 
 	var buf bytes.Buffer
-	tal.report(&buf, 2*time.Second)
+	tal.report(&buf, 2*time.Second, 0)
 	out := buf.String()
 
 	for _, want := range []string{
@@ -190,7 +190,7 @@ func TestTallyReportShowsTransportFailures(t *testing.T) {
 	tal.failed = 3
 
 	var buf bytes.Buffer
-	tal.report(&buf, time.Second)
+	tal.report(&buf, time.Second, 0)
 
 	if !strings.Contains(buf.String(), "no response") {
 		t.Errorf("failures not reported:\n%s", buf.String())
@@ -200,7 +200,7 @@ func TestTallyReportShowsTransportFailures(t *testing.T) {
 // An empty run must not divide by zero.
 func TestTallyReportEmpty(t *testing.T) {
 	var buf bytes.Buffer
-	newTally().report(&buf, 0)
+	newTally().report(&buf, 0, 0)
 	if buf.Len() == 0 {
 		t.Error("report wrote nothing")
 	}
@@ -292,7 +292,7 @@ func TestTallyReportFlagsMismatch(t *testing.T) {
 	tal.lat.add(time.Millisecond)
 
 	var buf bytes.Buffer
-	tal.report(&buf, time.Second)
+	tal.report(&buf, time.Second, 0)
 
 	if !strings.Contains(buf.String(), "MISMATCH") {
 		t.Errorf("mismatch not reported:\n%s", buf.String())
@@ -473,4 +473,56 @@ func TestVerifyReportsAnUnreachableServer(t *testing.T) {
 	if err == nil {
 		t.Fatal("verify succeeded against a dead server")
 	}
+}
+
+// --- clock honesty ---
+
+// The report must not state a figure the clock could not have resolved.
+func TestShowRefusesUnresolvableFigures(t *testing.T) {
+	const res = 500 * time.Microsecond
+
+	if got := show(0, res); got != "<500µs" {
+		t.Errorf("show(0, %s) = %q, want %q - 0s would be a claim, not a measurement", res, got, "<500µs")
+	}
+	if got := show(100*time.Microsecond, res); got != "<500µs" {
+		t.Errorf("show(100µs, %s) = %q, want it flagged as unresolvable", res, got)
+	}
+	// At or above the resolution the figure is real and printed as-is.
+	if got := show(2*time.Millisecond, res); got != "2ms" {
+		t.Errorf("show(2ms, %s) = %q, want %q", res, got, "2ms")
+	}
+	// With a perfect clock, nothing is suppressed.
+	if got := show(0, 0); got != "0s" {
+		t.Errorf("show(0, 0) = %q, want %q", got, "0s")
+	}
+}
+
+func TestReportStatesClockResolution(t *testing.T) {
+	tal := newTally()
+	tal.byStatus[200] = 1
+	tal.good = 1
+	tal.lat.add(0) // finished inside a tick
+
+	var buf bytes.Buffer
+	tal.report(&buf, time.Second, 500*time.Microsecond)
+	out := buf.String()
+
+	if !strings.Contains(out, "clock resolution") {
+		t.Errorf("report hides its own resolution:\n%s", out)
+	}
+	if strings.Contains(out, "p50 0s") {
+		t.Errorf("report claims an unresolvable p50 of 0s:\n%s", out)
+	}
+}
+
+// The probe must return something plausible rather than hanging or zero.
+func TestClockResolutionIsMeasurable(t *testing.T) {
+	got := clockResolution()
+	if got <= 0 {
+		t.Fatalf("clockResolution() = %s, want a positive tick", got)
+	}
+	if got > 100*time.Millisecond {
+		t.Errorf("clockResolution() = %s, implausibly coarse", got)
+	}
+	t.Logf("clock resolution on this machine: %s", got)
 }
