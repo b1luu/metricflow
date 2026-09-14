@@ -1,7 +1,12 @@
 package main
 
 import (
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -62,5 +67,79 @@ func TestParseFlagsRejectsNonsense(t *testing.T) {
 				t.Errorf("error = %q, want it to mention %q", err, c.wantMsg)
 			}
 		})
+	}
+}
+
+// --- sending ---
+
+func TestSendUntilHitsARealServer(t *testing.T) {
+	var got atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/ingest" || r.Method != http.MethodPost {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		body, _ := io.ReadAll(r.Body)
+		if !strings.Contains(string(body), `"ts"`) {
+			t.Errorf("body missing ts: %s", body)
+		}
+		got.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	cfg := config{target: srv.URL, workers: 1, duration: 50 * time.Millisecond, metrics: 1}
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.duration)
+	defer cancel()
+
+	tal := sendUntil(ctx, newClient(1), cfg, 0)
+
+	if tal.byStatus[http.StatusOK] == 0 {
+		t.Fatalf("no successful requests: %+v", tal)
+	}
+	if tal.failed != 0 {
+		t.Errorf("failed = %d, want 0", tal.failed)
+	}
+	if int64(tal.byStatus[http.StatusOK]) != got.Load() {
+		t.Errorf("client counted %d, server saw %d", tal.byStatus[http.StatusOK], got.Load())
+	}
+}
+
+func TestRunLoadStopsAtDuration(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	cfg := config{target: srv.URL, workers: 4, duration: 50 * time.Millisecond, metrics: 2}
+
+	start := time.Now()
+	total := runLoad(context.Background(), cfg)
+	elapsed := time.Since(start)
+
+	if total.sent() == 0 {
+		t.Fatal("no requests sent")
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("runLoad took %s, want it bounded by the duration", elapsed)
+	}
+}
+
+// A tally is merged from every worker; the totals must add up.
+func TestTallyMerge(t *testing.T) {
+	a := newTally()
+	a.byStatus[200] = 3
+	a.failed = 1
+
+	b := newTally()
+	b.byStatus[200] = 2
+	b.byStatus[400] = 5
+
+	a.merge(b)
+
+	if a.byStatus[200] != 5 || a.byStatus[400] != 5 || a.failed != 1 {
+		t.Errorf("merged = %+v", a)
+	}
+	if a.sent() != 11 { // 5 + 5 + 1 failed
+		t.Errorf("sent() = %d, want 11", a.sent())
 	}
 }

@@ -12,9 +12,14 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -57,6 +62,117 @@ func parseFlags(args []string) (config, error) {
 	return c, nil
 }
 
+// newClient returns an HTTP client tuned for load generation.
+//
+// The default transport keeps only two idle connections per host, so beyond
+// two workers every request would open a fresh socket and throw it away -
+// the run would be measuring TCP handshakes and TIME_WAIT pressure rather
+// than the server. Raising the idle pool to match the worker count keeps one
+// warm connection per worker.
+func newClient(workers int) *http.Client {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.MaxIdleConns = workers * 2
+	t.MaxIdleConnsPerHost = workers * 2
+	return &http.Client{Transport: t, Timeout: 10 * time.Second}
+}
+
+// tally is one worker's view of a run. Workers accumulate locally and the
+// totals are merged at the end, so the hot loop needs no shared state.
+type tally struct {
+	byStatus map[int]int // HTTP responses, by status code
+	failed   int         // transport errors: no response at all
+}
+
+func newTally() tally { return tally{byStatus: map[int]int{}} }
+
+func (t *tally) merge(o tally) {
+	for code, n := range o.byStatus {
+		t.byStatus[code] += n
+	}
+	t.failed += o.failed
+}
+
+func (t tally) sent() int {
+	n := t.failed
+	for _, c := range t.byStatus {
+		n += c
+	}
+	return n
+}
+
+// eventBody builds one valid /ingest payload.
+func eventBody(metric string, value float64, now time.Time) string {
+	return fmt.Sprintf(`{"name":%q,"value":%v,"ts":%d}`, metric, value, now.UnixMilli())
+}
+
+// sendUntil fires requests as fast as it can until ctx is done. Each worker
+// sticks to one metric name so the load spreads across the store's map the
+// way real reporters would.
+func sendUntil(ctx context.Context, client *http.Client, cfg config, workerID int) tally {
+	t := newTally()
+	metric := fmt.Sprintf("metric.%d", workerID%cfg.metrics)
+	url := strings.TrimSuffix(cfg.target, "/") + "/ingest"
+
+	for i := 0; ctx.Err() == nil; i++ {
+		body := eventBody(metric, float64(i%10+1), time.Now())
+
+		// Deliberately NOT http.NewRequestWithContext(ctx, ...): ctx ends
+		// the run, and binding it to the request would cancel whatever is
+		// in flight at that instant. The server may already have recorded
+		// such an event while the client scores it as a failure - which
+		// would make our own accepted count wrong, and the end-to-end
+		// check in verify() meaningless. The deadline stops us *issuing*
+		// requests; outstanding ones are allowed to finish. Client.Timeout
+		// still bounds a genuinely hung server.
+		req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
+		if err != nil {
+			t.failed++
+			continue
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			t.failed++
+			continue
+		}
+
+		// Drain and close, always. An undrained body keeps its connection
+		// out of the idle pool, so the next request opens a new socket and
+		// the tuned transport above buys nothing.
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+
+		t.byStatus[resp.StatusCode]++
+	}
+	return t
+}
+
+// runLoad drives cfg.workers senders for cfg.duration and returns the total.
+func runLoad(ctx context.Context, cfg config) tally {
+	ctx, cancel := context.WithTimeout(ctx, cfg.duration)
+	defer cancel()
+
+	client := newClient(cfg.workers)
+	results := make(chan tally, cfg.workers)
+
+	var wg sync.WaitGroup
+	for w := 0; w < cfg.workers; w++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			results <- sendUntil(ctx, client, cfg, id)
+		}(w)
+	}
+	wg.Wait()
+	close(results)
+
+	total := newTally()
+	for t := range results {
+		total.merge(t)
+	}
+	return total
+}
+
 func main() {
 	cfg, err := parseFlags(os.Args[1:])
 	if err != nil {
@@ -66,4 +182,7 @@ func main() {
 
 	fmt.Printf("target=%s workers=%d duration=%s metrics=%d bad=%.0f%% verify=%v\n",
 		cfg.target, cfg.workers, cfg.duration, cfg.metrics, cfg.badFrac*100, cfg.verify)
+
+	total := runLoad(context.Background(), cfg)
+	fmt.Printf("sent=%d failed=%d byStatus=%v\n", total.sent(), total.failed, total.byStatus)
 }
