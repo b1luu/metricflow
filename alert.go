@@ -27,6 +27,13 @@ const (
 	StatMax   Stat = "max"
 	StatMin   Stat = "min"
 	StatCount Stat = "count"
+	// Percentiles (§23). These are usually the right choice for a latency
+	// rule: max fires on a single unlucky request, avg is dragged around by
+	// the bulk and describes neither mode, but "p99 over 500ms" is the
+	// question an on-call engineer actually asks.
+	StatP50 Stat = "p50"
+	StatP90 Stat = "p90"
+	StatP99 Stat = "p99"
 )
 
 // Op is the comparison a rule applies to its stat.
@@ -89,7 +96,7 @@ func (r Rule) Validate() error {
 	}
 
 	switch r.Stat {
-	case StatAvg, StatMax, StatMin, StatCount:
+	case StatAvg, StatMax, StatMin, StatCount, StatP50, StatP90, StatP99:
 	default:
 		return fmt.Errorf("rule %q: unknown stat %q", r.Name, r.Stat)
 	}
@@ -126,6 +133,12 @@ func (r Rule) statValue(a Agg) float64 {
 		return a.Min
 	case StatCount:
 		return float64(a.Count)
+	case StatP50:
+		return a.h.quantile(0.50)
+	case StatP90:
+		return a.h.quantile(0.90)
+	case StatP99:
+		return a.h.quantile(0.99)
 	}
 	return 0 // unreachable for a validated rule
 }

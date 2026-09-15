@@ -438,3 +438,60 @@ func TestStatsPercentilesWithoutADistribution(t *testing.T) {
 		t.Errorf("percentiles = %g/%g, want 0 with no distribution recorded", m.P50, m.P99)
 	}
 }
+
+// --- alerting on percentiles ---
+
+// The case that motivates percentile rules: a slow tail that a max rule
+// over-reports and an avg rule under-reports, but p99 gets right.
+func TestAlertOnPercentileSeesTheTail(t *testing.T) {
+	s := newStore()
+	now := time.Now()
+
+	// 99% of requests are fast; 1% are slow. p99 should sit in the tail.
+	for i := 0; i < 990; i++ {
+		s.record(now, Event{Name: "http.latency_ms", Value: 20, TS: now.UnixMilli()})
+	}
+	for i := 0; i < 10; i++ {
+		s.record(now, Event{Name: "http.latency_ms", Value: 900, TS: now.UnixMilli()})
+	}
+
+	s.mu.Lock()
+	agg, ok := mergeBuckets(s.aggs["http.latency_ms"], 0)
+	s.mu.Unlock()
+	if !ok {
+		t.Fatal("no data")
+	}
+
+	p99 := Rule{Name: "p99", Metric: "http.latency_ms", Stat: StatP99, Op: OpGT, Value: 500}
+	if state, v := evaluate(p99, agg, true); state != StateFiring {
+		t.Errorf("p99 rule: state = %q value = %g, want firing", state, v)
+	}
+
+	// The average is ~28.8 - far below the threshold, so an avg rule would
+	// stay quiet while 1% of users wait nearly a second.
+	avg := Rule{Name: "avg", Metric: "http.latency_ms", Stat: StatAvg, Op: OpGT, Value: 500}
+	if state, _ := evaluate(avg, agg, true); state != StateOK {
+		t.Errorf("avg rule: state = %q, expected it to miss the tail", state)
+	}
+}
+
+func TestPercentileStatsAreValidRuleStats(t *testing.T) {
+	for _, stat := range []Stat{StatP50, StatP90, StatP99} {
+		r := Rule{Name: string(stat), Metric: "m", Stat: stat, Op: OpGT, Value: 1}
+		if err := r.Validate(); err != nil {
+			t.Errorf("stat %q rejected: %v", stat, err)
+		}
+	}
+}
+
+// A rule reading a percentile off an Agg with no distribution must not
+// panic - it reads as zero, the same as any other absent measurement.
+func TestPercentileRuleWithoutADistribution(t *testing.T) {
+	agg := Agg{Count: 3, Sum: 30, Min: 10, Max: 10} // no h
+	r := Rule{Name: "p99", Metric: "m", Stat: StatP99, Op: OpGT, Value: 1}
+
+	state, v := evaluate(r, agg, true)
+	if v != 0 || state != StateOK {
+		t.Errorf("got state=%q value=%g, want ok/0", state, v)
+	}
+}

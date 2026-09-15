@@ -349,7 +349,11 @@ func defaultRules() []Rule {
 		// instantaneous by nature, so waiting for it to persist would mean
 		// never reporting the thing this rule exists to catch.
 		{Name: "cpu-spike", Metric: "cpu.load", Stat: StatMax, Op: OpGT, Value: 0.99},
-		{Name: "slow-requests", Metric: "http.latency_ms", Stat: StatMax, Op: OpGT, Value: 500},
+		// Latency wants a percentile, not a max. A max rule fires on one
+		// unlucky request; p99 fires when a real fraction of users are
+		// affected, which is the thing worth waking someone for (§23).
+		{Name: "slow-requests", Metric: "http.latency_ms", Stat: StatP99, Op: OpGT, Value: 500,
+			For: 20 * time.Second},
 	}
 }
 
