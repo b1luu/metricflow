@@ -10,11 +10,11 @@ survives even when the code changes.
 | --------------- | ------ | ------------------------------------------------ |
 | `/health`       | GET    | Liveness check. Returns `ok`.                    |
 | `/ingest`       | POST   | Accept one metric event as a JSON body.          |
-| `/stats`        | GET    | Per-metric count/avg/min/max over a time window, as JSON. Optional `?window=`. |
+| `/stats`        | GET    | Per-metric count/avg/min/max/p50/p90/p99 over a time window, as JSON. Optional `?window=`. |
 | `/alerts`       | GET    | Current state of every alert rule, as JSON.      |
 
 Wrong method on any route → `405` (§13). Details: JSON shape §14, `?window=`
-§11, alerting §18.
+§11, alerting §18, percentiles §23.
 
 Event shape (see `Event` in `main.go`):
 
@@ -31,9 +31,13 @@ regardless of how many events arrive. A million `cpu.load` events use the same
 memory as one.
 
 - **Average** comes from `Sum / Count`; we never keep the raw values.
-- **Trade-off:** we can't compute anything we didn't decide to track up front
-  (e.g. percentiles, which need the distribution). Adding a new aggregate means
-  adding a field and back-filling is impossible — old data is already gone.
+- **Trade-off:** we can't compute anything we didn't decide to track up front.
+  Adding a new aggregate means adding a field, and back-filling is impossible
+  — old data is already gone.
+- **Percentiles were the headline casualty of that, and are now bought back**
+  (§23) — not by keeping events, but by keeping a bounded sketch of the
+  distribution alongside the four numbers. The trade-off above still stands;
+  percentiles just turned out to be affordable within it.
 
 ### 2. In-memory state, no persistence
 
@@ -660,6 +664,73 @@ checks something the development environment structurally cannot.
 The startup and shutdown waits poll rather than `sleep`. A fixed sleep is
 either flaky on a slow runner or wasted time on a fast one, and there is a
 readiness endpoint (`/health`) precisely so nobody has to guess.
+
+### 23. Percentiles: a bounded sketch, not the events
+
+§1 named this as the price of storing conclusions: no percentiles, because
+those need the distribution. `histogram.go` buys them back without keeping a
+single event.
+
+**Log-bucketing.** A value is bucketed by the logarithm of its magnitude, so
+buckets widen as values grow and the *relative* error stays flat — each
+reported quantile is within 1% of the truth at any magnitude. `gamma` is
+chosen so a bucket's representative value is off by exactly `relAccuracy` at
+both edges, which is the best a single representative can do.
+
+- **Why not linear buckets,** which is what loadgen uses (§19)? That works
+  there only because request latency has a known, narrow range. A general
+  metrics engine sees `cpu.load` near 1 and `http.latency_ms` near 10000 in
+  the same process, and a bucket width that suits one is useless for the
+  other. Same lesson as §8's bucket width, one level down.
+- **Sparse, not a fixed array.** Spanning 1e-9..1e9 at 1% needs ~1400
+  buckets, but a real metric's values sit in a narrow band — `cpu.load`
+  occupies a few dozen. Memory follows what actually arrived. A metric that
+  never reports a negative never allocates a negative map.
+- **Negatives get their own map**, keyed by magnitude, rather than being
+  rejected. §4 already establishes all-negative metrics as a supported case,
+  and a logarithm has no answer for a negative input. The quantile walk
+  therefore goes negatives-descending-magnitude, then zeros, then positives.
+- **Merging is exact** — bucket counts simply add — which is what lets a
+  windowed query combine several time buckets (§8) with no loss beyond the
+  bucketing already applied. A test asserts percentiles over a merge equal
+  percentiles over the same values in a single bucket.
+
+**`Agg.h` is an unexported pointer,** and that is load-bearing. `Agg` is
+copied by value — `mergeBuckets` returns one — and a copy must never share a
+histogram some other `Agg` is still writing into. `mergeBuckets` therefore
+always allocates a fresh one; there is a test that writes to a query result
+and asserts the store is unchanged.
+
+**What it cost, measured (§19's benchmarks):**
+
+| | before | after |
+| --- | --- | --- |
+| `record` | 68.4 ns/op, 0 allocs | 91.3 ns/op, 0 allocs |
+| `hist.add` alone | — | 22.0 ns/op, 0 allocs |
+| `/stats`, 100 metrics | — | 690 µs |
+
+`record` stays allocation-free in steady state: the map allocation happens
+only on first touch of a new bucket. The `/stats` figure has no "before",
+because the old benchmark seeded `Agg`s directly and so had no histograms to
+walk — it was quietly measuring almost none of what `/stats` does. Fixing
+that benchmark was part of this work, not a footnote to it.
+
+**Three quantiles cost the same as one.** The expense is sorting the bucket
+keys, so `quantiles(...)` sorts once and walks once for all of them:
+`BenchmarkHistQuantile` is 31 µs for one, `BenchmarkHistQuantilesTogether`
+30 µs for three.
+
+**Alert rules can use `p50`/`p90`/`p99`,** and `defaultRules`' latency rule
+moved from `max` to `p99`. That change is the argument for the whole slice: a
+`max` rule fires on one unlucky request, and an `avg` rule stays silent while
+a real fraction of users suffer. A test with 990 requests at 20 ms and 10 at
+900 ms has the p99 rule firing and the avg rule — identical threshold —
+missing it entirely, because the average is ~29 ms.
+
+**Accuracy and exactness are separate claims.** The bucket *values* are
+approximate by design; the bucket *counts* are exact, and §20's concurrency
+tests hold the histogram to the same standard as the summary numbers. A lost
+update must not be able to hide behind "percentiles are estimates".
 
 ## Testing
 
