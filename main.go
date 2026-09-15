@@ -256,11 +256,19 @@ func (s *Store) handleIngest(w http.ResponseWriter, r *http.Request) {
 
 // MetricStats is one metric's aggregate in a /stats response. Avg is
 // derived (Sum/Count) and served raw; the caller rounds for display.
+//
+// The percentiles come from the histogram (§23) and carry its accuracy
+// guarantee: each is within 1% of the true value. They are the numbers that
+// actually describe a distribution - an average of 0.6 says nothing about
+// whether the worst request took 2ms or 2 seconds.
 type MetricStats struct {
 	Count int     `json:"count"`
 	Avg   float64 `json:"avg"`
 	Min   float64 `json:"min"`
 	Max   float64 `json:"max"`
+	P50   float64 `json:"p50"`
+	P90   float64 `json:"p90"`
+	P99   float64 `json:"p99"`
 }
 
 // StatsResponse is the JSON body of GET /stats. Window echoes back the
@@ -302,6 +310,9 @@ func (s *Store) handleStats(w http.ResponseWriter, r *http.Request) {
 			Avg:   m.Sum / float64(m.Count),
 			Min:   m.Min,
 			Max:   m.Max,
+			P50:   m.h.quantile(0.50),
+			P90:   m.h.quantile(0.90),
+			P99:   m.h.quantile(0.99),
 		}
 	}
 	s.mu.Unlock()

@@ -366,3 +366,75 @@ func TestMergeBucketsHandlesHistogramlessBuckets(t *testing.T) {
 		t.Errorf("expected an empty histogram, got %+v", got.h)
 	}
 }
+
+// --- /stats reports percentiles ---
+
+func TestStatsHandlerReportsPercentiles(t *testing.T) {
+	s := newStore()
+	now := time.Now()
+
+	// A skewed shape: mostly fast, with a slow tail. This is exactly the
+	// case an average hides and a p99 exposes.
+	for i := 0; i < 990; i++ {
+		s.record(now, Event{Name: "http.latency_ms", Value: 10, TS: now.UnixMilli()})
+	}
+	for i := 0; i < 10; i++ {
+		s.record(now, Event{Name: "http.latency_ms", Value: 5000, TS: now.UnixMilli()})
+	}
+
+	m := getStats(t, s, "").Metrics["http.latency_ms"]
+
+	if !within(m.P50, 10) {
+		t.Errorf("p50 = %g, want about 10", m.P50)
+	}
+	if !within(m.P90, 10) {
+		t.Errorf("p90 = %g, want about 10", m.P90)
+	}
+	if !within(m.P99, 5000) {
+		t.Errorf("p99 = %g, want about 5000 - the tail is the point", m.P99)
+	}
+	// The average is dragged up by the tail without describing either part.
+	if m.Avg < 50 || m.Avg > 70 {
+		t.Errorf("avg = %g, expected it stranded between the two modes", m.Avg)
+	}
+}
+
+// Percentiles must respect the query window like every other statistic.
+func TestStatsPercentilesRespectTheWindow(t *testing.T) {
+	s := newStore()
+	now := time.Now()
+
+	// Old, slow values; recent, fast ones.
+	old := now.Add(-40 * time.Second)
+	for i := 0; i < 100; i++ {
+		s.record(old, Event{Name: "latency", Value: 9000, TS: old.UnixMilli()})
+	}
+	for i := 0; i < 100; i++ {
+		s.record(now, Event{Name: "latency", Value: 10, TS: now.UnixMilli()})
+	}
+
+	wide := getStats(t, s, "").Metrics["latency"]
+	if !within(wide.P99, 9000) {
+		t.Errorf("full window p99 = %g, want about 9000", wide.P99)
+	}
+
+	narrow := getStats(t, s, "?window=20s").Metrics["latency"]
+	if !within(narrow.P99, 10) {
+		t.Errorf("20s window p99 = %g, want about 10 - the old values are outside it", narrow.P99)
+	}
+}
+
+// A metric whose buckets were seeded without histograms still answers, with
+// zeros rather than a panic.
+func TestStatsPercentilesWithoutADistribution(t *testing.T) {
+	s := newStore()
+	seedBucket(s, "m", bucketAt(0), &Agg{Count: 3, Sum: 30, Min: 10, Max: 10})
+
+	m := getStats(t, s, "").Metrics["m"]
+	if m.Count != 3 {
+		t.Fatalf("count = %d, want 3", m.Count)
+	}
+	if m.P50 != 0 || m.P99 != 0 {
+		t.Errorf("percentiles = %g/%g, want 0 with no distribution recorded", m.P50, m.P99)
+	}
+}
