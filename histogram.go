@@ -12,7 +12,10 @@ package main
 // latency near 10000 in the same process, and a bucket width that suits one
 // is useless for the other.
 
-import "math"
+import (
+	"math"
+	"sort"
+)
 
 // relAccuracy is the relative error the bucketing guarantees: a reported
 // quantile is within 1% of the true value, at any magnitude. Smaller is
@@ -50,4 +53,123 @@ func bucketIndex(magnitude float64) int32 {
 // which is the best any single representative can do.
 func bucketValue(i int32) float64 {
 	return 2 * math.Pow(gamma, float64(i)) / (gamma + 1)
+}
+
+// hist is a sparse, mergeable distribution.
+//
+// Sparse rather than a fixed array because a real metric's values sit in a
+// narrow band: cpu.load occupies a few dozen buckets, not the ~1400 that
+// spanning 1e-9..1e9 at 1% accuracy would need. Memory therefore follows
+// what actually arrived, not what theoretically could.
+//
+// Negatives get their own map keyed by magnitude, rather than being
+// rejected. §4 already establishes that all-negative metrics are a case
+// this project supports, and log-bucketing has no answer for a negative
+// input otherwise.
+type hist struct {
+	pos   map[int32]int64 // buckets for values >= minMagnitude
+	neg   map[int32]int64 // buckets for values <= -minMagnitude, keyed by |v|
+	zeros int64           // |v| < minMagnitude
+	count int64
+}
+
+// add records one observation. The maps are created on first use, so a
+// metric that never reports a negative never allocates a negative map.
+func (h *hist) add(v float64) {
+	h.count++
+	switch {
+	case v >= minMagnitude:
+		if h.pos == nil {
+			h.pos = make(map[int32]int64)
+		}
+		h.pos[bucketIndex(v)]++
+	case v <= -minMagnitude:
+		if h.neg == nil {
+			h.neg = make(map[int32]int64)
+		}
+		h.neg[bucketIndex(-v)]++
+	default:
+		h.zeros++
+	}
+}
+
+// merge folds o into h. Merging is exact - bucket counts simply add - which
+// is the property that lets a windowed query combine several time buckets
+// without any loss beyond the bucketing already applied (§8).
+func (h *hist) merge(o *hist) {
+	if o == nil {
+		return
+	}
+	for i, n := range o.pos {
+		if h.pos == nil {
+			h.pos = make(map[int32]int64, len(o.pos))
+		}
+		h.pos[i] += n
+	}
+	for i, n := range o.neg {
+		if h.neg == nil {
+			h.neg = make(map[int32]int64, len(o.neg))
+		}
+		h.neg[i] += n
+	}
+	h.zeros += o.zeros
+	h.count += o.count
+}
+
+// quantile returns the value below which q of the observations fall, within
+// relAccuracy. The walk is in value order: negatives from most negative up
+// (so descending magnitude), then zeros, then positives ascending.
+func (h *hist) quantile(q float64) float64 {
+	if h == nil || h.count == 0 {
+		return 0
+	}
+
+	rank := int64(q * float64(h.count))
+	if rank >= h.count {
+		rank = h.count - 1 // q >= 1 asks for the largest observation
+	}
+	if rank < 0 {
+		rank = 0
+	}
+
+	var seen int64
+
+	// Most negative first: that is the largest magnitude, so this walks the
+	// negative buckets backwards.
+	negIdx := sortedBuckets(h.neg)
+	for i := len(negIdx) - 1; i >= 0; i-- {
+		seen += h.neg[negIdx[i]]
+		if seen > rank {
+			return -bucketValue(negIdx[i])
+		}
+	}
+
+	seen += h.zeros
+	if seen > rank {
+		return 0
+	}
+
+	for _, i := range sortedBuckets(h.pos) {
+		seen += h.pos[i]
+		if seen > rank {
+			return bucketValue(i)
+		}
+	}
+
+	return 0 // unreachable: rank < count and the buckets hold count samples
+}
+
+// sortedBuckets returns a map's bucket indices in ascending order. Map
+// iteration order is random, and a quantile walked in random order would be
+// a different (wrong) number every call.
+func sortedBuckets(m map[int32]int64) []int32 {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make([]int32, 0, len(m))
+	for i := range m {
+		out = append(out, i)
+	}
+	sort.Slice(out, func(a, b int) bool { return out[a] < out[b] })
+	return out
 }

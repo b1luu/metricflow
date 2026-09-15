@@ -59,3 +59,184 @@ func TestBucketValueRoundTrips(t *testing.T) {
 		}
 	}
 }
+
+// --- hist: storage and quantiles ---
+
+// within reports whether got is inside the accuracy guarantee of want.
+func within(got, want float64) bool {
+	if want == 0 {
+		return got == 0
+	}
+	return math.Abs(got-want)/math.Abs(want) <= relAccuracy
+}
+
+func TestHistQuantilesOverAUniformRange(t *testing.T) {
+	var h hist
+	for i := 1; i <= 1000; i++ {
+		h.add(float64(i))
+	}
+
+	cases := []struct{ q, want float64 }{
+		{0.00, 1},
+		{0.50, 501},
+		{0.90, 901},
+		{0.99, 991},
+		{1.00, 1000},
+	}
+	for _, c := range cases {
+		if got := h.quantile(c.q); !within(got, c.want) {
+			t.Errorf("quantile(%.2f) = %g, want %g within %.0f%%",
+				c.q, got, c.want, relAccuracy*100)
+		}
+	}
+	if h.count != 1000 {
+		t.Errorf("count = %d, want 1000", h.count)
+	}
+}
+
+// The reason for log buckets: accuracy has to hold at every magnitude, not
+// just the one the buckets were sized for.
+func TestHistAccuracyAcrossMagnitudes(t *testing.T) {
+	for _, scale := range []float64{1e-6, 0.01, 1, 1000, 1e8} {
+		var h hist
+		for i := 1; i <= 100; i++ {
+			h.add(scale * float64(i))
+		}
+		want := scale * 51
+		if got := h.quantile(0.5); !within(got, want) {
+			t.Errorf("scale %g: median = %g, want %g", scale, got, want)
+		}
+	}
+}
+
+// Negative values are a supported case (§4), so they need real ordering:
+// the median of -100..-1 is a negative number near the middle, not zero.
+func TestHistHandlesNegatives(t *testing.T) {
+	var h hist
+	for i := 1; i <= 100; i++ {
+		h.add(-float64(i))
+	}
+
+	// Ascending order is -100 .. -1, so the 51st value is -50.
+	if got := h.quantile(0.5); !within(got, -50) {
+		t.Errorf("median = %g, want about -50", got)
+	}
+	if got := h.quantile(0); !within(got, -100) {
+		t.Errorf("min = %g, want about -100", got)
+	}
+	if got := h.quantile(1); !within(got, -1) {
+		t.Errorf("max = %g, want about -1", got)
+	}
+	if h.pos != nil {
+		t.Error("an all-negative metric allocated a positive bucket map")
+	}
+}
+
+// Mixed signs must sort across the zero boundary correctly.
+func TestHistOrdersNegativesZerosAndPositives(t *testing.T) {
+	var h hist
+	h.add(-10)
+	h.add(0)
+	h.add(10)
+
+	if got := h.quantile(0); !within(got, -10) {
+		t.Errorf("lowest = %g, want -10", got)
+	}
+	if got := h.quantile(0.5); got != 0 {
+		t.Errorf("median = %g, want exactly 0", got)
+	}
+	if got := h.quantile(1); !within(got, 10) {
+		t.Errorf("highest = %g, want 10", got)
+	}
+}
+
+// Anything indistinguishable from zero is counted as zero rather than given
+// a bucket, or the index range would be unbounded below.
+func TestHistTreatsTinyValuesAsZero(t *testing.T) {
+	var h hist
+	h.add(0)
+	h.add(minMagnitude / 100)
+	h.add(-minMagnitude / 100)
+
+	if h.zeros != 3 {
+		t.Errorf("zeros = %d, want 3", h.zeros)
+	}
+	if h.pos != nil || h.neg != nil {
+		t.Error("tiny values allocated magnitude buckets")
+	}
+}
+
+// Merging is what lets a windowed query combine time buckets (§8), so it
+// must be exact and must not depend on which side started empty.
+func TestHistMergeIsExact(t *testing.T) {
+	var a, b hist
+	for i := 1; i <= 500; i++ {
+		a.add(float64(i))
+	}
+	for i := 501; i <= 1000; i++ {
+		b.add(float64(i))
+	}
+	a.merge(&b)
+
+	var whole hist
+	for i := 1; i <= 1000; i++ {
+		whole.add(float64(i))
+	}
+
+	if a.count != whole.count {
+		t.Fatalf("merged count = %d, want %d", a.count, whole.count)
+	}
+	for _, q := range []float64{0, 0.25, 0.5, 0.9, 0.99, 1} {
+		if got, want := a.quantile(q), whole.quantile(q); got != want {
+			t.Errorf("q%.2f: merged %g != whole %g", q, got, want)
+		}
+	}
+}
+
+func TestHistMergeIntoEmptyAndNil(t *testing.T) {
+	var src hist
+	src.add(5)
+	src.add(-5)
+	src.add(0)
+
+	var dst hist
+	dst.merge(&src)
+	if dst.count != 3 {
+		t.Errorf("merge into empty: count = %d, want 3", dst.count)
+	}
+
+	dst.merge(nil) // must not panic
+	if dst.count != 3 {
+		t.Errorf("merging nil changed count to %d", dst.count)
+	}
+}
+
+func TestHistEmptyQuantileIsZero(t *testing.T) {
+	var h hist
+	if got := h.quantile(0.5); got != 0 {
+		t.Errorf("empty quantile = %g, want 0", got)
+	}
+	var nilHist *hist
+	if got := nilHist.quantile(0.5); got != 0 {
+		t.Errorf("nil quantile = %g, want 0", got)
+	}
+}
+
+// A skewed distribution is the realistic case - most requests fast, a few
+// slow - and it's where a median alone misleads.
+func TestHistCapturesATail(t *testing.T) {
+	var h hist
+	for i := 0; i < 990; i++ {
+		h.add(10) // the bulk
+	}
+	for i := 0; i < 10; i++ {
+		h.add(5000) // the tail
+	}
+
+	if got := h.quantile(0.5); !within(got, 10) {
+		t.Errorf("median = %g, want 10 (the bulk)", got)
+	}
+	if got := h.quantile(0.999); !within(got, 5000) {
+		t.Errorf("p99.9 = %g, want 5000 (the tail the average would hide)", got)
+	}
+}
