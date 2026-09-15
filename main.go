@@ -27,13 +27,19 @@ type Event struct {
 	Type  string  `json:"type"`  // metric kind, e.g. "gauge" / "counter"
 }
 
-// Agg holds the running aggregates for one metric. Four small numbers,
-// no matter how many events arrive - we store the conclusion, not the events.
+// Agg holds the running aggregates for one metric: four summary numbers
+// plus a bounded sketch of the distribution behind them. Still no events -
+// h is a histogram of bucket counts, not samples (§23).
 type Agg struct {
 	Count int     // how many events seen
 	Sum   float64 // sum of all values (Sum/Count = average)
 	Min   float64 // smallest value seen
 	Max   float64 // largest value seen
+
+	// h answers percentile queries. Unexported and a pointer: Agg is copied
+	// by value in places (mergeBuckets returns one), and a copy must never
+	// be handed a histogram some other Agg is still writing into.
+	h *hist
 }
 
 // Store owns all metric state behind one mutex. Bundling the lock with the
@@ -84,8 +90,14 @@ func (s *Store) record(now time.Time, ev Event) {
 
 	a := series[bucket]
 	if a == nil {
-		a = &Agg{Min: ev.Value, Max: ev.Value}
+		a = &Agg{Min: ev.Value, Max: ev.Value, h: &hist{}}
 		series[bucket] = a
+	}
+	if a.h == nil {
+		// An Agg built elsewhere (a test seeding a bucket) may have no
+		// histogram yet. Create it rather than panicking; the summary
+		// numbers stay correct either way.
+		a.h = &hist{}
 	}
 
 	a.Count++
@@ -96,6 +108,7 @@ func (s *Store) record(now time.Time, ev Event) {
 	if ev.Value > a.Max {
 		a.Max = ev.Value
 	}
+	a.h.add(ev.Value)
 
 	// Drop buckets that have aged out of the retention window, so a
 	// long-lived metric's map stays bounded to ~numBuckets entries. A

@@ -3,6 +3,7 @@ package main
 import (
 	"math"
 	"testing"
+	"time"
 )
 
 // The whole guarantee in one test: whatever magnitude you feed in, the
@@ -238,5 +239,51 @@ func TestHistCapturesATail(t *testing.T) {
 	}
 	if got := h.quantile(0.999); !within(got, 5000) {
 		t.Errorf("p99.9 = %g, want 5000 (the tail the average would hide)", got)
+	}
+}
+
+// --- record populates the distribution ---
+
+func TestRecordBuildsADistribution(t *testing.T) {
+	s := newStore()
+	now := time.Now()
+	for i := 1; i <= 1000; i++ {
+		s.record(now, Event{Name: "latency", Value: float64(i), TS: now.UnixMilli()})
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a := s.aggs["latency"][now.Truncate(bucketWidth).Unix()]
+
+	if a.h == nil {
+		t.Fatal("record did not build a histogram")
+	}
+	if a.h.count != int64(a.Count) {
+		t.Errorf("histogram count %d != Agg.Count %d", a.h.count, a.Count)
+	}
+	if got := a.h.quantile(0.99); !within(got, 991) {
+		t.Errorf("p99 = %g, want about 991", got)
+	}
+}
+
+// A bucket seeded without a histogram must not panic when a real event
+// lands in it - the summary numbers stay correct either way.
+func TestRecordSurvivesASeededBucketWithNoHistogram(t *testing.T) {
+	s := newStore()
+	now := time.Now()
+	key := now.Truncate(bucketWidth).Unix()
+
+	seedBucket(s, "cpu.load", key, &Agg{Count: 1, Sum: 5, Min: 5, Max: 5}) // no h
+
+	s.record(now, Event{Name: "cpu.load", Value: 7, TS: now.UnixMilli()})
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a := s.aggs["cpu.load"][key]
+	if a.Count != 2 || a.Sum != 12 || a.Max != 7 {
+		t.Errorf("summary numbers wrong after seeding: %+v", a)
+	}
+	if a.h == nil || a.h.count != 1 {
+		t.Errorf("histogram should hold only the recorded event, got %+v", a.h)
 	}
 }
