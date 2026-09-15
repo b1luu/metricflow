@@ -134,7 +134,13 @@ func evict(series map[int64]*Agg, cutoff int64) {
 // The bool is false when no bucket qualifies. Caller must hold the Store
 // lock. (Pure read over the passed map - stays a free function.)
 func mergeBuckets(series map[int64]*Agg, cutoff int64) (Agg, bool) {
-	var merged Agg
+	// A fresh histogram, never a reference to one of the buckets': the
+	// returned Agg escapes this function while those buckets stay live and
+	// keep being written to. Aliasing here would let a query's result
+	// mutate under the caller, and would corrupt the store if the caller
+	// merged into it.
+	merged := Agg{h: &hist{}}
+
 	first := true
 	for bucket, a := range series {
 		if bucket < cutoff {
@@ -148,6 +154,7 @@ func mergeBuckets(series map[int64]*Agg, cutoff int64) (Agg, bool) {
 		if first || a.Max > merged.Max {
 			merged.Max = a.Max
 		}
+		merged.h.merge(a.h) // exact: bucket counts add
 		first = false
 	}
 	return merged, !first

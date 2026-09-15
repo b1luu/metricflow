@@ -287,3 +287,82 @@ func TestRecordSurvivesASeededBucketWithNoHistogram(t *testing.T) {
 		t.Errorf("histogram should hold only the recorded event, got %+v", a.h)
 	}
 }
+
+// --- merging across time buckets ---
+
+// The windowed query has to combine several 10s buckets (§8). Percentiles
+// over the merge must match percentiles over the same data recorded into a
+// single bucket, or the window boundary would change the answer.
+func TestMergeBucketsCombinesDistributions(t *testing.T) {
+	s := newStore()
+	base := time.Now().Truncate(bucketWidth)
+
+	// 300 values spread across three consecutive time buckets.
+	for i := 1; i <= 300; i++ {
+		at := base.Add(time.Duration((i-1)/100) * bucketWidth)
+		s.record(at, Event{Name: "latency", Value: float64(i), TS: at.UnixMilli()})
+	}
+
+	s.mu.Lock()
+	got, ok := mergeBuckets(s.aggs["latency"], 0)
+	s.mu.Unlock()
+	if !ok {
+		t.Fatal("no data")
+	}
+
+	var whole hist
+	for i := 1; i <= 300; i++ {
+		whole.add(float64(i))
+	}
+
+	if got.h.count != 300 {
+		t.Errorf("merged count = %d, want 300", got.h.count)
+	}
+	for _, q := range []float64{0, 0.5, 0.9, 0.99, 1} {
+		if a, b := got.h.quantile(q), whole.quantile(q); a != b {
+			t.Errorf("q%.2f across buckets = %g, single bucket = %g", q, a, b)
+		}
+	}
+}
+
+// The aliasing hazard the pointer field exists to guard. A merge result
+// escapes while the store's buckets stay live; if it shared their
+// histogram, writing to the result would corrupt the store.
+func TestMergeBucketsDoesNotAliasStoredHistograms(t *testing.T) {
+	s := newStore()
+	now := time.Now()
+	s.record(now, Event{Name: "cpu.load", Value: 1, TS: now.UnixMilli()})
+
+	s.mu.Lock()
+	stored := s.aggs["cpu.load"][now.Truncate(bucketWidth).Unix()]
+	got, _ := mergeBuckets(s.aggs["cpu.load"], 0)
+	s.mu.Unlock()
+
+	if got.h == stored.h {
+		t.Fatal("merge returned the stored histogram itself, not a copy")
+	}
+
+	// Mutating the result must leave the store untouched.
+	got.h.add(999)
+	if stored.h.count != 1 {
+		t.Errorf("writing to the merge result changed the store: count = %d, want 1",
+			stored.h.count)
+	}
+}
+
+// Merging must tolerate buckets that carry no histogram at all.
+func TestMergeBucketsHandlesHistogramlessBuckets(t *testing.T) {
+	s := newStore()
+	seedBucket(s, "m", bucketAt(0), &Agg{Count: 5, Sum: 25, Min: 5, Max: 5}) // no h
+
+	s.mu.Lock()
+	got, ok := mergeBuckets(s.aggs["m"], 0)
+	s.mu.Unlock()
+
+	if !ok || got.Count != 5 {
+		t.Fatalf("summary merge broke: %+v ok=%v", got, ok)
+	}
+	if got.h == nil || got.h.count != 0 {
+		t.Errorf("expected an empty histogram, got %+v", got.h)
+	}
+}
