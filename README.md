@@ -4,8 +4,8 @@
 
 A small real-time metrics ingestion and aggregation engine in Go — a mini
 Datadog. Events are pushed in over HTTP; per-metric aggregates (count, average,
-min, max) are kept live in memory over a rolling time window and served back on
-demand.
+min, max, and p50/p90/p99) are kept live in memory over a rolling time window
+and served back on demand.
 
 Standard library only (`net/http`), no database, no external services.
 
@@ -24,7 +24,7 @@ exits; a second `Ctrl-C` kills immediately.
 | ------ | --------- | ------------------------------------------------------ |
 | GET    | `/health` | Liveness check. Returns `ok`.                          |
 | POST   | `/ingest` | Submit one metric event as a JSON body.                |
-| GET    | `/stats`  | Per-metric aggregate over a time window (JSON, default 60s). |
+| GET    | `/stats`  | Per-metric count/avg/min/max and p50/p90/p99 over a time window (JSON, default 60s). |
 | GET    | `/alerts` | Current state of every alert rule (JSON).              |
 
 `/alerts` reports each rule as `ok`, `pending`, `firing`, or `nodata`, with
@@ -36,6 +36,29 @@ no data reads as `nodata`, never as healthy.
 A rule may set `For`, requiring the breach to hold that long before it counts;
 until then it sits in `pending` and logs nothing, so a metric flapping across
 its threshold never raises an alert at all.
+
+Rules compare `avg`, `max`, `min`, `count`, or a percentile (`p50`/`p90`/`p99`).
+For latency, a percentile is usually the right choice: a `max` rule fires on a
+single unlucky request, while an `avg` rule stays quiet even when a real
+fraction of users are suffering.
+
+## Percentiles
+
+`/stats` reports p50/p90/p99 alongside the summary numbers, each within 1% of
+the true value. They come from a log-bucketed histogram kept per metric per
+time bucket — bucket counts, never the events — so memory stays bounded
+however long the process runs.
+
+They exist because an average describes a distribution badly. 99 requests at
+20 ms and one at 900 ms:
+
+```
+count=100  avg=28.8  min=20  max=900  p50=19.9  p90=19.9  p99=907
+```
+
+The average is stranded between the two modes and describes neither; the max
+reflects one request. p99 is the number that says 1% of users waited nearly a
+second.
 
 `/stats` accepts an optional `?window=` (Go duration, e.g. `?window=30s`),
 capped at the 60-second retention window. `/ingest` requires `name` and `ts`
@@ -59,7 +82,7 @@ Invoke-RestMethod -Method Post -Uri http://localhost:8080/ingest `
 Invoke-RestMethod http://localhost:8080/stats
 # window  metrics
 # ------  -------
-# 1m0s    @{cpu.load=@{count=1; avg=0.8; min=0.8; max=0.8}}
+# 1m0s    @{cpu.load=@{count=1; avg=0.8; min=0.8; max=0.8; p50=0.8; p90=0.8; p99=0.8}}
 
 (Invoke-RestMethod http://localhost:8080/alerts).alerts
 # rule          metric          state  value since
@@ -122,14 +145,15 @@ of event volume. Concurrent writes are serialised with a mutex. See
 ## Status
 
 Done: ingest with validation, windowed aggregation over event time, per-metric
-stats with a configurable query window, an alerting layer with flap
-suppression, graceful shutdown, and a load harness (benchmarks, concurrency
-invariants, and an HTTP load generator that verifies the server recorded
-exactly what it accepted).
+stats with a configurable query window, percentiles from a bounded histogram,
+an alerting layer with flap suppression, graceful shutdown, and a load harness
+(benchmarks, concurrency invariants, and an HTTP load generator that verifies
+the server recorded exactly what it accepted).
 
 Known limits, all deliberate and argued in [DESIGN.md](DESIGN.md): state is
-in-memory and resets on restart (§2); only count/sum/min/max are kept, so
-percentiles are impossible after the fact (§1); and a single mutex guards the
-whole store, which the benchmarks show is the throughput ceiling at ~7.7M
-events/sec — measured, and not worth fixing until something actually hits it
-(§5).
+in-memory and resets on restart (§2); only the aggregates decided up front are
+kept, so a statistic nobody planned for can't be back-filled (§1); percentiles
+are accurate to 1% rather than exact, which is the price of not keeping events
+(§23); and a single mutex guards the whole store, which the benchmarks show is
+the throughput ceiling at ~7.7M events/sec — measured, and not worth fixing
+until something actually hits it (§5).
