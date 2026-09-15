@@ -144,15 +144,30 @@ func BenchmarkIngestHandler(b *testing.B) {
 
 // BenchmarkStats measures a full /stats response over a realistic store:
 // every metric holds a full window of buckets, so the merge does real work.
+//
+// The data is recorded rather than seeded. Seeding Aggs directly leaves them
+// with no histogram, and the percentile work - the merge of bucket maps and
+// the quantile walk - would be skipped entirely, so the benchmark would
+// quietly stop measuring most of what /stats now does.
 func BenchmarkStats(b *testing.B) {
-	const metrics = 100
+	const (
+		metrics       = 100
+		perTimeBucket = 50
+	)
 
 	s := newStore()
+	now := time.Now()
 	for m := 0; m < metrics; m++ {
 		name := fmt.Sprintf("metric.%d", m)
 		for i := 0; i < numBuckets; i++ {
-			seedBucket(s, name, bucketAt(time.Duration(i)*bucketWidth),
-				&Agg{Count: 10, Sum: 50, Min: 1, Max: 9})
+			at := now.Add(-time.Duration(i) * bucketWidth)
+			for j := 0; j < perTimeBucket; j++ {
+				s.record(at, Event{
+					Name:  name,
+					Value: float64(j%40 + 1), // ~40 distinct histogram buckets
+					TS:    at.UnixMilli(),
+				})
+			}
 		}
 	}
 
@@ -204,5 +219,50 @@ func BenchmarkEvaluateAll(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		a.evaluateAll(now)
+	}
+}
+
+// --- the distribution (§23) ---
+
+// What recording a value into the histogram costs. This is the tax the
+// percentiles slice put on every single ingest, so it should stay small and
+// stay allocation-free once the buckets exist.
+func BenchmarkHistAdd(b *testing.B) {
+	var h hist
+	h.add(1) // create the map outside the measurement
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		h.add(float64(i%1000 + 1))
+	}
+}
+
+// One quantile: what an alert rule pays per evaluation.
+func BenchmarkHistQuantile(b *testing.B) {
+	var h hist
+	for i := 1; i <= 100000; i++ {
+		h.add(float64(i))
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = h.quantile(0.99)
+	}
+}
+
+// Three quantiles in one pass, which is what /stats does. Compare against
+// three times BenchmarkHistQuantile: the gap is the bucket sort this avoids.
+func BenchmarkHistQuantilesTogether(b *testing.B) {
+	var h hist
+	for i := 1; i <= 100000; i++ {
+		h.add(float64(i))
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = h.quantiles(0.50, 0.90, 0.99)
 	}
 }

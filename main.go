@@ -305,14 +305,18 @@ func (s *Store) handleStats(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			continue // no data inside the window
 		}
+		// One pass for all three: asking separately would sort this
+		// metric's bucket keys three times.
+		p := m.h.quantiles(0.50, 0.90, 0.99)
+
 		resp.Metrics[name] = MetricStats{
 			Count: m.Count,
 			Avg:   m.Sum / float64(m.Count),
 			Min:   m.Min,
 			Max:   m.Max,
-			P50:   m.h.quantile(0.50),
-			P90:   m.h.quantile(0.90),
-			P99:   m.h.quantile(0.99),
+			P50:   p[0],
+			P90:   p[1],
+			P99:   p[2],
 		}
 	}
 	s.mu.Unlock()
