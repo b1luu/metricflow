@@ -241,3 +241,142 @@ func TestMixedStreamCountsOnlyAcceptedEvents(t *testing.T) {
 		t.Errorf("stored Sum = %v, want %v", got.Sum, want)
 	}
 }
+
+// --- the distribution under concurrency (§23) ---
+
+// The histogram is written on the ingest hot path, so it needs the same
+// exactness guarantee as the summary numbers: every observation lands in a
+// bucket, none lost to a race. The counts have to survive even though the
+// bucket *values* are approximate.
+func TestConcurrentHistogramIsExact(t *testing.T) {
+	const (
+		workers   = 64
+		perWorker = 1000
+	)
+
+	s := newStore()
+	now := time.Now()
+	ts := now.UnixMilli()
+
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < perWorker; i++ {
+				s.record(now, Event{Name: "latency", Value: cycleValue(i), TS: ts})
+			}
+		}()
+	}
+	wg.Wait()
+
+	got, ok := mergeAll(s, "latency")
+	if !ok {
+		t.Fatal("no data recorded")
+	}
+
+	want := int64(workers * perWorker)
+	if got.h.count != want {
+		t.Errorf("histogram count = %d, want %d (observations lost)", got.h.count, want)
+	}
+	// The histogram's own count must agree with the summary count, or one
+	// of the two update paths dropped something the other didn't.
+	if got.h.count != int64(got.Count) {
+		t.Errorf("histogram count %d disagrees with Agg.Count %d", got.h.count, got.Count)
+	}
+
+	// Values cycle 1..10 evenly, so the median is 5 or 6 and the extremes
+	// are exact regardless of interleaving.
+	if q := got.h.quantile(0.5); q < 5*(1-relAccuracy) || q > 6*(1+relAccuracy) {
+		t.Errorf("median = %g, want about 5-6", q)
+	}
+	if q := got.h.quantile(1); !within(q, 10) {
+		t.Errorf("max quantile = %g, want about 10", q)
+	}
+}
+
+// Percentiles must be readable while writes are in flight without tearing.
+// Go panics on concurrent map access even without -race, so an unguarded
+// bucket map would fail this loudly.
+func TestConcurrentPercentileReadsStayConsistent(t *testing.T) {
+	const (
+		writers   = 32
+		perWriter = 500
+		readers   = 4
+		perReader = 200
+	)
+
+	s := newStore()
+	now := time.Now()
+	ts := now.UnixMilli()
+
+	var wg sync.WaitGroup
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < perWriter; i++ {
+				s.record(now, Event{Name: "latency", Value: cycleValue(i), TS: ts})
+			}
+		}()
+	}
+	for r := 0; r < readers; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w := &discardWriter{}
+			for i := 0; i < perReader; i++ {
+				s.handleStats(w, httptest.NewRequest(http.MethodGet, "/stats", nil))
+			}
+		}()
+	}
+	wg.Wait()
+
+	got, ok := mergeAll(s, "latency")
+	if !ok {
+		t.Fatal("no data recorded")
+	}
+	if want := int64(writers * perWriter); got.h.count != want {
+		t.Errorf("histogram count = %d, want %d", got.h.count, want)
+	}
+}
+
+// A percentile read must never observe a partially-merged histogram: every
+// quantile has to be monotonic in q, at any moment, under any interleaving.
+func TestConcurrentQuantilesStayMonotonic(t *testing.T) {
+	s := newStore()
+	now := time.Now()
+	ts := now.UnixMilli()
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			s.record(now, Event{Name: "latency", Value: cycleValue(i), TS: ts})
+		}
+	}()
+
+	for i := 0; i < 500; i++ {
+		s.mu.Lock()
+		m, ok := mergeBuckets(s.aggs["latency"], 0)
+		s.mu.Unlock()
+		if !ok {
+			continue
+		}
+		q := m.h.quantiles(0.5, 0.9, 0.99)
+		if q[0] > q[1] || q[1] > q[2] {
+			t.Fatalf("quantiles out of order mid-write: p50=%g p90=%g p99=%g", q[0], q[1], q[2])
+		}
+	}
+
+	close(stop)
+	wg.Wait()
+}
