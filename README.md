@@ -110,13 +110,13 @@ With the server running, drive it over real HTTP:
 go run ./cmd/loadgen -duration 3s -workers 8 -bad 0.25
 ```
 ```
-141625 requests in 3s  (47206 req/s)
-  200    106215   75.0%
-  400     29511   20.8%
-  413      5899    4.2%
-latency  p50 <557µs  p90 <557µs  p99 1.042ms  max 23.891ms
-         (clock resolution 557µs - faster than that is unresolvable)
-verify: OK - 106215 accepted, 106215 recorded
+159639 requests in 3s  (53206 req/s)
+  200    119726   75.0%
+  400     33262   20.8%
+  413      6651    4.2%
+latency  p50 <529µs  p90 <529µs  p99 1.026ms  max 8.709ms
+         (clock resolution 529µs - faster than that is unresolvable)
+verify: OK - 119726 accepted, 119726 recorded
 ```
 
 `-bad` mixes in deliberately invalid requests. After the run, loadgen fetches
@@ -139,14 +139,19 @@ server, drives it with `loadgen`, and checks it shuts down cleanly on
 
 Aggregates are stored as fixed-width time buckets (10s each, 6 in a 60-second
 window) so "the last minute" collapses to a handful of small structs regardless
-of event volume. Concurrent writes are serialised with a mutex. See
-[DESIGN.md](DESIGN.md) for the reasoning behind these and other choices.
+of event volume. Writes are serialised per metric: the store is split into 32
+independently-locked shards, each padded to its own cache line, and a metric
+lives in the shard its name hashes to — so two metrics are only ever in each
+other's way if their names collide. See [DESIGN.md](DESIGN.md) for the
+reasoning behind these and other choices.
 
 ## Status
 
 Done: ingest with validation, windowed aggregation over event time, per-metric
 stats with a configurable query window, percentiles from a bounded histogram,
-an alerting layer with flap suppression, graceful shutdown, and a load harness
+an alerting layer with flap suppression, graceful shutdown, a store whose lock
+is sharded by metric name (14.9x on concurrent writes to distinct metrics,
+measured before and after), and a load harness
 (benchmarks, concurrency invariants, and an HTTP load generator that verifies
 the server recorded exactly what it accepted).
 
@@ -154,6 +159,8 @@ Known limits, all deliberate and argued in [DESIGN.md](DESIGN.md): state is
 in-memory and resets on restart (§2); only the aggregates decided up front are
 kept, so a statistic nobody planned for can't be back-filled (§1); percentiles
 are accurate to 1% rather than exact, which is the price of not keeping events
-(§23); and a single mutex guards the whole store, which the benchmarks show is
-the throughput ceiling at ~7.7M events/sec — measured, and not worth fixing
-until something actually hits it (§5).
+(§23); `/stats` reads one shard at a time, so a response is not a single
+instant across all metrics, though no individual metric is ever internally
+torn (§24); and many goroutines writing the *same* metric still serialize,
+because they contend for the same aggregate rather than for the locking
+scheme — 159 ns/op against 10 ns/op for writes to distinct metrics (§24).
