@@ -293,11 +293,7 @@ func TestAlerterTransitions(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	setSeries := func(buckets map[int64]*Agg) {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		s.aggs["cpu.load"] = buckets
-	}
+	set := func(buckets map[int64]*Agg) { setSeries(s, "cpu.load", buckets) }
 	check := func(step string, at time.Time, wantState State, wantValue float64, wantSince time.Time) {
 		t.Helper()
 		a.evaluateAll(at)
@@ -317,7 +313,7 @@ func TestAlerterTransitions(t *testing.T) {
 	check("empty store", t0.Add(1*time.Second), StateNoData, 0, t0)
 
 	// avg 2 -> under the threshold.
-	setSeries(map[int64]*Agg{bucketAt(0): {Count: 1, Sum: 2, Min: 2, Max: 2}})
+	set(map[int64]*Agg{bucketAt(0): {Count: 1, Sum: 2, Min: 2, Max: 2}})
 	t2 := t0.Add(2 * time.Second)
 	check("nodata -> ok", t2, StateOK, 2, t2)
 
@@ -325,7 +321,7 @@ func TestAlerterTransitions(t *testing.T) {
 	check("ok holds", t0.Add(3*time.Second), StateOK, 2, t2)
 
 	// avg (2+20)/2 = 11 -> over the threshold.
-	setSeries(map[int64]*Agg{
+	set(map[int64]*Agg{
 		bucketAt(0):                {Count: 1, Sum: 2, Min: 2, Max: 2},
 		bucketAt(10 * time.Second): {Count: 1, Sum: 20, Min: 20, Max: 20},
 	})
@@ -333,12 +329,12 @@ func TestAlerterTransitions(t *testing.T) {
 	check("ok -> firing", t4, StateFiring, 11, t4)
 
 	// Back under the threshold.
-	setSeries(map[int64]*Agg{bucketAt(0): {Count: 1, Sum: 1, Min: 1, Max: 1}})
+	set(map[int64]*Agg{bucketAt(0): {Count: 1, Sum: 1, Min: 1, Max: 1}})
 	t5 := t0.Add(5 * time.Second)
 	check("firing -> ok", t5, StateOK, 1, t5)
 
 	// Metric goes silent entirely.
-	setSeries(nil)
+	set(nil)
 	t6 := t0.Add(6 * time.Second)
 	check("ok -> nodata", t6, StateNoData, 0, t6)
 }
@@ -679,9 +675,7 @@ func TestAlerterSuppressesFlapping(t *testing.T) {
 	}
 
 	setAvg := func(v float64) {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		s.aggs["cpu.load"] = map[int64]*Agg{bucketAt(0): {Count: 1, Sum: v, Min: v, Max: v}}
+		setSeries(s, "cpu.load", map[int64]*Agg{bucketAt(0): {Count: 1, Sum: v, Min: v, Max: v}})
 	}
 
 	out := captureLog(t, func() {

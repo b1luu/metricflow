@@ -365,9 +365,7 @@ func TestConcurrentQuantilesStayMonotonic(t *testing.T) {
 	}()
 
 	for i := 0; i < 500; i++ {
-		s.mu.Lock()
-		m, ok := mergeBuckets(s.aggs["latency"], 0)
-		s.mu.Unlock()
+		m, ok := mergeAll(s, "latency")
 		if !ok {
 			continue
 		}

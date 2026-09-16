@@ -15,21 +15,71 @@ import (
 	"time"
 )
 
+// The store is sharded by metric name (§24), so tests reach its internals
+// through these helpers rather than a single lock. They exist so that a test
+// asserting on aggregation never has to know which shard a name landed in.
+
+// withMetric runs fn holding the lock for the shard owning name, passing that
+// shard's series map for the metric (nil if the metric is unknown).
+func withMetric(s *Store, name string, fn func(series map[int64]*Agg)) {
+	sh := s.shardFor(name)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	fn(sh.aggs[name])
+}
+
 // mergeAll folds every bucket for a metric, ignoring the time window.
 // Used by tests that check record()'s output regardless of wall-clock timing.
 func mergeAll(s *Store, name string) (Agg, bool) {
-	return mergeBuckets(s.aggs[name], 0)
+	var (
+		agg Agg
+		ok  bool
+	)
+	withMetric(s, name, func(series map[int64]*Agg) {
+		agg, ok = mergeBuckets(series, 0)
+	})
+	return agg, ok
+}
+
+// bucketOf returns one stored bucket, or nil.
+func bucketOf(s *Store, name string, key int64) *Agg {
+	var a *Agg
+	withMetric(s, name, func(series map[int64]*Agg) { a = series[key] })
+	return a
+}
+
+// setSeries replaces a metric's whole series, for tests that need to move
+// the data underneath a running alerter.
+func setSeries(s *Store, name string, buckets map[int64]*Agg) {
+	sh := s.shardFor(name)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	sh.aggs[name] = buckets
 }
 
 // seedBucket injects a bucket straight into a metric's series, so a test
 // can place data at a chosen age without waiting on the clock.
 func seedBucket(s *Store, name string, key int64, a *Agg) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.aggs[name] == nil {
-		s.aggs[name] = map[int64]*Agg{}
+	sh := s.shardFor(name)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if sh.aggs[name] == nil {
+		sh.aggs[name] = map[int64]*Agg{}
 	}
-	s.aggs[name][key] = a
+	sh.aggs[name][key] = a
+}
+
+// metricCount is how many distinct metrics the store holds, across every
+// shard. Tests use it to assert nothing was recorded.
+func metricCount(s *Store) int {
+	n := 0
+	for i := range s.shards {
+		sh := &s.shards[i]
+		sh.mu.Lock()
+		n += len(sh.aggs)
+		sh.mu.Unlock()
+	}
+	return n
 }
 
 // bucketAt returns the bucket key for "d ago" (d >= 0).
@@ -126,7 +176,7 @@ func TestRecordKeepsMetricsSeparate(t *testing.T) {
 	cpu, cpuOK := mergeAll(s, "cpu.load")
 	mem, memOK := mergeAll(s, "memory.used")
 	if !cpuOK || !memOK || cpu.Count != 1 || mem.Count != 1 {
-		t.Errorf("metrics bled into each other: %+v", s.aggs)
+		t.Errorf("metrics bled into each other: %+v", storeDump(s))
 	}
 }
 
@@ -142,7 +192,7 @@ func TestIngestHandlerValid(t *testing.T) {
 	}
 	a, ok := mergeAll(s, "cpu.load")
 	if !ok || a.Count != 1 {
-		t.Errorf("event was not recorded: %+v", s.aggs)
+		t.Errorf("event was not recorded: %+v", storeDump(s))
 	}
 }
 
@@ -176,8 +226,8 @@ func TestIngestHandlerRejectsMissingTS(t *testing.T) {
 			t.Errorf("%s: body = %q, want ts-required error", body, rec.Body.String())
 		}
 	}
-	if len(s.aggs) != 0 {
-		t.Errorf("nothing should have been recorded, got %+v", s.aggs)
+	if metricCount(s) != 0 {
+		t.Errorf("nothing should have been recorded, got %+v", storeDump(s))
 	}
 }
 
@@ -194,8 +244,8 @@ func TestIngestHandlerRejectsTooOldTS(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "too old") {
 		t.Errorf("body = %q, want too-old error", rec.Body.String())
 	}
-	if len(s.aggs) != 0 {
-		t.Errorf("nothing should have been recorded, got %+v", s.aggs)
+	if metricCount(s) != 0 {
+		t.Errorf("nothing should have been recorded, got %+v", storeDump(s))
 	}
 }
 
@@ -210,7 +260,7 @@ func TestIngestHandlerAcceptsRecentTS(t *testing.T) {
 		t.Fatalf("status = %d, want 200 (ts within window)", rec.Code)
 	}
 	if a, ok := mergeAll(s, "cpu.load"); !ok || a.Count != 1 {
-		t.Errorf("recent event not recorded: %+v", s.aggs)
+		t.Errorf("recent event not recorded: %+v", storeDump(s))
 	}
 }
 
@@ -227,8 +277,8 @@ func TestIngestHandlerRejectsFutureTS(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "future") {
 		t.Errorf("body = %q, want future-ts error", rec.Body.String())
 	}
-	if len(s.aggs) != 0 {
-		t.Errorf("nothing should have been recorded, got %+v", s.aggs)
+	if metricCount(s) != 0 {
+		t.Errorf("nothing should have been recorded, got %+v", storeDump(s))
 	}
 }
 
@@ -256,8 +306,8 @@ func TestIngestHandlerInvalidJSON(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rec.Code)
 	}
-	if len(s.aggs) != 0 {
-		t.Errorf("nothing should have been recorded, got %+v", s.aggs)
+	if metricCount(s) != 0 {
+		t.Errorf("nothing should have been recorded, got %+v", storeDump(s))
 	}
 }
 
@@ -274,8 +324,8 @@ func TestIngestHandlerBodyReadError(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rec.Code)
 	}
-	if len(s.aggs) != 0 {
-		t.Errorf("nothing should have been recorded, got %+v", s.aggs)
+	if metricCount(s) != 0 {
+		t.Errorf("nothing should have been recorded, got %+v", storeDump(s))
 	}
 }
 
@@ -292,8 +342,8 @@ func TestIngestHandlerRejectsOversizedBody(t *testing.T) {
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status = %d, want 413", rec.Code)
 	}
-	if len(s.aggs) != 0 {
-		t.Errorf("nothing should have been recorded, got %+v", s.aggs)
+	if metricCount(s) != 0 {
+		t.Errorf("nothing should have been recorded, got %+v", storeDump(s))
 	}
 }
 
@@ -479,8 +529,8 @@ func TestIngestHandlerRejectsMissingName(t *testing.T) {
 			t.Errorf("body %s: %q, want name-required error", body, rec.Body.String())
 		}
 	}
-	if len(s.aggs) != 0 {
-		t.Errorf("nothing should have been recorded, got %+v", s.aggs)
+	if metricCount(s) != 0 {
+		t.Errorf("nothing should have been recorded, got %+v", storeDump(s))
 	}
 }
 
@@ -610,22 +660,20 @@ func TestEvict(t *testing.T) {
 func TestRecordEvictsStaleBuckets(t *testing.T) {
 	s := newStore()
 
-	s.mu.Lock()
-	s.aggs["cpu.load"] = map[int64]*Agg{
+	setSeries(s, "cpu.load", map[int64]*Agg{
 		1000: {Count: 99, Sum: 99, Min: 1, Max: 1}, // ancient
-	}
-	s.mu.Unlock()
+	})
 
 	recordNow(s, "cpu.load", 0.5)
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.aggs["cpu.load"][1000]; ok {
-		t.Error("ancient bucket 1000 survived a record() call")
-	}
-	if got := len(s.aggs["cpu.load"]); got != 1 {
-		t.Errorf("series has %d buckets, want 1 (just the current one)", got)
-	}
+	withMetric(s, "cpu.load", func(series map[int64]*Agg) {
+		if _, ok := series[1000]; ok {
+			t.Error("ancient bucket 1000 survived a record() call")
+		}
+		if got := len(series); got != 1 {
+			t.Errorf("series has %d buckets, want 1 (just the current one)", got)
+		}
+	})
 }
 
 // The end-to-end windowing story, driven by a synthetic clock: as time
@@ -642,9 +690,13 @@ func TestWindowRollsAsClockAdvances(t *testing.T) {
 		s.record(at, Event{Name: "cpu.load", Value: value, TS: at.UnixMilli()})
 	}
 	countAt := func(now time.Time) (int, bool) {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		m, ok := mergeBuckets(s.aggs["cpu.load"], windowStart(now, window))
+		var (
+			m  Agg
+			ok bool
+		)
+		withMetric(s, "cpu.load", func(series map[int64]*Agg) {
+			m, ok = mergeBuckets(series, windowStart(now, window))
+		})
 		return m.Count, ok
 	}
 
@@ -672,9 +724,7 @@ func TestWindowRollsAsClockAdvances(t *testing.T) {
 
 	// A write at t=75s evicts the stale base bucket from the map.
 	happen(t75, 9)
-	s.mu.Lock()
-	_, stale := s.aggs["cpu.load"][base.Unix()]
-	s.mu.Unlock()
+	stale := bucketOf(s, "cpu.load", base.Unix()) != nil
 	if stale {
 		t.Error("t=75s write did not evict the aged-out base bucket")
 	}
@@ -695,14 +745,14 @@ func TestRecordBucketsByEventTime(t *testing.T) {
 	// arrives now, but happened 30s ago
 	s.record(now, Event{Name: "cpu.load", Value: 5, TS: past.UnixMilli()})
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.aggs["cpu.load"][past.Unix()]; !ok {
-		t.Errorf("event not in its event-time bucket %d; series=%v", past.Unix(), s.aggs["cpu.load"])
-	}
-	if _, ok := s.aggs["cpu.load"][now.Unix()]; ok {
-		t.Error("event landed in the arrival-time bucket instead")
-	}
+	withMetric(s, "cpu.load", func(series map[int64]*Agg) {
+		if _, ok := series[past.Unix()]; !ok {
+			t.Errorf("event not in its event-time bucket %d; series=%v", past.Unix(), series)
+		}
+		if _, ok := series[now.Unix()]; ok {
+			t.Error("event landed in the arrival-time bucket instead")
+		}
+	})
 }
 
 // Two events with the same event-time recorded at different wall-clock
@@ -714,9 +764,7 @@ func TestRecordMergesSameEventTime(t *testing.T) {
 	s.record(time.Now().Add(-12*time.Second), Event{Name: "m", Value: 2, TS: happened.UnixMilli()})
 	s.record(time.Now(), Event{Name: "m", Value: 8, TS: happened.UnixMilli()})
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	a := s.aggs["m"][happened.Unix()]
+	a := bucketOf(s, "m", happened.Unix())
 	if a == nil || a.Count != 2 || a.Sum != 10 {
 		t.Errorf("got %+v, want Count=2 Sum=10 in bucket %d", a, happened.Unix())
 	}
@@ -929,4 +977,19 @@ func TestRunServesThenStopsOnCancel(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("run did not return after context cancel")
 	}
+}
+
+// storeDump renders every metric in the store for a failure message. The
+// store is sharded, so a plain %+v of one shard would show only part of it.
+func storeDump(s *Store) map[string]map[int64]*Agg {
+	out := map[string]map[int64]*Agg{}
+	for i := range s.shards {
+		sh := &s.shards[i]
+		sh.mu.Lock()
+		for name, series := range sh.aggs {
+			out[name] = series
+		}
+		sh.mu.Unlock()
+	}
+	return out
 }

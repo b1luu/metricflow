@@ -251,9 +251,7 @@ func TestRecordBuildsADistribution(t *testing.T) {
 		s.record(now, Event{Name: "latency", Value: float64(i), TS: now.UnixMilli()})
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	a := s.aggs["latency"][now.Truncate(bucketWidth).Unix()]
+	a := bucketOf(s, "latency", now.Truncate(bucketWidth).Unix())
 
 	if a.h == nil {
 		t.Fatal("record did not build a histogram")
@@ -277,9 +275,7 @@ func TestRecordSurvivesASeededBucketWithNoHistogram(t *testing.T) {
 
 	s.record(now, Event{Name: "cpu.load", Value: 7, TS: now.UnixMilli()})
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	a := s.aggs["cpu.load"][key]
+	a := bucketOf(s, "cpu.load", key)
 	if a.Count != 2 || a.Sum != 12 || a.Max != 7 {
 		t.Errorf("summary numbers wrong after seeding: %+v", a)
 	}
@@ -303,9 +299,7 @@ func TestMergeBucketsCombinesDistributions(t *testing.T) {
 		s.record(at, Event{Name: "latency", Value: float64(i), TS: at.UnixMilli()})
 	}
 
-	s.mu.Lock()
-	got, ok := mergeBuckets(s.aggs["latency"], 0)
-	s.mu.Unlock()
+	got, ok := mergeAll(s, "latency")
 	if !ok {
 		t.Fatal("no data")
 	}
@@ -333,10 +327,8 @@ func TestMergeBucketsDoesNotAliasStoredHistograms(t *testing.T) {
 	now := time.Now()
 	s.record(now, Event{Name: "cpu.load", Value: 1, TS: now.UnixMilli()})
 
-	s.mu.Lock()
-	stored := s.aggs["cpu.load"][now.Truncate(bucketWidth).Unix()]
-	got, _ := mergeBuckets(s.aggs["cpu.load"], 0)
-	s.mu.Unlock()
+	stored := bucketOf(s, "cpu.load", now.Truncate(bucketWidth).Unix())
+	got, _ := mergeAll(s, "cpu.load")
 
 	if got.h == stored.h {
 		t.Fatal("merge returned the stored histogram itself, not a copy")
@@ -355,9 +347,7 @@ func TestMergeBucketsHandlesHistogramlessBuckets(t *testing.T) {
 	s := newStore()
 	seedBucket(s, "m", bucketAt(0), &Agg{Count: 5, Sum: 25, Min: 5, Max: 5}) // no h
 
-	s.mu.Lock()
-	got, ok := mergeBuckets(s.aggs["m"], 0)
-	s.mu.Unlock()
+	got, ok := mergeAll(s, "m")
 
 	if !ok || got.Count != 5 {
 		t.Fatalf("summary merge broke: %+v ok=%v", got, ok)
@@ -455,9 +445,7 @@ func TestAlertOnPercentileSeesTheTail(t *testing.T) {
 		s.record(now, Event{Name: "http.latency_ms", Value: 900, TS: now.UnixMilli()})
 	}
 
-	s.mu.Lock()
-	agg, ok := mergeBuckets(s.aggs["http.latency_ms"], 0)
-	s.mu.Unlock()
+	agg, ok := mergeAll(s, "http.latency_ms")
 	if !ok {
 		t.Fatal("no data")
 	}

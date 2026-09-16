@@ -42,18 +42,34 @@ type Agg struct {
 	h *hist
 }
 
-// Store owns all metric state behind one mutex. Bundling the lock with the
-// map it guards keeps "what's protected by what" obvious, and lets each test
-// (and, later, each shard) hold its own independent state instead of sharing
-// one global.
-type Store struct {
+// shard is one independently-locked slice of the store. Bundling the lock
+// with the map it guards keeps "what's protected by what" obvious.
+type shard struct {
 	mu   sync.Mutex
 	aggs map[string]map[int64]*Agg
 }
 
-// newStore returns a ready-to-use Store with its map initialized.
+// Store owns all metric state, split across independently-locked shards by
+// metric name (§24). A metric's buckets always live in one shard, so a write
+// takes exactly one lock and writes to different metrics don't queue behind
+// each other - which is the ceiling §5 measured.
+type Store struct {
+	shards [shardCount]shard
+}
+
+// newStore returns a ready-to-use Store with every shard's map initialized.
 func newStore() *Store {
-	return &Store{aggs: make(map[string]map[int64]*Agg)}
+	s := &Store{}
+	for i := range s.shards {
+		s.shards[i].aggs = make(map[string]map[int64]*Agg)
+	}
+	return s
+}
+
+// shardFor returns the shard owning a metric. Callers lock it themselves:
+// the lock scope belongs to the operation, not to the lookup.
+func (s *Store) shardFor(metric string) *shard {
+	return &s.shards[shardIndex(metric)]
 }
 
 const (
@@ -79,13 +95,16 @@ const (
 func (s *Store) record(now time.Time, ev Event) {
 	bucket := time.UnixMilli(ev.TS).Truncate(bucketWidth).Unix()
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	// One metric lives in exactly one shard, so an ingest takes one lock and
+	// never blocks a write to a differently-named metric.
+	sh := s.shardFor(ev.Name)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 
-	series := s.aggs[ev.Name]
+	series := sh.aggs[ev.Name]
 	if series == nil {
 		series = make(map[int64]*Agg)
-		s.aggs[ev.Name] = series
+		sh.aggs[ev.Name] = series
 	}
 
 	a := series[bucket]
@@ -162,12 +181,16 @@ func mergeBuckets(series map[int64]*Agg, cutoff int64) (Agg, bool) {
 
 // aggFor merges one metric's buckets at or after cutoff, taking the lock
 // itself. The alerter needs a per-metric read because each rule carries its
-// own window (and so its own cutoff); handleStats keeps its own loop because
-// it wants every metric at one cutoff under a single lock.
+// own window, and so its own cutoff.
+//
+// Sharding makes this strictly cheaper: it now locks only the shard owning
+// this metric, so an alerter tick no longer blocks ingest for every other
+// metric in the store.
 func (s *Store) aggFor(name string, cutoff int64) (Agg, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return mergeBuckets(s.aggs[name], cutoff)
+	sh := s.shardFor(name)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	return mergeBuckets(sh.aggs[name], cutoff)
 }
 
 // windowStart returns the bucket key marking the start of a window of
@@ -299,27 +322,39 @@ func (s *Store) handleStats(w http.ResponseWriter, r *http.Request) {
 	cutoff := windowStart(time.Now(), win)
 	resp := StatsResponse{Window: win.String(), Metrics: map[string]MetricStats{}}
 
-	s.mu.Lock()
-	for name, series := range s.aggs {
-		m, ok := mergeBuckets(series, cutoff)
-		if !ok {
-			continue // no data inside the window
-		}
-		// One pass for all three: asking separately would sort this
-		// metric's bucket keys three times.
-		p := m.h.quantiles(0.50, 0.90, 0.99)
+	// One shard at a time, rather than one lock over everything.
+	//
+	// This is the trade sharding makes: the response is no longer a single
+	// instant across all metrics - a fast metric in shard 0 may be read a
+	// few microseconds before one in shard 31, and a write can land between
+	// them. Each metric's own numbers remain internally consistent, which is
+	// what a metrics query actually needs; a globally atomic snapshot would
+	// mean holding every shard lock at once and handing ingest back the
+	// exact stall this slice removes (§24).
+	for i := range s.shards {
+		sh := &s.shards[i]
+		sh.mu.Lock()
+		for name, series := range sh.aggs {
+			m, ok := mergeBuckets(series, cutoff)
+			if !ok {
+				continue // no data inside the window
+			}
+			// One pass for all three: asking separately would sort this
+			// metric's bucket keys three times.
+			p := m.h.quantiles(0.50, 0.90, 0.99)
 
-		resp.Metrics[name] = MetricStats{
-			Count: m.Count,
-			Avg:   m.Sum / float64(m.Count),
-			Min:   m.Min,
-			Max:   m.Max,
-			P50:   p[0],
-			P90:   p[1],
-			P99:   p[2],
+			resp.Metrics[name] = MetricStats{
+				Count: m.Count,
+				Avg:   m.Sum / float64(m.Count),
+				Min:   m.Min,
+				Max:   m.Max,
+				P50:   p[0],
+				P90:   p[1],
+				P99:   p[2],
+			}
 		}
+		sh.mu.Unlock()
 	}
-	s.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	// Nothing useful to do if this fails: the client hung up mid-read, or
