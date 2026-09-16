@@ -14,6 +14,7 @@ package main
 // gives the same answer. Count, Min and Max are order-independent regardless.
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -377,4 +378,276 @@ func TestConcurrentQuantilesStayMonotonic(t *testing.T) {
 
 	close(stop)
 	wg.Wait()
+}
+
+// --- exactness across shards (§24) ---
+
+// Writing many metrics at once is the case sharding exists for: the workers
+// land on different shards and stop queueing behind one lock. Correctness
+// has to survive that. A per-shard lock is only sound because a metric's
+// buckets never live outside the shard its name hashes to - if that ever
+// stopped holding, a write and a merge would take different locks for the
+// same data, and these counts would drift.
+func TestConcurrentRecordAcrossShardsIsExact(t *testing.T) {
+	const (
+		metrics   = 200
+		writers   = 8   // concurrent writers per metric
+		perWriter = 200 // a multiple of 10, so each block of values sums to 55
+	)
+
+	names := make([]string, metrics)
+	for i := range names {
+		names[i] = fmt.Sprintf("svc.metric.%d", i)
+	}
+
+	// This test only says anything about sharding if the names actually
+	// span shards. The hash is deterministic, so this cannot flake: it
+	// either holds for these names or it never does.
+	spread := map[int]bool{}
+	for _, n := range names {
+		spread[shardIndex(n)] = true
+	}
+	if len(spread) != shardCount {
+		t.Fatalf("%d metric names covered %d of %d shards - the test would not "+
+			"be exercising concurrent writes to different shards",
+			metrics, len(spread), shardCount)
+	}
+
+	s := newStore()
+	now := time.Now()
+	ts := now.UnixMilli()
+
+	var wg sync.WaitGroup
+	for _, name := range names {
+		for w := 0; w < writers; w++ {
+			wg.Add(1)
+			go func(name string) {
+				defer wg.Done()
+				for i := 0; i < perWriter; i++ {
+					s.record(now, Event{Name: name, Value: cycleValue(i), TS: ts})
+				}
+			}(name)
+		}
+	}
+	wg.Wait()
+
+	wantCount := writers * perWriter
+	wantSum := float64(writers * (perWriter / 10) * 55)
+
+	for _, name := range names {
+		got, ok := mergeAll(s, name)
+		if !ok {
+			t.Fatalf("%s: no data recorded", name)
+		}
+		if got.Count != wantCount {
+			t.Errorf("%s: Count = %d, want %d", name, got.Count, wantCount)
+		}
+		if got.Sum != wantSum {
+			t.Errorf("%s: Sum = %v, want %v", name, got.Sum, wantSum)
+		}
+		if got.Min != 1 || got.Max != 10 {
+			t.Errorf("%s: Min/Max = %v/%v, want 1/10", name, got.Min, got.Max)
+		}
+	}
+
+	// No metric invented, none lost, none filed under two shards.
+	if got := metricCount(s); got != metrics {
+		t.Errorf("store holds %d metrics, want %d", got, metrics)
+	}
+}
+
+// The adversarial case for a per-shard lock: two *different* metrics that
+// hash to the *same* shard, so they share one mutex and one map. Sharding
+// buys nothing here by design - what matters is that it costs nothing
+// either, and the two metrics' aggregates stay completely separate.
+//
+// The value ranges are disjoint, so any bleed between the two shows up in
+// Min/Max, not only in a count that could drift for other reasons.
+func TestConcurrentCollidingMetricsStaySeparate(t *testing.T) {
+	const (
+		writers   = 32
+		perWriter = 500
+	)
+
+	a, b := collidingNames(t)
+
+	s := newStore()
+	now := time.Now()
+	ts := now.UnixMilli()
+
+	var wg sync.WaitGroup
+	for w := 0; w < writers; w++ {
+		wg.Add(2)
+		// a gets 1..10, b gets 101..110.
+		go func() {
+			defer wg.Done()
+			for i := 0; i < perWriter; i++ {
+				s.record(now, Event{Name: a, Value: cycleValue(i), TS: ts})
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for i := 0; i < perWriter; i++ {
+				s.record(now, Event{Name: b, Value: 100 + cycleValue(i), TS: ts})
+			}
+		}()
+	}
+	wg.Wait()
+
+	wantCount := writers * perWriter
+	base := float64(writers * (perWriter / 10) * 55)
+
+	cases := []struct {
+		name             string
+		wantSum          float64
+		wantMin, wantMax float64
+	}{
+		{a, base, 1, 10},
+		{b, base + float64(wantCount*100), 101, 110},
+	}
+	for _, c := range cases {
+		got, ok := mergeAll(s, c.name)
+		if !ok {
+			t.Fatalf("%s: no data recorded", c.name)
+		}
+		if got.Count != wantCount {
+			t.Errorf("%s: Count = %d, want %d", c.name, got.Count, wantCount)
+		}
+		if got.Sum != c.wantSum {
+			t.Errorf("%s: Sum = %v, want %v", c.name, got.Sum, c.wantSum)
+		}
+		if got.Min != c.wantMin || got.Max != c.wantMax {
+			t.Errorf("%s: Min/Max = %v/%v, want %v/%v - the two metrics bled together",
+				c.name, got.Min, got.Max, c.wantMin, c.wantMax)
+		}
+	}
+}
+
+// collidingNames finds two distinct metric names that hash to one shard.
+// With shardCount shards a collision turns up within a few dozen tries; the
+// search is bounded so a hash change fails the test rather than hanging.
+func collidingNames(t *testing.T) (string, string) {
+	t.Helper()
+	seen := map[int]string{}
+	for i := 0; i < 10000; i++ {
+		n := fmt.Sprintf("collide.%d", i)
+		idx := shardIndex(n)
+		if prev, ok := seen[idx]; ok {
+			return prev, n
+		}
+		seen[idx] = n
+	}
+	t.Fatalf("no two of 10000 names shared a shard, with only %d shards", shardCount)
+	return "", ""
+}
+
+// /stats now walks the shards one at a time, so a response is no longer a
+// single instant across all metrics: a write can land between shard 0 and
+// shard 31. That is the trade §24 documents. What must never happen is a
+// *metric* coming back torn - its Count, Sum, Min and Max come from one
+// merge under one lock, so they always describe the same set of events.
+//
+// Every event for a metric carries that metric's own constant value, which
+// makes the invariant exact and checkable from the response alone: its Avg
+// is exactly that value, and so are its Min and Max. Avg is Sum/Count
+// computed inside the merge, so a torn read - a Sum from before a write
+// paired with the Count from after it - lands off the expected average.
+func TestStatsAcrossShardsIsNeverTornPerMetric(t *testing.T) {
+	const (
+		metrics   = 64
+		perMetric = 3000
+		readers   = 4
+	)
+
+	names := make([]string, metrics)
+	value := map[string]float64{}
+	for i := range names {
+		names[i] = fmt.Sprintf("torn.metric.%d", i)
+		value[names[i]] = float64(i + 1) // constant per metric, and distinct
+	}
+
+	s := newStore()
+	now := time.Now()
+	ts := now.UnixMilli()
+
+	var (
+		writers   sync.WaitGroup
+		readersWG sync.WaitGroup
+		done      atomic.Bool
+		snapshots atomic.Int64
+	)
+	// Buffered and drained after every goroutine has joined: t.Errorf must
+	// not be called from these goroutines, and a full channel must not
+	// deadlock a writer either.
+	failures := make(chan string, 64)
+
+	for _, name := range names {
+		writers.Add(1)
+		go func(name string) {
+			defer writers.Done()
+			for i := 0; i < perMetric; i++ {
+				s.record(now, Event{Name: name, Value: value[name], TS: ts})
+			}
+		}(name)
+	}
+
+	fail := func(msg string) {
+		select {
+		case failures <- msg:
+		default: // already have plenty of evidence
+		}
+	}
+
+	for r := 0; r < readers; r++ {
+		readersWG.Add(1)
+		go func() {
+			defer readersWG.Done()
+			for !done.Load() {
+				rec := httptest.NewRecorder()
+				s.handleStats(rec, httptest.NewRequest(http.MethodGet, "/stats", nil))
+
+				var resp StatsResponse
+				if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+					fail(fmt.Sprintf("invalid JSON: %v", err))
+					return
+				}
+				snapshots.Add(1)
+
+				for name, m := range resp.Metrics {
+					v := value[name]
+					if m.Avg != v {
+						fail(fmt.Sprintf("%s: torn read - Count=%d Avg=%v, want %v",
+							name, m.Count, m.Avg, v))
+					}
+					if m.Min != v || m.Max != v {
+						fail(fmt.Sprintf("%s: Min/Max = %v/%v, want %v/%v",
+							name, m.Min, m.Max, v, v))
+					}
+				}
+			}
+		}()
+	}
+
+	writers.Wait()
+	done.Store(true)
+	readersWG.Wait()
+	close(failures)
+
+	for msg := range failures {
+		t.Error(msg)
+	}
+	if snapshots.Load() == 0 {
+		t.Fatal("no snapshot completed; the readers never observed the store")
+	}
+
+	// And the final state is exact, so the readers cost nothing.
+	for _, name := range names {
+		got, ok := mergeAll(s, name)
+		if !ok {
+			t.Fatalf("%s: no data recorded", name)
+		}
+		if got.Count != perMetric {
+			t.Errorf("%s: Count = %d, want %d", name, got.Count, perMetric)
+		}
+	}
 }
