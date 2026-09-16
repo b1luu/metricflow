@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"testing"
+	"unsafe"
 )
 
 // The one property the whole scheme rests on: a metric always resolves to the
@@ -110,5 +111,32 @@ func TestFnv32KnownValues(t *testing.T) {
 		if got := fnv32(c.in); got != c.want {
 			t.Errorf("fnv32(%q) = %#x, want %#x", c.in, got, c.want)
 		}
+	}
+}
+
+// Padding is invisible at runtime - nothing fails if it silently goes away,
+// the throughput just drops back. So assert the layout directly: a shard
+// owns exactly one cache line, and shards sit one per line in the array.
+func TestShardOwnsOneCacheLine(t *testing.T) {
+	if got := unsafe.Sizeof(shard{}); got != cacheLine {
+		t.Errorf("sizeof(shard) = %d, want %d - padding is wrong, so shards share cache lines", got, cacheLine)
+	}
+
+	var s Store
+	if len(s.shards) < 2 {
+		t.Fatal("need at least two shards to check the stride")
+	}
+	stride := uintptr(unsafe.Pointer(&s.shards[1])) - uintptr(unsafe.Pointer(&s.shards[0]))
+	if stride != cacheLine {
+		t.Errorf("adjacent shards are %d bytes apart, want %d", stride, cacheLine)
+	}
+}
+
+// The shard's real fields must actually fit in a line; if they ever don't,
+// the padding expression goes negative and stops compiling. This documents
+// the headroom that assumption is running on.
+func TestShardStateFitsInACacheLine(t *testing.T) {
+	if got := unsafe.Sizeof(shardState{}); got > cacheLine {
+		t.Errorf("sizeof(shardState) = %d, exceeds a %d-byte cache line", got, cacheLine)
 	}
 }

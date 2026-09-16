@@ -11,9 +11,10 @@ import (
 	"net/http"      // the HTTP server and routing
 	"os"            // os.Interrupt
 	"os/signal"     // catch Ctrl-C / SIGTERM
-	"sync"          // Mutex, to guard the Store's aggs map
+	"sync"          // Mutex, to guard each shard's aggs map
 	"syscall"       // SIGTERM
 	"time"
+	"unsafe" // Sizeof, a compile-time constant, for cache-line padding
 )
 
 // Event is the in-memory form of one metric observation.
@@ -42,11 +43,28 @@ type Agg struct {
 	h *hist
 }
 
-// shard is one independently-locked slice of the store. Bundling the lock
-// with the map it guards keeps "what's protected by what" obvious.
-type shard struct {
+// shardState is one independently-locked slice of the store. Bundling the
+// lock with the map it guards keeps "what's protected by what" obvious.
+type shardState struct {
 	mu   sync.Mutex
 	aggs map[string]map[int64]*Agg
+}
+
+// cacheLine is the coherence granularity on x86-64 and arm64: the unit cores
+// trade ownership of. A mutex is 8 bytes and a map header 8, so four
+// unpadded shards would share one line, and a core taking shard 0's lock
+// would invalidate that line for cores working on shards 1-3 - false
+// sharing, where independent locks contend anyway through the cache.
+const cacheLine = 64
+
+// shard is shardState padded out to own a full cache line. Embedding keeps
+// sh.mu and sh.aggs reading exactly as before, and unsafe.Sizeof is a
+// compile-time constant, so adding a field either re-pads automatically or,
+// past 64 bytes, fails to compile on a negative array length rather than
+// silently reintroducing the false sharing.
+type shard struct {
+	shardState
+	_ [cacheLine - unsafe.Sizeof(shardState{})]byte
 }
 
 // Store owns all metric state, split across independently-locked shards by
