@@ -74,7 +74,10 @@ When a metric is first seen: `a = &Agg{Min: ev.Value, Max: ev.Value}`.
 
 ### 5. One mutex around the whole map
 
-A `sync.Mutex` guards every read and write of the aggregate map.
+*Superseded by §24, which shards the lock. Kept because the reasoning that
+led here — and the measurement that ended it — is the point.*
+
+A `sync.Mutex` guarded every read and write of the aggregate map.
 
 - `net/http` runs each request on its own goroutine. Two concurrent `/ingest`
   calls writing the map — or `/stats` reading while `/ingest` writes — is a
@@ -101,11 +104,22 @@ A `sync.Mutex` guards every read and write of the aggregate map.
   single goroutine**: adding parallelism costs throughput, because every
   goroutine serializes on one mutex and pays contention overhead on top of
   the work. That is the ceiling, quantified.
-- **The fix when it matters:** shard the map and its lock by metric name, so
-  writes to different metrics don't block each other. Still not worth the
-  complexity — 7.7 M events/sec is orders of magnitude past anything this
-  project ingests, and the honest engineering answer is that a measured
-  bottleneck nobody is hitting is a note, not a task.
+
+  (These three numbers predate §23's histogram, so `record` does more work
+  now. §24 re-measures both sides on the same code rather than comparing
+  against this table.)
+- **Why this stopped being a note and became a task.** The first answer here
+  was that 7.7 M events/sec is orders of magnitude past anything this project
+  ingests, so a measured bottleneck nobody is hitting is a note, not work.
+  That reasoning is sound for a throughput number and wrong for this one. The
+  bottleneck was not "too slow"; it was *parallelism making the system
+  slower*, in a project whose stated claim is correct aggregation under
+  concurrency. A ceiling that contradicts the headline is worth removing even
+  when nobody is pressed against it.
+- **What replaced it:** the map and its lock are sharded by metric name, and
+  writes to different metrics take different locks. §24 has the design, the
+  before/after numbers, the cache-line problem that surfaced underneath, and
+  what the query path gave up in exchange.
 
 ### 5a. State lives on a `Store`, not in package globals
 
@@ -117,7 +131,8 @@ A `sync.Mutex` guards every read and write of the aggregate map.
   shared global state invisibly, and two independent engines (a server plus a
   test, or two tests) couldn't coexist. A `Store` makes state a value you
   hold — each test gets a fresh one from `newStore()` with no reset dance, and
-  it's the seam a future lock-shard (§5) would slot into.
+  it's the seam the lock-shard in §24 slotted into, with no change to any
+  caller.
 - **What stayed a free function:** `mergeBuckets`, `evict`, `windowStart` —
   they operate only on their arguments (a bucket map, a cutoff, a time), never
   on `Store` fields, so a method receiver there would be dead weight.
@@ -731,6 +746,96 @@ missing it entirely, because the average is ~29 ms.
 approximate by design; the bucket *counts* are exact, and §20's concurrency
 tests hold the histogram to the same standard as the summary numbers. A lost
 update must not be able to hide behind "percentiles are estimates".
+
+### 24. Sharding the lock by metric name
+
+§5 left a measured bottleneck and an explicit decision not to fix it. This
+section is the fix, and the reason the decision changed: the ceiling wasn't
+a footnote about throughput, it was the project's central claim. "Correct
+aggregation under concurrency" is not worth much if adding concurrency makes
+the thing slower, which is precisely what §5 measured.
+
+**The shape.** `Store` no longer holds one mutex over one map. It holds
+`shardCount` shards, each with its own mutex and its own
+`map[string]map[int64]*Agg`, and a metric lives in the shard its *name*
+hashes to. That choice is what makes the scheme sound: every bucket of a
+metric is reachable through exactly one lock, so a write, an eviction and a
+merge for that metric can never take different locks for the same data.
+
+**Why hash the name, and not something easier.**
+
+- Hashing the *bucket* would scatter one metric's buckets across shards, so
+  merging a window would need every lock. Hashing the name keeps each
+  metric's whole series together, which is the unit every operation works on.
+- A `map[string]*lock` would need its own lock to look up the lock. A fixed
+  array of shards needs no allocation and no bookkeeping.
+- The hash is FNV-1a, hand-rolled in `shard.go` rather than taken from
+  `hash/fnv`. The stdlib version returns an interface, which escapes to the
+  heap; `record` is allocation-free and must stay that way.
+  `TestFnv32DoesNotAllocate` holds that line, and `TestFnv32KnownValues`
+  pins the hash against canonical vectors, so an "optimisation" that changes
+  the mapping shows up as a failing test rather than as mysterious behaviour.
+- `shardCount` is a power of two, so the index is `hash & (shardCount-1)` —
+  a mask, not a division. `TestShardCountIsAPowerOfTwo` asserts the property
+  the mask silently depends on.
+
+**Why 32.** It is roughly twice the hardware thread count of a typical
+machine, which leaves headroom for uneven hashing without making the store
+large. It is a constant, not a tunable: exposing it would invite tuning
+nobody has data for. The honest statement is that 32 was chosen, not tuned —
+the benchmarks below are what a future tuning exercise would move.
+
+**The measurement** (Ryzen 7 7800X3D, 16 threads, `-benchtime=2s -count=6`,
+median; both sides measured on this machine on the same code, so the numbers
+compare):
+
+| benchmark | one lock | sharded | sharded + padded |
+| --- | --- | --- | --- |
+| `Record` (1 goroutine) | 97 ns | 101 ns | 100 ns |
+| `RecordParallelSameMetric` (16) | 151 ns | 159 ns | 159 ns |
+| `RecordParallelDistinctMetrics` (16) | 149 ns | 15.0 ns | **10.0 ns** |
+
+Writes to distinct metrics go from 149 ns/op to 10.0 ns/op — **14.9×**, or
+6.7 M events/sec to 100 M. The single-goroutine cost rises ~4 ns, which is
+the hash; that is the price paid on every ingest for the parallel win.
+
+§5's old table read 68.4 / 108.7 / 130.0. Those numbers are not the "before"
+here and were not reused: they predate §23's histogram, so `record` does
+strictly more work now. Comparing against them would have credited sharding
+with a speedup it didn't produce.
+
+**False sharing, and the second measurement.** Sharding removed the software
+bottleneck and exposed a hardware one. A shard is an 8-byte mutex plus an
+8-byte map header, so four of them fit in a 64-byte cache line — and a core
+taking shard 0's lock invalidates that line for cores working on shards 1
+through 3. Independent locks contend anyway, through the cache. Padding each
+shard to a full line is the last column above: 15.0 ns → 10.0 ns, a further
+1.5×, for 2 KB of padding.
+
+The signature is what makes this a diagnosis rather than a guess: only the
+distinct-metrics row moved. One goroutine has nobody to falsely share with,
+and the same-metric case was already serialized on a single mutex. Padding
+is invisible at runtime — delete it and nothing fails, throughput just
+quietly drops — so `TestShardOwnsOneCacheLine` asserts the layout itself,
+including the stride between adjacent shards.
+
+**What `/stats` gave up.** The query path walks shards one at a time instead
+of holding one lock over everything, so a response is no longer a single
+instant across all metrics: a write can land between shard 0 and shard 31.
+That is a real loss and it is deliberate. A globally atomic snapshot means
+holding all 32 locks at once, which hands ingest back the exact stall this
+section removes — the most expensive possible operation, in service of a
+guarantee metrics queries don't need. Each metric's own numbers still come
+from one merge under one lock, so no single metric is ever internally torn,
+and §20's `TestStatsAcrossShardsIsNeverTornPerMetric` holds that line.
+
+**What sharding does not fix.** `RecordParallelSameMetric` is unchanged, and
+that is correct: 16 goroutines writing one metric still serialize, because
+they genuinely contend for one `*Agg`. Sharding by name cannot help a single
+hot name. The remaining ceiling is real contention on real shared state, not
+an artifact of the locking scheme — a different problem (per-core
+accumulators, or atomics on the `Agg` fields) for a different day, and one
+nothing in this project is anywhere near needing.
 
 ## Testing
 
