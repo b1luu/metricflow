@@ -237,6 +237,40 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "ok")
 }
 
+// validateEvent checks one decoded event against the ingest contract: the
+// two fields that have no sane zero value, and the accepted ts range.
+//
+// It is a free function returning an error, rather than a handler writing a
+// status, because the batch path needs the same verdict for each event in a
+// stream with no response of its own to write it to. Every failure here is
+// the caller getting the contract wrong, so every one of them is a 400 -
+// which is why the error carries a message and not a status code.
+func validateEvent(now time.Time, ev Event) error {
+	// Unmarshal only checks syntax, not meaning. Name and TS have no sane
+	// zero-value default, so they are checked explicitly. See DESIGN.md §12.
+	if ev.Name == "" {
+		return errors.New("name is required")
+	}
+	if ev.TS == 0 {
+		return errors.New("ts is required (unix milliseconds)")
+	}
+
+	// ev.TS picks the event's time bucket (see record / DESIGN.md §16).
+	// Too old -> its bucket is already evicted, nothing to add to.
+	// Too far future -> it would sit in a bucket that stays visible for
+	// however long the clock is wrong. Either way, reject rather than
+	// silently mis-record; one bucketWidth of future slack covers normal
+	// client/server clock skew.
+	ts := time.UnixMilli(ev.TS)
+	switch {
+	case ts.Before(now.Add(-window)):
+		return fmt.Errorf("event too old (ts before now-%s)", window)
+	case ts.After(now.Add(bucketWidth)):
+		return fmt.Errorf("ts too far in the future (after now+%s)", bucketWidth)
+	}
+	return nil
+}
+
 // handleIngest: POST /ingest - accept one metric event as a JSON body.
 func (s *Store) handleIngest(w http.ResponseWriter, r *http.Request) {
 	// Read the whole body, but refuse to buffer an unbounded amount -
@@ -263,31 +297,9 @@ func (s *Store) handleIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Unmarshal only checks syntax, not meaning. Name and TS have no sane
-	// zero-value default, so they are checked explicitly. See DESIGN.md §12.
-	if ev.Name == "" {
-		http.Error(w, "name is required", http.StatusBadRequest)
-		return
-	}
-	if ev.TS == 0 {
-		http.Error(w, "ts is required (unix milliseconds)", http.StatusBadRequest)
-		return
-	}
-
-	// ev.TS picks the event's time bucket (see record / DESIGN.md §16).
-	// Too old -> its bucket is already evicted, nothing to add to.
-	// Too far future -> it would sit in a bucket that stays visible for
-	// however long the clock is wrong. Either way, reject rather than
-	// silently mis-record; one bucketWidth of future slack covers normal
-	// client/server clock skew.
 	now := time.Now()
-	ts := time.UnixMilli(ev.TS)
-	switch {
-	case ts.Before(now.Add(-window)):
-		http.Error(w, fmt.Sprintf("event too old (ts before now-%s)", window), http.StatusBadRequest)
-		return
-	case ts.After(now.Add(bucketWidth)):
-		http.Error(w, fmt.Sprintf("ts too far in the future (after now+%s)", bucketWidth), http.StatusBadRequest)
+	if err := validateEvent(now, ev); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 

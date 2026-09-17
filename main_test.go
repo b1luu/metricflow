@@ -993,3 +993,91 @@ func storeDump(s *Store) map[string]map[int64]*Agg {
 	}
 	return out
 }
+
+// --- validateEvent ---
+
+// validateEvent is the ingest contract as a pure function, so it is tested
+// directly rather than only through the handler. The boundaries matter most:
+// the ts range uses strict Before/After, so an event landing exactly on
+// either edge is accepted, and a test that only checks "way too old" would
+// not notice the comparison flipping to inclusive.
+func TestValidateEvent(t *testing.T) {
+	now := time.Now()
+	ms := func(d time.Duration) int64 { return now.Add(d).UnixMilli() }
+
+	cases := []struct {
+		name    string
+		ev      Event
+		wantErr string // "" means it must be accepted
+	}{
+		{"valid", Event{Name: "cpu.load", Value: 0.5, TS: ms(0)}, ""},
+		{"zero value is fine", Event{Name: "cpu.load", Value: 0, TS: ms(0)}, ""},
+		{"negative value is fine", Event{Name: "temp.delta", Value: -12.5, TS: ms(0)}, ""},
+		{"missing name", Event{Value: 1, TS: ms(0)}, "name is required"},
+		{"empty name", Event{Name: "", Value: 1, TS: ms(0)}, "name is required"},
+		{"missing ts", Event{Name: "cpu.load", Value: 1}, "ts is required"},
+		{"too old", Event{Name: "cpu.load", TS: ms(-window - time.Second)}, "event too old"},
+		{"too far future", Event{Name: "cpu.load", TS: ms(bucketWidth + time.Second)}, "too far in the future"},
+
+		// The edges themselves. The future edge is accepted, as a strict
+		// After requires. The *old* edge is not, and that is worth pinning
+		// rather than glossing: ts is unix MILLISECONDS while now carries
+		// nanoseconds, so UnixMilli(now-window) truncates to a moment
+		// strictly before now-window and loses by a fraction of a
+		// millisecond. A client computing "exactly one window ago" is
+		// therefore rejected, depending on sub-millisecond noise in the
+		// server clock. Harmless - it is 1 ms of fuzz on a 60 s window, and
+		// it errs toward rejecting data that is aging out anyway - but it
+		// is real, and a test claiming the edge is accepted would be lying.
+		{"exactly at the old edge, lost to ms truncation", Event{Name: "cpu.load", TS: ms(-window)}, "event too old"},
+		{"exactly at the future edge", Event{Name: "cpu.load", TS: ms(bucketWidth)}, ""},
+		{"just inside the old edge", Event{Name: "cpu.load", TS: ms(-window + time.Millisecond)}, ""},
+		{"just outside the old edge", Event{Name: "cpu.load", TS: ms(-window - time.Millisecond)}, "event too old"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := validateEvent(now, c.ev)
+			switch {
+			case c.wantErr == "" && err != nil:
+				t.Errorf("validateEvent(%+v) = %v, want accepted", c.ev, err)
+			case c.wantErr != "" && err == nil:
+				t.Errorf("validateEvent(%+v) = nil, want error containing %q", c.ev, c.wantErr)
+			case c.wantErr != "" && !strings.Contains(err.Error(), c.wantErr):
+				t.Errorf("validateEvent(%+v) = %q, want it to contain %q", c.ev, err, c.wantErr)
+			}
+		})
+	}
+}
+
+// The handler's rejections must be validateEvent's, not a second copy that
+// can drift from it. Same event, both paths, same verdict and same message.
+func TestIngestHandlerReportsValidateEventsMessage(t *testing.T) {
+	now := time.Now()
+	bad := []Event{
+		{Value: 1, TS: now.UnixMilli()},
+		{Name: "cpu.load", Value: 1},
+		{Name: "cpu.load", TS: now.Add(-window - time.Second).UnixMilli()},
+		{Name: "cpu.load", TS: now.Add(bucketWidth + time.Second).UnixMilli()},
+	}
+
+	for _, ev := range bad {
+		err := validateEvent(now, ev)
+		if err == nil {
+			t.Fatalf("validateEvent(%+v) accepted an event the test expects rejected", ev)
+		}
+
+		body, mErr := json.Marshal(ev)
+		if mErr != nil {
+			t.Fatal(mErr)
+		}
+		rec := postIngest(newStore(), string(body))
+
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("POST %s: status = %d, want 400", body, rec.Code)
+		}
+		if got := strings.TrimSpace(rec.Body.String()); got != err.Error() {
+			t.Errorf("POST %s: body = %q, want validateEvent's %q", body, got, err)
+		}
+	}
+}
