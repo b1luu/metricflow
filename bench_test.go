@@ -15,6 +15,7 @@ package main
 //	go test -run=^$ -bench=Record -cpuprofile=cpu.out
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -265,4 +266,121 @@ func BenchmarkHistQuantilesTogether(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		_ = h.quantiles(0.50, 0.90, 0.99)
 	}
+}
+
+// --- the batch path ---
+
+// BenchmarkIngestBatch measures the whole HTTP batch path at several batch
+// sizes and reports ns/event, so the sizes are directly comparable to each
+// other and to BenchmarkIngestHandler - which is the same measurement at a
+// batch size of one, through the single-event endpoint.
+//
+// The question is where per-request cost stops dominating. At size 1 a
+// batch is strictly worse than /ingest: identical request overhead, plus a
+// JSON response body that /ingest does not write. Every size after that is
+// the amortisation, and the point at which the curve flattens is the point
+// at which the store, not the network, is the thing being measured again.
+//
+// Events all share one metric name on purpose. That is the *worst* case for
+// the sharded store - every event in the batch takes the same lock - so a
+// win here is not an artifact of the events spreading across shards.
+func BenchmarkIngestBatch(b *testing.B) {
+	for _, size := range []int{1, 10, 100, 1000, maxBatchEvents} {
+		b.Run(fmt.Sprintf("size=%d", size), func(b *testing.B) {
+			s := newStore()
+			w := &discardWriter{}
+			body := ndjson(validEvents("cpu.load", size)...)
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				// Same trap as BenchmarkIngestHandler: the accepted-ts
+				// range is only 60 s wide, so a body built once would
+				// silently start measuring the reject path on a long run.
+				if i%1024 == 0 {
+					b.StopTimer()
+					body = ndjson(validEvents("cpu.load", size)...)
+					b.StartTimer()
+				}
+
+				w.code = http.StatusOK
+				s.handleIngestBatch(w, httptest.NewRequest(
+					http.MethodPost, "/ingest/batch", strings.NewReader(body)))
+
+				if w.code != http.StatusOK {
+					b.Fatalf("iteration %d: status = %d, want 200", i, w.code)
+				}
+			}
+			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*size), "ns/event")
+		})
+	}
+}
+
+// The same batch sizes with every event on a *different* metric, so the
+// events spread across shards instead of queueing on one. Compared against
+// BenchmarkIngestBatch this separates the two things batching could be
+// buying: amortised request overhead, which both cases get, and reduced
+// lock contention, which only this case gets.
+func BenchmarkIngestBatchDistinctMetrics(b *testing.B) {
+	for _, size := range []int{100, 1000} {
+		b.Run(fmt.Sprintf("size=%d", size), func(b *testing.B) {
+			s := newStore()
+			w := &discardWriter{}
+
+			build := func() string {
+				evs := validEvents("cpu.load", size)
+				for i := range evs {
+					evs[i].Name = fmt.Sprintf("svc.metric.%d", i)
+				}
+				return ndjson(evs...)
+			}
+			body := build()
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if i%1024 == 0 {
+					b.StopTimer()
+					body = build()
+					b.StartTimer()
+				}
+
+				w.code = http.StatusOK
+				s.handleIngestBatch(w, httptest.NewRequest(
+					http.MethodPost, "/ingest/batch", strings.NewReader(body)))
+
+				if w.code != http.StatusOK {
+					b.Fatalf("iteration %d: status = %d, want 200", i, w.code)
+				}
+			}
+			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*size), "ns/event")
+		})
+	}
+}
+
+// BenchmarkBatchDecodeOnly is the same stream without the store: decode and
+// validate every event, record none. It splits a batch's per-event cost into
+// the part JSON parsing owns and the part the store owns, which is what says
+// whether optimising the locking below it could pay for itself at all.
+func BenchmarkBatchDecodeOnly(b *testing.B) {
+	const size = 1000
+
+	body := ndjson(validEvents("cpu.load", size)...)
+	now := time.Now()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		dec := json.NewDecoder(strings.NewReader(body))
+		for {
+			var ev Event
+			if err := dec.Decode(&ev); err != nil {
+				break
+			}
+			if err := validateEvent(now, ev); err != nil {
+				b.Fatalf("iteration %d: %v", i, err)
+			}
+		}
+	}
+	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*size), "ns/event")
 }
