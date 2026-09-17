@@ -398,6 +398,7 @@ func routes(s *Store, a *Alerter) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", allow(http.MethodGet, handleHealth))
 	mux.HandleFunc("/ingest", allow(http.MethodPost, s.handleIngest))
+	mux.HandleFunc("/ingest/batch", allow(http.MethodPost, s.handleIngestBatch))
 	mux.HandleFunc("/stats", allow(http.MethodGet, s.handleStats))
 	mux.HandleFunc("/alerts", allow(http.MethodGet, a.handleAlerts))
 	return mux
