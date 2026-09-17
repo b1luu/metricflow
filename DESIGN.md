@@ -799,6 +799,10 @@ Writes to distinct metrics go from 149 ns/op to 10.0 ns/op — **14.9×**, or
 6.7 M events/sec to 100 M. The single-goroutine cost rises ~4 ns, which is
 the hash; that is the price paid on every ingest for the parallel win.
 
+That win was invisible end-to-end until §25: the server was answering ~53 k
+requests/sec over loopback, so the store was never the thing a client was
+waiting on. Batching is what let this number reach the wire.
+
 §5's old table read 68.4 / 108.7 / 130.0. Those numbers are not the "before"
 here and were not reused: they predate §23's histogram, so `record` does
 strictly more work now. Comparing against them would have credited sharding
@@ -836,6 +840,125 @@ hot name. The remaining ceiling is real contention on real shared state, not
 an artifact of the locking scheme — a different problem (per-core
 accumulators, or atomics on the `Agg` fields) for a different day, and one
 nothing in this project is anywhere near needing.
+
+### 25. Batch ingest: the request boundary was the bottleneck
+
+§24 ended with the store doing ~100 M events/sec on distinct metrics. The
+server answered ~53 k requests/sec over loopback. Both numbers were true, and
+together they said something uncomfortable: the engine's throughput was
+invisible from outside, because one HTTP request per observation is the wrong
+unit of work. Everything §24 bought was being spent on request framing.
+
+`POST /ingest/batch` takes many events in one request. `/ingest` is unchanged
+and stays the documented single-event contract.
+
+**Newline-delimited JSON, not a JSON array.** The reason is memory, not
+taste. An array has to be buffered and parsed whole before the first event
+can be looked at, and its length comes from the client, so the server would
+be sizing an allocation from untrusted input. A stream of JSON values decodes
+one at a time in constant memory however long the batch runs, and lets the
+server stop early — at a cap, or at a syntax error — without having parsed
+the rest. `json.Decoder` reads concatenated values, so the newlines are a
+convention for producers rather than something the parser depends on; the
+endpoint accepts pretty-printed or space-separated events too, and a test
+pins that so nobody later "fixes" it.
+
+**Rejection is per event.** A firehose that discards 999 good samples because
+the 1000th was malformed is worse than useless. A bad event costs exactly
+itself — but never silently: the reject count is exact and the first
+`maxBatchErrors` are named with their index in the submitted batch. The
+listing is capped so a client cannot turn a 1 MiB request into a much larger
+reply; the count is not capped, because the count is what tells a client how
+much to resend.
+
+**The accounting contract, which is the part that ties into everything
+else.** `accepted` and `rejected` describe what actually happened on *every*
+status this endpoint returns, not just 200. A 413 with no accounting would
+leave a client unable to tell what landed, and would break the invariant this
+project holds everywhere else — that the events the server says it accepted
+are exactly the events it recorded. So a batch cut short by the byte cap, the
+event cap, or a syntax error still reports what it applied, and `fatal` says
+why it stopped. Partial application is the honest outcome here; pretending
+otherwise would require either discarding good events or lying about them.
+
+**Two caps, because they stop different things.** `maxBatchBody` (1 MiB)
+bounds the bytes one request can make the server read and parse, which is
+what a hostile client abuses. `maxBatchEvents` (10 000) bounds the work in
+the unit everyone else pays for: a batch takes the store's locks once per
+event, so an unbounded batch is an unbounded stall for `/stats` and for every
+other writer. The event cap is checked *after* a successful decode, not
+before — reaching the index with an event in hand means it is the
+(cap+1)-th. Checking first rejected a batch of exactly the cap, which is the
+off-by-one `TestBatchAcceptsExactlyTheEventCap` caught on its first run.
+
+**A syntax error ends the batch.** Once the decoder is mid-token there is
+nothing sound to resync to — a stray brace could be a truncated object or the
+start of a valid one — so claiming to have skipped just that event would be a
+guess. The stream stops, everything before it stays applied, and the response
+says where.
+
+**The measurement** (Ryzen 7 7800X3D, `-count=3`, median, per event):
+
+| path | ns/event |
+| --- | --- |
+| `/ingest`, one event per request | 2215 |
+| batch size=1 | 2843 |
+| batch size=10 | 868 |
+| batch size=100 | 766 |
+| batch size=1000 | 777 |
+| batch size=10000 | 713 |
+| decode + validate only, no store | 536 |
+
+Size 1 being *worse* than `/ingest` is the expected shape: identical request
+overhead plus a JSON response body that `/ingest` does not write. The curve
+flattens by size 100, which is the number worth telling clients — past that a
+larger batch buys very little and costs latency and blast radius.
+
+End to end over a real socket, 8 workers for 3 s:
+
+| | events | events/sec |
+| --- | --- | --- |
+| `-batch 1` | 168 314 | 56 100 |
+| `-batch 10` | 1 190 180 | 396 715 |
+| `-batch 100` | 4 634 300 | 1 544 644 |
+| `-batch 1000` | 8 559 000 | 2 851 755 |
+
+**50.8×**, with `verify` passing at every size. That is what §24's 14.9× was
+worth and could not show on its own.
+
+**The optimisation this slice cancelled.** The plan was to group a batch by
+shard so each lock is taken once instead of once per event — a natural
+follow-on from §24, and it would have been real, measurable work.
+`BenchmarkBatchDecodeOnly` said don't. Decoding and validating is 536 of the
+~730 ns, or 73%; the entire store path — hash, lock, map lookups, `Agg`
+update, histogram, eviction — is about 100 ns, or 14%. Grouping locks attacks
+part of that 14%, so it could not move the total by more than a couple of
+percent: measurable in a microbenchmark, invisible to any client.
+`BenchmarkIngestBatchDistinctMetrics` checks the other half of that
+reasoning — spreading a batch across shards instead of piling it on one is
+836 ns/event against 777, slightly *worse* from touching more distinct
+memory. So batching is not fixing lock contention. It is amortising request
+overhead, and that is all it needs to do.
+
+The next bottleneck is therefore named where it actually is: JSON decoding,
+at roughly one allocation and 56 bytes per event, most of it the metric name
+string.
+
+**What batching costs, stated plainly.**
+
+- *Latency.* An event now waits for its batch to fill. That is a producer-side
+  choice, but it is a real trade against the "real-time" in the project's
+  name, and it is why the default stays 1.
+- *Atomicity.* A batch is not a transaction. Half of one can land and be
+  reported as such. The alternative — all-or-nothing — throws away good data
+  for the sake of a guarantee metrics ingestion does not need.
+- *Blast radius.* One dropped connection now costs a batch rather than an
+  event. The accounting contract is what keeps that recoverable: the client
+  knows exactly how far it got.
+- *Lock hold time.* A batch takes a shard's lock once per event in a tight
+  loop, which is a longer stretch of contention for `/stats` than a single
+  ingest. `maxBatchEvents` is the bound on that, and it is the reason the
+  event cap exists at all rather than only the byte cap.
 
 ## Testing
 

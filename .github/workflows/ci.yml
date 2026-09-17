@@ -90,6 +90,16 @@ jobs:
       - name: traffic with injected failures must still verify
         run: ./loadgen -duration 3s -workers 8 -bad 0.25
 
+      # Batched traffic is a different write path with its own accounting:
+      # a partially-rejected batch is a 200, so the number the server owes
+      # comes from the reply body rather than the status. Gate it the same
+      # way, clean and with rejects mixed in.
+      - name: batched traffic must verify
+        run: ./loadgen -duration 3s -workers 8 -batch 100
+
+      - name: batched traffic with per-event rejects must still verify
+        run: ./loadgen -duration 3s -workers 8 -batch 100 -bad 0.25
+
       - name: shut down cleanly
         run: |
           kill -TERM "$(cat server.pid)"

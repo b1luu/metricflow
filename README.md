@@ -24,6 +24,7 @@ exits; a second `Ctrl-C` kills immediately.
 | ------ | --------- | ------------------------------------------------------ |
 | GET    | `/health` | Liveness check. Returns `ok`.                          |
 | POST   | `/ingest` | Submit one metric event as a JSON body.                |
+| POST   | `/ingest/batch` | Submit many events as newline-delimited JSON.    |
 | GET    | `/stats`  | Per-metric count/avg/min/max and p50/p90/p99 over a time window (JSON, default 60s). |
 | GET    | `/alerts` | Current state of every alert rule (JSON).              |
 
@@ -41,6 +42,34 @@ Rules compare `avg`, `max`, `min`, `count`, or a percentile (`p50`/`p90`/`p99`).
 For latency, a percentile is usually the right choice: a `max` rule fires on a
 single unlucky request, while an `avg` rule stays quiet even when a real
 fraction of users are suffering.
+
+## Batch ingest
+
+`POST /ingest/batch` takes newline-delimited JSON — one event object per line,
+no enclosing array — and replies with what it did:
+
+```json
+{"accepted": 98, "rejected": 2, "errors": [{"index": 17, "error": "ts is required (unix milliseconds)"}]}
+```
+
+A bad event costs exactly itself. A firehose that discarded 98 good samples
+because two were malformed would be worse than useless, so rejection is per
+event — reported, never silent, with each reject's index in the batch you
+sent. The error list is capped; the count is not.
+
+`accepted` and `rejected` are accurate on **every** status this endpoint
+returns, not just `200`. If a batch is cut short — by the 1 MiB body cap, the
+10 000 event cap, or malformed JSON that the parser cannot resync past — the
+events before the break stay applied and the reply says how far it got in a
+`fatal` field. That is what lets a client know exactly what to resend, and it
+keeps the invariant the rest of the project holds: the events the server says
+it accepted are exactly the events it recorded.
+
+Batching is worth about 50x end to end, and the curve flattens around 100
+events per request — past that you are buying very little and paying for it in
+latency and in how much one dropped connection costs. See [DESIGN.md](DESIGN.md)
+§25 for the measurements and for what the batch path deliberately does *not*
+optimise.
 
 ## Percentiles
 
@@ -119,9 +148,27 @@ latency  p50 <529µs  p90 <529µs  p99 1.026ms  max 8.709ms
 verify: OK - 119726 accepted, 119726 recorded
 ```
 
-`-bad` mixes in deliberately invalid requests. After the run, loadgen fetches
-`/stats` and checks the server recorded exactly as many events as it answered
-`200` to, exiting non-zero if not — so it works as a CI gate, not just a demo.
+`-bad` mixes in deliberately invalid events. After the run, loadgen fetches
+`/stats` and checks the server recorded exactly as many events as it said it
+accepted, exiting non-zero if not — so it works as a CI gate, not just a demo.
+
+`-batch N` sends N events per request instead of one, which is where the
+throughput actually is:
+
+```
+go run ./cmd/loadgen -duration 3s -workers 8 -batch 100 -bad 0.25
+```
+```
+40417 requests in 3.001s  (13469 req/s)
+4041700 events  (1346945 events/s)  3031275 accepted, 1010425 rejected
+  200     40417  100.0%
+latency  p50 <550µs  p90 1.052ms  p99 1.393ms  max 11.621ms
+verify: OK - 3031275 accepted, 3031275 recorded
+```
+
+Every request there is a `200` carrying both outcomes, so the accepted count
+comes from the reply body rather than from the status code — and 3 031 275
+accepted events were 3 031 275 recorded events.
 
 ## Test
 
@@ -147,11 +194,12 @@ reasoning behind these and other choices.
 
 ## Status
 
-Done: ingest with validation, windowed aggregation over event time, per-metric
+Done: single-event and batch ingest with validation, windowed aggregation over event time, per-metric
 stats with a configurable query window, percentiles from a bounded histogram,
 an alerting layer with flap suppression, graceful shutdown, a store whose lock
 is sharded by metric name (14.9x on concurrent writes to distinct metrics,
-measured before and after), and a load harness
+measured before and after), a batch endpoint that turns that into 50x end to
+end (§25), and a load harness
 (benchmarks, concurrency invariants, and an HTTP load generator that verifies
 the server recorded exactly what it accepted).
 
