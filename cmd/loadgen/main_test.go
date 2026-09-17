@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -34,6 +35,7 @@ func TestParseFlagsOverrides(t *testing.T) {
 		"-duration", "2s",
 		"-metrics", "7",
 		"-bad", "0.25",
+		"-batch", "50",
 		"-verify=false",
 	})
 	if err != nil {
@@ -41,7 +43,7 @@ func TestParseFlagsOverrides(t *testing.T) {
 	}
 	want := config{
 		target: "http://example:9999", workers: 32,
-		duration: 2 * time.Second, metrics: 7, badFrac: 0.25, verify: false,
+		duration: 2 * time.Second, metrics: 7, badFrac: 0.25, batch: 50, verify: false,
 	}
 	if c != want {
 		t.Errorf("got %+v, want %+v", c, want)
@@ -395,7 +397,7 @@ func TestVerifyAgreesWhenCountsMatch(t *testing.T) {
 	cfg.target = srv.URL
 
 	tal := newTally()
-	tal.byStatus[http.StatusOK] = 100
+	tal.accepted = 100
 
 	var buf bytes.Buffer
 	if err := verify(newClient(1), cfg, tal, time.Second, &buf); err != nil {
@@ -415,7 +417,7 @@ func TestVerifyCatchesADroppedEvent(t *testing.T) {
 	cfg.target = srv.URL
 
 	tal := newTally()
-	tal.byStatus[http.StatusOK] = 100 // the server said yes 100 times
+	tal.accepted = 100 // the server said it took 100 events
 
 	err := verify(newClient(1), cfg, tal, time.Second, io.Discard)
 	if err == nil {
@@ -439,7 +441,7 @@ func TestVerifyIgnoresOtherMetrics(t *testing.T) {
 	cfg.target = srv.URL
 
 	tal := newTally()
-	tal.byStatus[http.StatusOK] = 10
+	tal.accepted = 10
 
 	if err := verify(newClient(1), cfg, tal, time.Second, io.Discard); err != nil {
 		t.Fatalf("verify: %v", err)
@@ -456,7 +458,7 @@ func TestVerifySkipsWhenRunOutlastsWindow(t *testing.T) {
 	cfg.target = srv.URL
 
 	tal := newTally()
-	tal.byStatus[http.StatusOK] = 999999 // wildly different, and that's fine
+	tal.accepted = 999999 // wildly different, and that's fine
 
 	var buf bytes.Buffer
 	if err := verify(newClient(1), cfg, tal, 2*time.Minute, &buf); err != nil {
@@ -525,4 +527,178 @@ func TestClockResolutionIsMeasurable(t *testing.T) {
 		t.Errorf("clockResolution() = %s, implausibly coarse", got)
 	}
 	t.Logf("clock resolution on this machine: %s", got)
+}
+
+// --- batch mode ---
+
+func TestParseFlagsRejectsABatchBelowOne(t *testing.T) {
+	if _, err := parseFlags([]string{"-batch", "0"}); err == nil {
+		t.Error("parseFlags accepted -batch 0")
+	}
+	if _, err := parseFlags([]string{"-batch", "-5"}); err == nil {
+		t.Error("parseFlags accepted a negative batch")
+	}
+}
+
+// In batch mode the generator posts NDJSON to a different endpoint and takes
+// the accepted count from the reply rather than from the status code. Both
+// halves matter: a 200 no longer means "one event accepted", so counting
+// statuses would compare a request count against an event count later on.
+func TestSendUntilBatchesToTheBatchEndpoint(t *testing.T) {
+	const batch = 10
+
+	var (
+		events   atomic.Int64
+		requests atomic.Int64
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/ingest/batch" || r.Method != http.MethodPost {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		body, _ := io.ReadAll(r.Body)
+
+		// Count the events the way the real server does - one JSON value
+		// per line - so a generator that sent one blob would be caught.
+		n := 0
+		for _, line := range strings.Split(strings.TrimSpace(string(body)), "\n") {
+			if strings.TrimSpace(line) != "" {
+				n++
+			}
+		}
+		if n != batch {
+			t.Errorf("request carried %d events, want %d", n, batch)
+		}
+		events.Add(int64(n))
+		requests.Add(1)
+
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"accepted":%d,"rejected":0,"errors":[]}`, n)
+	}))
+	defer srv.Close()
+
+	cfg := config{
+		target: srv.URL, workers: 1, duration: 50 * time.Millisecond,
+		metrics: 1, batch: batch,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.duration)
+	defer cancel()
+
+	tal := sendUntil(ctx, newClient(1), cfg, 0)
+
+	if requests.Load() == 0 {
+		t.Fatalf("no requests reached the server: %+v", tal)
+	}
+	if int64(tal.events) != events.Load() {
+		t.Errorf("client counted %d events, server saw %d", tal.events, events.Load())
+	}
+	if int64(tal.accepted) != events.Load() {
+		t.Errorf("accepted = %d, want the %d the replies reported", tal.accepted, events.Load())
+	}
+	// The requests/events distinction is the whole point of the mode.
+	if tal.events != tal.byStatus[http.StatusOK]*batch {
+		t.Errorf("events = %d, want %d requests x %d", tal.events, tal.byStatus[http.StatusOK], batch)
+	}
+}
+
+// A partially-rejected batch is still a 200, so the accepted count has to
+// come from the body. Counting 200s would credit the server with events it
+// explicitly refused.
+func TestSendUntilReadsPartialRejectsFromTheBody(t *testing.T) {
+	const (
+		batch    = 10
+		accepted = 6
+	)
+
+	var requests atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"accepted":%d,"rejected":%d,"errors":[]}`, accepted, batch-accepted)
+	}))
+	defer srv.Close()
+
+	cfg := config{
+		target: srv.URL, workers: 1, duration: 50 * time.Millisecond,
+		metrics: 1, batch: batch,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.duration)
+	defer cancel()
+
+	tal := sendUntil(ctx, newClient(1), cfg, 0)
+
+	n := requests.Load()
+	if n == 0 {
+		t.Fatal("no requests reached the server")
+	}
+	if int64(tal.accepted) != n*accepted {
+		t.Errorf("accepted = %d, want %d - it must come from the body, not the status",
+			tal.accepted, n*accepted)
+	}
+	if int64(tal.rejected) != n*(batch-accepted) {
+		t.Errorf("rejected = %d, want %d", tal.rejected, n*(batch-accepted))
+	}
+}
+
+// The bad shapes usable inside a batch must be semantically invalid but
+// syntactically fine. Malformed JSON ends the whole stream rather than
+// costing one event, and an oversized body is refused by the single-event
+// size cap rather than by anything about the event - so counting either as
+// a per-event reject would make the generator disagree with a correct
+// server.
+func TestBadEventBodiesAreParseableJSON(t *testing.T) {
+	now := time.Now()
+	for i, build := range badEventBodies {
+		body := build("cpu.load", now)
+
+		var into map[string]any
+		if err := json.Unmarshal([]byte(body), &into); err != nil {
+			t.Errorf("badEventBodies[%d] = %q is not valid JSON: %v", i, body, err)
+		}
+		if len(body) > 4<<10 {
+			t.Errorf("badEventBodies[%d] is %d bytes; big enough to trip a size cap "+
+				"rather than the contract", i, len(body))
+		}
+	}
+
+	// And the single-event set must still carry the two shapes that only
+	// make sense there, or its own reject path stops being covered.
+	if len(badBodies) != len(badEventBodies)+2 {
+		t.Errorf("badBodies has %d shapes, want badEventBodies + 2", len(badBodies))
+	}
+}
+
+// The report distinguishes requests from events only when they differ -
+// in single-event mode the extra line would say the same thing twice.
+func TestTallyReportShowsEventsOnlyWhenBatching(t *testing.T) {
+	single := newTally()
+	single.byStatus[200] = 100
+	single.events = 100
+	single.accepted = 100
+	single.good = 100
+
+	var buf bytes.Buffer
+	single.report(&buf, time.Second, 0)
+	if strings.Contains(buf.String(), "events/s") {
+		t.Errorf("single-event report has an events line:\n%s", buf.String())
+	}
+
+	batched := newTally()
+	batched.byStatus[200] = 10
+	batched.events = 1000
+	batched.accepted = 900
+	batched.rejected = 100
+	batched.good = 900
+
+	buf.Reset()
+	batched.report(&buf, time.Second, 0)
+	out := buf.String()
+	for _, want := range []string{"1000 events", "events/s", "900 accepted", "100 rejected"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("batched report missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "MISMATCH") {
+		t.Errorf("report cried mismatch on a consistent tally:\n%s", out)
+	}
 }

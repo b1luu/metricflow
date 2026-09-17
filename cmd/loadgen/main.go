@@ -31,7 +31,8 @@ type config struct {
 	workers  int           // concurrent request senders
 	duration time.Duration // how long to send for
 	metrics  int           // how many distinct metric names to spread across
-	badFrac  float64       // fraction of requests that should be rejectable
+	badFrac  float64       // fraction of events that should be rejectable
+	batch    int           // events per request; 1 uses the single-event endpoint
 	verify   bool          // cross-check the server's count afterwards
 	runID    string        // makes this run's metric names unique
 }
@@ -56,7 +57,8 @@ func parseFlags(args []string) (config, error) {
 	fs.IntVar(&c.workers, "workers", 8, "concurrent request senders")
 	fs.DurationVar(&c.duration, "duration", 10*time.Second, "how long to send for")
 	fs.IntVar(&c.metrics, "metrics", 4, "number of distinct metric names to spread load across")
-	fs.Float64Var(&c.badFrac, "bad", 0, "fraction of requests made deliberately invalid (0..1)")
+	fs.Float64Var(&c.badFrac, "bad", 0, "fraction of events made deliberately invalid (0..1)")
+	fs.IntVar(&c.batch, "batch", 1, "events per request; 1 posts to /ingest, more posts NDJSON to /ingest/batch")
 	fs.BoolVar(&c.verify, "verify", true, "after the run, check the server recorded exactly what it accepted")
 
 	if err := fs.Parse(args); err != nil {
@@ -74,6 +76,8 @@ func parseFlags(args []string) (config, error) {
 		return config{}, fmt.Errorf("-metrics must be >= 1, got %d", c.metrics)
 	case c.badFrac < 0 || c.badFrac > 1:
 		return config{}, fmt.Errorf("-bad must be between 0 and 1, got %v", c.badFrac)
+	case c.batch < 1:
+		return config{}, fmt.Errorf("-batch must be >= 1, got %d", c.batch)
 	}
 	return c, nil
 }
@@ -189,10 +193,17 @@ func (l *latencies) quantile(q float64) time.Duration {
 
 // tally is one worker's view of a run. Workers accumulate locally and the
 // totals are merged at the end, so the hot loop needs no shared state.
+// tally counts in two units, and the distinction is the whole reason the
+// batch mode needed changes here. byStatus, failed and lat count *requests*.
+// events, good, accepted and rejected count *events* - which stop being the
+// same thing the moment one request carries a hundred of them.
 type tally struct {
 	byStatus map[int]int // HTTP responses, by status code
 	failed   int         // transport errors: no response at all
-	good     int         // requests the generator intended to be valid
+	events   int         // events put on the wire
+	good     int         // events the generator intended to be valid
+	accepted int         // events the server said it accepted
+	rejected int         // events the server said it rejected
 	lat      *latencies
 }
 
@@ -203,7 +214,10 @@ func (t *tally) merge(o tally) {
 		t.byStatus[code] += n
 	}
 	t.failed += o.failed
+	t.events += o.events
 	t.good += o.good
+	t.accepted += o.accepted
+	t.rejected += o.rejected
 	t.lat.merge(o.lat)
 }
 
@@ -231,10 +245,18 @@ func eventBody(metric string, value float64, now time.Time) string {
 // Note the sizes and bounds here are chosen to be *obviously* out of range,
 // not read from the server's constants - loadgen is an external client and
 // doesn't get to peek at them.
-var badBodies = []func(metric string, now time.Time) string{
-	func(string, time.Time) string {
-		return `{"name":` // truncated JSON
-	},
+// badEventBodies are events that parse as JSON but break the ingest
+// contract. These are the only shapes usable *inside* a batch, and the
+// distinction is real rather than bookkeeping:
+//
+//   - Malformed JSON is not a per-event failure in a batch. The decoder
+//     cannot resync past it, so it ends the stream and takes the rest of
+//     the batch with it - a different experiment, covered by unit tests.
+//   - An oversized body is rejected by the single-event endpoint's 4 KiB
+//     cap, not by anything about the event. The same bytes inside a batch
+//     are a perfectly valid event, and counting them as "bad" would make
+//     the generator disagree with a server that was entirely right.
+var badEventBodies = []func(metric string, now time.Time) string{
 	func(_ string, now time.Time) string {
 		return fmt.Sprintf(`{"value":1,"ts":%d}`, now.UnixMilli()) // no name
 	},
@@ -247,10 +269,28 @@ var badBodies = []func(metric string, now time.Time) string{
 	func(m string, now time.Time) string {
 		return eventBody(m, 1, now.Add(time.Hour)) // ts far in the future
 	},
+}
+
+// badBodies adds the two shapes that only mean anything when the whole
+// request is one event.
+var badBodies = append([]func(metric string, now time.Time) string{
+	func(string, time.Time) string {
+		return `{"name":` // truncated JSON
+	},
 	func(m string, now time.Time) string {
 		return fmt.Sprintf(`{"name":%q,"value":1,"ts":%d,"type":%q}`,
 			m, now.UnixMilli(), strings.Repeat("x", 16<<10)) // oversized
 	},
+}, badEventBodies...)
+
+// batchResponse is the reply from /ingest/batch. Redeclared here rather
+// than imported for the same reason statsResponse is: this is the wire
+// contract, and a generator that shares types with the server it measures
+// cannot notice the server changing them.
+type batchResponse struct {
+	Accepted int    `json:"accepted"`
+	Rejected int    `json:"rejected"`
+	Fatal    string `json:"fatal"`
 }
 
 // sendUntil fires requests as fast as it can until ctx is done. Each worker
@@ -259,23 +299,50 @@ var badBodies = []func(metric string, now time.Time) string{
 func sendUntil(ctx context.Context, client *http.Client, cfg config, workerID int) tally {
 	t := newTally()
 	metric := cfg.metricName(workerID)
+
+	// parseFlags rejects a batch below 1, but config is also built directly
+	// by tests, and a zero there would send bodies containing no events at
+	// all - forever, and silently. Treat it as the single-event default.
+	perRequest := max(1, cfg.batch)
+
+	batching := perRequest > 1
 	url := strings.TrimSuffix(cfg.target, "/") + "/ingest"
+	bad := badBodies
+	if batching {
+		url += "/batch"
+		bad = badEventBodies
+	}
 
+	// nextBody builds one request. The bad quota is applied per *event*, so
+	// a batch carries a realistic mix rather than being wholly good or
+	// wholly bad - which is also the only way the partial-failure path gets
+	// exercised at all.
+	//
+	// A greedy quota rather than randomness: emit a bad event whenever we
+	// are below the requested fraction. Two runs with the same flags then
+	// send the same mix, which makes them comparable.
 	nBad := 0
-	for i := 0; ctx.Err() == nil; i++ {
-		now := time.Now()
-
-		// A greedy quota rather than randomness: send a bad request
-		// whenever we're below the requested fraction. Two runs with the
-		// same flags then send the same mix, which makes them comparable.
-		var body string
-		if float64(nBad) < cfg.badFrac*float64(i+1) {
-			body = badBodies[nBad%len(badBodies)](metric, now)
-			nBad++
-		} else {
-			body = eventBody(metric, float64(i%10+1), now)
-			t.good++
+	nextBody := func(now time.Time) string {
+		var b strings.Builder
+		for j := 0; j < perRequest; j++ {
+			t.events++
+			if float64(nBad) < cfg.badFrac*float64(t.events) {
+				b.WriteString(bad[nBad%len(bad)](metric, now))
+				nBad++
+			} else {
+				b.WriteString(eventBody(metric, float64(t.events%10+1), now))
+				t.good++
+			}
+			// Harmless for the single-event endpoint, which trims trailing
+			// whitespace, and required between events in a batch.
+			b.WriteByte('\n')
 		}
+		return b.String()
+	}
+
+	for ctx.Err() == nil {
+		now := time.Now()
+		body := nextBody(now)
 
 		// Deliberately NOT http.NewRequestWithContext(ctx, ...): ctx ends
 		// the run, and binding it to the request would cancel whatever is
@@ -298,6 +365,21 @@ func sendUntil(ctx context.Context, client *http.Client, cfg config, workerID in
 			continue
 		}
 		t.lat.add(time.Since(start))
+
+		// How many events the server took is read from the reply in batch
+		// mode, because a 200 no longer means "one event accepted" - a
+		// partially-rejected batch is still a 200. Counting statuses there
+		// would make verify() compare a request count against an event
+		// count and call the server broken.
+		if batching {
+			var br batchResponse
+			if err := json.NewDecoder(resp.Body).Decode(&br); err == nil {
+				t.accepted += br.Accepted
+				t.rejected += br.Rejected
+			}
+		} else if resp.StatusCode == http.StatusOK {
+			t.accepted++
+		}
 
 		// Drain and close, always. An undrained body keeps its connection
 		// out of the idle pool, so the next request opens a new socket and
@@ -351,6 +433,16 @@ func (t tally) report(w io.Writer, elapsed, clockRes time.Duration) {
 	}
 	fmt.Fprintln(w)
 
+	// Only worth printing when they differ - in single-event mode one
+	// request is one event and the line would say the same thing twice.
+	if t.events != sent {
+		fmt.Fprintf(w, "%d events", t.events)
+		if secs := elapsed.Seconds(); secs > 0 {
+			fmt.Fprintf(w, "  (%.0f events/s)", float64(t.events)/secs)
+		}
+		fmt.Fprintf(w, "  %d accepted, %d rejected\n", t.accepted, t.rejected)
+	}
+
 	pct := func(n int) float64 {
 		if sent == 0 {
 			return 0
@@ -386,8 +478,8 @@ func (t tally) report(w io.Writer, elapsed, clockRes time.Duration) {
 	// The generator knows which requests it meant to be valid, so it can
 	// check the server agreed. A mismatch either way is a real finding: a
 	// good request refused, or a deliberately broken one waved through.
-	if ok := t.byStatus[http.StatusOK]; ok != t.good {
-		fmt.Fprintf(w, "MISMATCH: sent %d valid requests but %d were accepted\n", t.good, ok)
+	if t.accepted != t.good {
+		fmt.Fprintf(w, "MISMATCH: sent %d valid events but %d were accepted\n", t.good, t.accepted)
 	}
 }
 
@@ -458,7 +550,10 @@ func verify(client *http.Client, cfg config, total tally, elapsed time.Duration,
 		recorded += stats.Metrics[cfg.metricName(i)].Count
 	}
 
-	accepted := total.byStatus[http.StatusOK]
+	// total.accepted is the server's own answer in both modes: a count of
+	// 200s when one request is one event, and the sum of the batch replies'
+	// accepted fields when it is not.
+	accepted := total.accepted
 	if recorded != accepted {
 		return fmt.Errorf("server accepted %d events but recorded %d (difference %d)",
 			accepted, recorded, accepted-recorded)
