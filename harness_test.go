@@ -651,3 +651,308 @@ func TestStatsAcrossShardsIsNeverTornPerMetric(t *testing.T) {
 		}
 	}
 }
+
+// --- exactness through the batch endpoint ---
+
+// buildBatch renders an NDJSON body where every badEvery-th event is
+// invalid - or none of them, when badEvery is 0 - and reports how many valid
+// events it contains per metric. The
+// rejects are interleaved rather than grouped so a bug that loses its place
+// in the stream - an index that counts only accepted events, say - shows up
+// as a count mismatch rather than being masked by a tidy layout.
+func buildBatch(metrics []string, size, badEvery int, ts int64) (string, map[string]int) {
+	evs := make([]Event, 0, size)
+	valid := map[string]int{}
+
+	for i := 0; i < size; i++ {
+		if badEvery > 0 && i%badEvery == 0 {
+			evs = append(evs, Event{Value: 1, TS: ts}) // no name: rejected
+			continue
+		}
+		name := metrics[i%len(metrics)]
+		evs = append(evs, Event{Name: name, Value: 1, TS: ts})
+		valid[name]++
+	}
+	return ndjson(evs...), valid
+}
+
+// postBatchRaw is postBatch without the *testing.T, so it is safe to call
+// from a goroutine - t.Fatalf from a non-test goroutine is not.
+func postBatchRaw(s *Store, body string) (int, BatchResponse, error) {
+	rec := httptest.NewRecorder()
+	s.handleIngestBatch(rec, httptest.NewRequest(
+		http.MethodPost, "/ingest/batch", strings.NewReader(body)))
+
+	var resp BatchResponse
+	err := json.Unmarshal(rec.Body.Bytes(), &resp)
+	return rec.Code, resp, err
+}
+
+// The batch endpoint's whole contract is that "accepted" and "recorded" are
+// the same number. Under concurrency that doubles as the lost-update test:
+// a dropped increment shows up as the store holding fewer events than the
+// replies promised, and an event counted twice shows up as more.
+//
+// Rejects are mixed in throughout, because the interesting failure is not a
+// clean batch racing another clean batch - it is the accounting drifting
+// while some events are being skipped.
+func TestConcurrentBatchesRecordExactlyWhatTheyReport(t *testing.T) {
+	const (
+		writers          = 16
+		batchesPerWriter = 20
+		batchSize        = 50
+		badEvery         = 7
+	)
+
+	// Shared across every writer, so the batches collide on the same
+	// metrics and the same shards rather than each having its own lane.
+	metrics := []string{
+		"svc.api.latency_ms", "svc.api.errors", "svc.worker.queue_depth",
+		"svc.db.latency_ms", "svc.db.errors",
+	}
+
+	s := newStore()
+	ts := time.Now().UnixMilli()
+
+	body, validPerBatch := buildBatch(metrics, batchSize, badEvery, ts)
+	wantAccepted := 0
+	for _, n := range validPerBatch {
+		wantAccepted += n
+	}
+	if wantAccepted == 0 || wantAccepted == batchSize {
+		t.Fatalf("test data is wrong: %d of %d events valid, want a mix",
+			wantAccepted, batchSize)
+	}
+
+	var (
+		wg          sync.WaitGroup
+		totalAccept atomic.Int64
+		totalReject atomic.Int64
+		failures    = make(chan string, 32)
+	)
+	fail := func(msg string) {
+		select {
+		case failures <- msg:
+		default:
+		}
+	}
+
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < batchesPerWriter; i++ {
+				code, resp, err := postBatchRaw(s, body)
+				if err != nil {
+					fail(fmt.Sprintf("reply was not JSON: %v", err))
+					return
+				}
+				if code != http.StatusOK {
+					fail(fmt.Sprintf("status = %d, want 200 (fatal %q)", code, resp.Fatal))
+					return
+				}
+				if resp.Accepted != wantAccepted {
+					fail(fmt.Sprintf("accepted = %d, want %d", resp.Accepted, wantAccepted))
+				}
+				totalAccept.Add(int64(resp.Accepted))
+				totalReject.Add(int64(resp.Rejected))
+			}
+		}()
+	}
+	wg.Wait()
+	close(failures)
+
+	for msg := range failures {
+		t.Error(msg)
+	}
+
+	// The invariant: every event the server said it accepted is in the
+	// store, and nothing else is.
+	recorded := 0
+	for name, series := range storeDump(s) {
+		agg, ok := mergeBuckets(series, 0)
+		if !ok {
+			continue
+		}
+		recorded += agg.Count
+
+		want := validPerBatch[name] * writers * batchesPerWriter
+		if agg.Count != want {
+			t.Errorf("%s: recorded %d, want %d", name, agg.Count, want)
+		}
+		// Every valid event is worth 1, so this catches a Sum that drifted
+		// away from its own Count.
+		if agg.Sum != float64(agg.Count) {
+			t.Errorf("%s: Sum = %v, want %v", name, agg.Sum, float64(agg.Count))
+		}
+	}
+
+	if int64(recorded) != totalAccept.Load() {
+		t.Errorf("replies claimed %d events accepted, store holds %d",
+			totalAccept.Load(), recorded)
+	}
+	wantReject := int64(writers * batchesPerWriter * (batchSize - wantAccepted))
+	if totalReject.Load() != wantReject {
+		t.Errorf("rejected %d, want %d", totalReject.Load(), wantReject)
+	}
+	// A rejected event must not have created its metric.
+	if got, want := metricCount(s), len(metrics); got != want {
+		t.Errorf("store holds %d metrics, want %d - a rejected event created one",
+			got, want)
+	}
+}
+
+// Both write paths and every read path at once. /ingest and /ingest/batch
+// share validateEvent and record but not their framing, so this is the test
+// that they cannot corrupt each other, and that a reader walking shards
+// mid-batch sees no torn metric.
+func TestConcurrentBatchAndSingleIngestStayExact(t *testing.T) {
+	const (
+		batchWriters     = 8
+		batchesPerWriter = 25
+		batchSize        = 40
+		singleWriters    = 8
+		perSingleWriter  = 500
+		readers          = 3
+	)
+
+	s := newStore()
+	ts := time.Now().UnixMilli()
+
+	// The two paths deliberately share a metric name, so they contend on
+	// one shard and one *Agg rather than running in separate lanes.
+	const shared = "svc.api.latency_ms"
+	body, validPerBatch := buildBatch([]string{shared}, batchSize, 0, ts)
+	if validPerBatch[shared] != batchSize {
+		t.Fatalf("test data is wrong: %d of %d valid, want all",
+			validPerBatch[shared], batchSize)
+	}
+
+	var (
+		wgWrite  sync.WaitGroup
+		wgRead   sync.WaitGroup
+		done     atomic.Bool
+		failures = make(chan string, 32)
+	)
+	fail := func(msg string) {
+		select {
+		case failures <- msg:
+		default:
+		}
+	}
+
+	for w := 0; w < batchWriters; w++ {
+		wgWrite.Add(1)
+		go func() {
+			defer wgWrite.Done()
+			for i := 0; i < batchesPerWriter; i++ {
+				code, resp, err := postBatchRaw(s, body)
+				if err != nil || code != http.StatusOK || resp.Accepted != batchSize {
+					fail(fmt.Sprintf("batch: code=%d accepted=%d err=%v fatal=%q",
+						code, resp.Accepted, err, resp.Fatal))
+					return
+				}
+			}
+		}()
+	}
+
+	for w := 0; w < singleWriters; w++ {
+		wgWrite.Add(1)
+		go func() {
+			defer wgWrite.Done()
+			for i := 0; i < perSingleWriter; i++ {
+				s.record(time.Now(), Event{Name: shared, Value: 1, TS: ts})
+			}
+		}()
+	}
+
+	for r := 0; r < readers; r++ {
+		wgRead.Add(1)
+		go func() {
+			defer wgRead.Done()
+			w := &discardWriter{}
+			for !done.Load() {
+				s.handleStats(w, httptest.NewRequest(http.MethodGet, "/stats", nil))
+			}
+		}()
+	}
+
+	wgWrite.Wait()
+	done.Store(true)
+	wgRead.Wait()
+	close(failures)
+
+	for msg := range failures {
+		t.Error(msg)
+	}
+
+	want := batchWriters*batchesPerWriter*batchSize + singleWriters*perSingleWriter
+	got, ok := mergeAll(s, shared)
+	if !ok {
+		t.Fatal("nothing recorded")
+	}
+	if got.Count != want {
+		t.Errorf("Count = %d, want %d (the two write paths lost or duplicated events)",
+			got.Count, want)
+	}
+	if got.Sum != float64(want) {
+		t.Errorf("Sum = %v, want %v", got.Sum, float64(want))
+	}
+}
+
+// A batch that stops early - at the event cap here - still has to report
+// exactly what it applied, and concurrency must not blur that. This is the
+// case where a naive implementation reports the whole batch, or reports
+// nothing, and the store then disagrees with every client.
+func TestConcurrentTruncatedBatchesStayHonest(t *testing.T) {
+	const writers = 8
+
+	s := newStore()
+	body := ndjson(validEvents("cpu.load", maxBatchEvents+100)...)
+
+	var (
+		wg       sync.WaitGroup
+		accepted atomic.Int64
+		failures = make(chan string, 16)
+	)
+
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			code, resp, err := postBatchRaw(s, body)
+			if err != nil {
+				select {
+				case failures <- fmt.Sprintf("reply was not JSON: %v", err):
+				default:
+				}
+				return
+			}
+			if code != http.StatusRequestEntityTooLarge {
+				select {
+				case failures <- fmt.Sprintf("status = %d, want 413", code):
+				default:
+				}
+			}
+			accepted.Add(int64(resp.Accepted))
+		}()
+	}
+	wg.Wait()
+	close(failures)
+
+	for msg := range failures {
+		t.Error(msg)
+	}
+
+	got, ok := mergeAll(s, "cpu.load")
+	if !ok {
+		t.Fatal("nothing recorded")
+	}
+	if int64(got.Count) != accepted.Load() {
+		t.Errorf("replies claimed %d accepted, store holds %d",
+			accepted.Load(), got.Count)
+	}
+	if want := int64(writers * maxBatchEvents); accepted.Load() != want {
+		t.Errorf("accepted %d in total, want %d", accepted.Load(), want)
+	}
+}
