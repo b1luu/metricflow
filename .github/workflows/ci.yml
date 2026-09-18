@@ -113,3 +113,69 @@ jobs:
             sleep 0.2
           done
           echo "server did not exit within 5s of SIGTERM"; cat server.log; exit 1
+
+  # DESIGN §26: under overload the server must shed rather than queue, and a
+  # shed request must be completely shed - never half-applied. This job runs
+  # its own server with METRICFLOW_MAX_INFLIGHT=4 rather than the default
+  # 256, because saturating 256 concurrent handlers honestly took 1500
+  # workers and 2000-event batches locally, and a two-core runner cannot do
+  # it. The limit is what changes; the code under test does not.
+  overload:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - run: go build -o metricflow .
+      - run: go build -o loadgen ./cmd/loadgen
+
+      - name: start a deliberately small server
+        env:
+          METRICFLOW_MAX_INFLIGHT: "4"
+        run: |
+          ./metricflow > server.log 2>&1 &
+          echo $! > server.pid
+          for i in $(seq 1 50); do
+            if curl -sf localhost:8080/health > /dev/null; then
+              echo "server up after ${i} attempts"
+              exit 0
+            fi
+            sleep 0.2
+          done
+          echo "server never became healthy"; cat server.log; exit 1
+
+      # -expect-shed is what stops this passing vacuously: without it the
+      # step would be just as green against a server with no limiter at all.
+      # verify still has to hold while the shedding happens - that is the
+      # actual claim, that a refused request touched nothing.
+      - name: overload must shed, and stay exact while shedding
+        run: ./loadgen -duration 5s -workers 64 -batch 20 -expect-shed
+
+      - name: /health must answer even while the server is shedding
+        run: |
+          ./loadgen -duration 5s -workers 64 -batch 20 -expect-shed -verify=false &
+          load=$!
+          # A health check that gets shed makes an overloaded server look
+          # dead, so an orchestrator would kill it. Poll throughout the run.
+          for i in $(seq 1 20); do
+            if ! curl -sf --max-time 2 localhost:8080/health > /dev/null; then
+              echo "/health failed while the server was shedding"
+              kill $load 2>/dev/null || true
+              exit 1
+            fi
+            sleep 0.2
+          done
+          wait $load
+
+      - name: shut down cleanly
+        run: |
+          kill -TERM "$(cat server.pid)"
+          for i in $(seq 1 25); do
+            if ! kill -0 "$(cat server.pid)" 2>/dev/null; then
+              echo "exited cleanly"; cat server.log; exit 0
+            fi
+            sleep 0.2
+          done
+          echo "server did not exit within 5s of SIGTERM"; cat server.log; exit 1

@@ -170,6 +170,42 @@ Every request there is a `200` carrying both outcomes, so the accepted count
 comes from the reply body rather than from the status code — and 3 031 275
 accepted events were 3 031 275 recorded events.
 
+## Overload
+
+The server caps how many requests are in a handler at once and refuses the
+excess with `503` and `Retry-After` — immediately, rather than queueing them.
+Under sustained overload a queue does not reduce the work, it hides it:
+latency grows without bound and the server spends its capacity on answers
+nobody is waiting for any more. Refusing costs 179 ns against 1862 ns to
+serve, so an overloaded server spends almost nothing on what it turns away.
+
+A shed request never reaches the store, so the counts stay exact while it is
+happening. `/health` is never shed — a health check that fails under load
+makes a busy server look like a dead one, and whatever is watching responds by
+killing it.
+
+`METRICFLOW_MAX_INFLIGHT` sets the limit (default 256); a value that isn't a
+positive integer stops the server rather than being ignored. To see it work:
+
+```
+METRICFLOW_MAX_INFLIGHT=4 ./metricflow
+go run ./cmd/loadgen -duration 3s -workers 64 -batch 20 -expect-shed
+```
+```
+282136 requests in 3.001s  (94002 req/s)
+5642720 events  (1880035 events/s)  2154860 accepted, 0 rejected
+shed  3487860 events in 174393 requests refused for capacity (503)
+  200    107743   38.2%
+  503    174393   61.8%
+verify: OK - 2154860 accepted, 2154860 recorded
+```
+
+`-expect-shed` fails the run if the server never shed, so the check cannot
+pass against a server with no limiter at all. Every request got an answer —
+38% served, 62% refused in 179 ns — and the accepted count still matched the
+store exactly. See [DESIGN.md](DESIGN.md) §26 for the timeouts, the
+shed-don't-queue argument, and what this deliberately does not do.
+
 ## Test
 
 ```
@@ -196,7 +232,8 @@ reasoning behind these and other choices.
 
 Done: single-event and batch ingest with validation, windowed aggregation over event time, per-metric
 stats with a configurable query window, percentiles from a bounded histogram,
-an alerting layer with flap suppression, graceful shutdown, a store whose lock
+an alerting layer with flap suppression, graceful shutdown, a fully
+timed-out HTTP server that sheds load rather than queueing it, a store whose lock
 is sharded by metric name (14.9x on concurrent writes to distinct metrics,
 measured before and after), a batch endpoint that turns that into 50x end to
 end (§25), and a load harness
@@ -211,4 +248,6 @@ are accurate to 1% rather than exact, which is the price of not keeping events
 instant across all metrics, though no individual metric is ever internally
 torn (§24); and many goroutines writing the *same* metric still serialize,
 because they contend for the same aggregate rather than for the locking
-scheme — 159 ns/op against 10 ns/op for writes to distinct metrics (§24).
+scheme — 159 ns/op against 10 ns/op for writes to distinct metrics (§24); and
+the concurrency limit is global rather than per-client, so one noisy client can
+consume every slot and shed everyone else (§26).

@@ -960,6 +960,152 @@ string.
   ingest. `maxBatchEvents` is the bound on that, and it is the reason the
   event cap exists at all rather than only the byte cap.
 
+### 26. Surviving a bad client: timeouts, and shedding rather than queueing
+
+The project's spine says the harness should prove throughput and correctness
+*under injected failure*. Up to here "failure" meant bad input — `-bad`
+sends events the server should refuse. That is the easy half. The other half
+is a client that is not merely wrong but expensive: one that is slow, or
+abandoned, or simply too numerous. Against those the server had no defence
+at all.
+
+**Two holes, both of them defaults.**
+
+`run()` built `&http.Server{Handler: ...}` and nothing else. Every timeout
+field was its zero value, which in `net/http` means no limit: no bound on how
+long a client may take to send headers, to send a body, or to read the
+response. This is the standard Go production bug, and it is dangerous
+precisely because nothing looks wrong — the code is correct against every
+well-behaved client and falls over against one that isn't. A client can open
+a connection, dribble one header byte a minute, and hold a goroutine and a
+socket indefinitely. A few thousand of those cost an attacker nothing.
+
+Second, `net/http` runs every connection on its own goroutine and imposes no
+limit on how many. The server's concurrency was whatever clients decided it
+was.
+
+**The timeouts, and how they compose.**
+
+| field | value | what it stops |
+| --- | --- | --- |
+| `ReadHeaderTimeout` | 5s | slow-loris: headers that never end |
+| `ReadTimeout` | 30s | a body delivered arbitrarily slowly |
+| `WriteTimeout` | 30s | a client that never reads the response |
+| `IdleTimeout` | 60s | abandoned keep-alive connections |
+| `MaxHeaderBytes` | 64 KiB | headers, which `MaxBytesReader` never sees |
+
+`ReadHeaderTimeout` is tightest because headers from anything legitimate
+arrive in one packet. `ReadTimeout` is deliberately loose, because a 1 MiB
+batch on a slow link is a real request that needs room.
+
+The composition is the part worth noticing. `MaxBytesReader` (§17, §25)
+bounds how *much* a client may send; `ReadTimeout` bounds how *long* it may
+take. Only the two together bound the *rate*. Either one alone leaves a hole —
+unbounded bytes, or a 1 MiB batch delivered one byte per second — and neither
+is obviously incomplete on its own.
+
+`IdleTimeout` is what makes the read timeouts safe to set at all. Without it
+Go applies `ReadTimeout` to the idle wait between keep-alive requests, so a
+well-behaved client reusing a connection gets disconnected for not yet having
+anything to say. A test asserts `IdleTimeout >= ReadTimeout` rather than
+leaving that as folklore in a comment.
+
+**Shed, don't queue.** The concurrency limit is a middleware holding a
+counting semaphore. Past `maxInFlight` in-flight requests, the next one gets
+`503` and `Retry-After` immediately — it is never parked waiting for a slot.
+
+That is the real decision, and it is worth stating why queueing is the wrong
+answer rather than the safe one. Under sustained overload a queue does not
+reduce the work; it hides it. Latency grows without bound, every client waits
+longer for a response it will eventually time out on, and the server spends
+its capacity producing answers nobody is listening for any more. Shedding
+keeps the requests it does serve fast and hands the rest an immediate, honest
+answer they can act on — for a metrics reporter, "retry" or "drop this
+interval", both far better than hanging.
+
+Shedding is only a defence if refusing is much cheaper than serving.
+`BenchmarkShedRequest`: **179 ns and 64 B to refuse, against 1862 ns and
+5.8 kB to serve an ingest** — about 10×, so an overloaded server spends
+almost nothing on what it turns away.
+
+**A shed request is shed completely.** The limiter sits outside the handler,
+so a refused request never reaches the store. This is the property that makes
+shedding compatible with everything else here: a request that were
+half-applied and then refused would make the `503` a lie and leave the store
+holding events no client was ever told about — worse than dropping them,
+because it would be silent. Three concurrency tests hold that line, each at a
+capacity small enough that shedding is guaranteed and each asserting shedding
+actually happened, so a limiter that never shed could not pass them by
+default.
+
+It also means the capacity check runs *before* the method check, so `GET
+/ingest` under overload is a `503` rather than a `405`. That is deliberate:
+under overload the server should not spend cycles classifying requests it is
+not going to serve.
+
+**`/health` is exempt, and it is the exemption that matters.** A health check
+that gets shed makes an overloaded server look like a dead one, so whatever
+is watching — an orchestrator, a load balancer — kills or depools the
+instance. That turns a server still serving most of its traffic into one
+serving none, and moves its load onto its equally-loaded neighbours. The
+check costs nothing to answer; being wrong about it is how an overload
+becomes an outage. `TestHealthIsNeverShed` uses a limiter of capacity zero,
+which sheds everything, and then checks the other four routes *do* get `503` —
+otherwise a `200` on `/health` would only prove the limiter was never wired
+in.
+
+**Why the limit is tunable when `shardCount` is not.**
+`METRICFLOW_MAX_INFLIGHT` overrides `maxInFlight`. §24 argued that
+`shardCount` should stay a constant because exposing it invites tuning nobody
+has data for, and that still holds — `shardCount` is an algorithmic choice
+whose right value follows from the code. A concurrency limit is an
+operational one: it depends on the machine, the deployment, and what a
+request costs there, none of which this code can know. A bad value fails
+startup rather than falling back to the default, for the same reason a bad
+alert rule does (§18) — a misconfigured limit that quietly ignores you is
+found at 3am; a refusal to start is found immediately.
+
+**Little's law, and why 400 clients could not overload this server.** The
+first attempt to make a live server shed used `-workers 400` against a limit
+of 256, and it never shed once. Concurrency in a handler is arrival rate ×
+service time, not client count: 400 clients each waiting on a ~2 ms round
+trip for a request that spends ~7 µs inside the handler put barely one
+request in flight at a time. Saturating 256 honestly took 1500 workers
+sending 2000-event batches — 5.86 M events/sec, and 92 requests shed. That is
+a fine thing to learn about the server and a terrible basis for a CI gate,
+which is the other reason the limit reads from the environment: CI starts a
+server with 4 and overloads it on a two-core runner.
+
+Live, with the limit at 4 and 64 workers sending 20-event batches: 282 136
+requests, **61.8% shed**, and `verify` exact at 2 154 860 accepted and
+2 154 860 recorded. The contrast with the unlimited run is the argument in
+one line — the unlimited run dropped 205 connections outright with no
+response at all, while the shedding run answered every single request, 38%
+served and 62% refused in 179 ns each.
+
+**Where exactness genuinely stops.** A request that gets no response is the
+one case where the server does not owe the harness equality: it may have
+recorded those events and failed on the way back. That is at-least-once, and
+it is correct. `verify` now widens its check by exactly the number of events
+in unanswered requests and says so, rather than either failing a correct
+server or pretending the number is exact. Outside that window it still fails,
+so it is still a gate. This is the honest limit of the invariant the whole
+project is built on, and it only becomes visible once failure is injected at
+the transport rather than at the contract.
+
+**What this deliberately does not do.**
+
+- *No per-client fairness.* The slots are global, so one noisy client can
+  consume all of them and shed everyone else. Fixing that means per-client
+  accounting and an identity to account against, and this server has no
+  notion of client identity at all. Named here rather than half-solved.
+- *No smoothing.* With no queue whatsoever, a brief burst that a one-deep
+  queue would have absorbed is shed instead. That is the accepted cost of
+  refusing to hide work, and the right knob for it is the limit, not a queue.
+- *No rate limiting.* A client within the concurrency limit may send as fast
+  as it likes. Concurrency and rate are different quantities, and only the
+  first is bounded here.
+
 ## Testing
 
 See `main_test.go`. ~91% coverage — everything but `main()` (listen + signal
