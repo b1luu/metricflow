@@ -262,3 +262,46 @@ func BenchmarkShedRequest(b *testing.B) {
 		h.ServeHTTP(w, req)
 	}
 }
+
+// The limit is the one operational knob this server exposes, so its parsing
+// is held to the same standard as an alert rule: a value the operator got
+// wrong stops the process rather than being quietly replaced by the default.
+func TestInFlightLimitFromTheEnvironment(t *testing.T) {
+	cases := []struct {
+		name    string
+		set     bool
+		value   string
+		want    int
+		wantErr bool
+	}{
+		{name: "unset falls back to the constant", want: maxInFlight},
+		{name: "a plain number", set: true, value: "4", want: 4},
+		{name: "one is allowed", set: true, value: "1", want: 1},
+		{name: "zero would shed everything", set: true, value: "0", wantErr: true},
+		{name: "negative", set: true, value: "-1", wantErr: true},
+		{name: "not a number", set: true, value: "lots", wantErr: true},
+		{name: "empty but set", set: true, value: "", wantErr: true},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if c.set {
+				t.Setenv("METRICFLOW_MAX_INFLIGHT", c.value)
+			}
+
+			got, err := inFlightLimit()
+			if c.wantErr {
+				if err == nil {
+					t.Fatalf("value %q was accepted as %d, want an error", c.value, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("value %q: %v", c.value, err)
+			}
+			if got != c.want {
+				t.Errorf("value %q gave %d, want %d", c.value, got, c.want)
+			}
+		})
+	}
+}

@@ -702,3 +702,131 @@ func TestTallyReportShowsEventsOnlyWhenBatching(t *testing.T) {
 		t.Errorf("report cried mismatch on a consistent tally:\n%s", out)
 	}
 }
+
+// --- load shedding ---
+
+// A 503 is the server defending itself, not judging the events. Counting
+// those events as "good" would make the generator report a MISMATCH every
+// time the server behaved correctly under load - the harness crying wolf at
+// the exact moment its output matters most.
+func TestSendUntilTreatsSheddingAsNeitherGoodNorAccepted(t *testing.T) {
+	var requests atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "server at capacity", http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	cfg := config{
+		target: srv.URL, workers: 1, duration: 50 * time.Millisecond,
+		metrics: 1, batch: 5,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.duration)
+	defer cancel()
+
+	tal := sendUntil(ctx, newClient(1), cfg, 0)
+
+	if requests.Load() == 0 {
+		t.Fatal("no requests reached the server")
+	}
+	if tal.good != 0 {
+		t.Errorf("good = %d, want 0 - the server never looked at these events", tal.good)
+	}
+	if tal.accepted != 0 {
+		t.Errorf("accepted = %d, want 0", tal.accepted)
+	}
+	if tal.shedEv != tal.events {
+		t.Errorf("shedEv = %d, want all %d events", tal.shedEv, tal.events)
+	}
+
+	// And the report must not accuse the server of anything.
+	var buf bytes.Buffer
+	tal.report(&buf, time.Second, 0)
+	if strings.Contains(buf.String(), "MISMATCH") {
+		t.Errorf("report cried mismatch over a server that only shed:\n%s", buf.String())
+	}
+	if !strings.Contains(buf.String(), "shed") {
+		t.Errorf("report does not mention shedding:\n%s", buf.String())
+	}
+}
+
+// A request that got no response is the one case where the server does not
+// owe exact equality: it may have recorded the events and failed on the way
+// back, which is at-least-once and correct. verify widens by exactly that
+// many events, and no further.
+func TestVerifyAllowsAtLeastOnceForUnansweredRequests(t *testing.T) {
+	cfg := config{metrics: 1, runID: "abc", duration: time.Second}
+
+	cases := []struct {
+		name      string
+		recorded  int
+		accepted  int
+		unknown   int
+		wantError bool
+	}{
+		{"inside the window", 105, 100, 10, false},
+		{"at the top of the window", 110, 100, 10, false},
+		{"exactly the accepted count", 100, 100, 10, false},
+		{"beyond the window", 111, 100, 10, true},
+		{"below the accepted count", 99, 100, 10, true},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			srv := statsServer(t, "1m0s", map[string]int{cfg.metricName(0): c.recorded})
+			defer srv.Close()
+			cfg := cfg
+			cfg.target = srv.URL
+
+			tal := newTally()
+			tal.accepted = c.accepted
+			tal.unknownEv = c.unknown
+
+			err := verify(newClient(1), cfg, tal, time.Second, io.Discard)
+			if c.wantError && err == nil {
+				t.Errorf("recorded %d against %d accepted and %d unknown: accepted, want an error",
+					c.recorded, c.accepted, c.unknown)
+			}
+			if !c.wantError && err != nil {
+				t.Errorf("recorded %d against %d accepted and %d unknown: %v",
+					c.recorded, c.accepted, c.unknown, err)
+			}
+		})
+	}
+}
+
+// With no unanswered requests the check stays exact - the widening above
+// must not quietly become the general rule.
+func TestVerifyStaysExactWithoutUnansweredRequests(t *testing.T) {
+	cfg := config{metrics: 1, runID: "abc", duration: time.Second}
+	srv := statsServer(t, "1m0s", map[string]int{cfg.metricName(0): 101})
+	defer srv.Close()
+	cfg.target = srv.URL
+
+	tal := newTally()
+	tal.accepted = 100
+
+	if err := verify(newClient(1), cfg, tal, time.Second, io.Discard); err == nil {
+		t.Error("verify accepted a one-event discrepancy with nothing unresolved")
+	}
+}
+
+func TestParseFlagsHasExpectShedOffByDefault(t *testing.T) {
+	c, err := parseFlags(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.wantShed {
+		t.Error("expect-shed defaults on; a normal run would fail for not overloading the server")
+	}
+
+	c, err = parseFlags([]string{"-expect-shed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.wantShed {
+		t.Error("-expect-shed did not set the flag")
+	}
+}

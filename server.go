@@ -9,7 +9,10 @@ package main
 // client and a genuine firehose, so the failure modes are not hypothetical.
 
 import (
+	"fmt"
 	"net/http"
+	"os"
+	"strconv"
 	"sync/atomic"
 	"time"
 )
@@ -83,6 +86,37 @@ func newServer(h http.Handler) *http.Server {
 // the worst case - 256 batch bodies being decoded at once, rather than
 // however many sockets an attacker can open.
 const maxInFlight = 256
+
+// inFlightLimit is maxInFlight, unless METRICFLOW_MAX_INFLIGHT overrides it.
+//
+// Why this is tunable when shardCount (§24) deliberately is not: shardCount is
+// an algorithmic choice whose right value follows from the code, and exposing
+// it would invite tuning nobody has data for. A concurrency limit is an
+// operational choice - it depends on the machine, the deployment, and how
+// expensive a request is there, none of which this code can know. It is also
+// what lets CI prove the shedding path on every push, by starting a server
+// small enough to saturate on purpose rather than needing a machine that can
+// actually overwhelm 256 concurrent handlers.
+//
+// A bad value fails startup rather than falling back to the default, for the
+// same reason a bad alert rule does (§18): a misconfigured limit that quietly
+// ignores you is found at 3am, and a refusal to start is found immediately.
+func inFlightLimit() (int, error) {
+	v, ok := os.LookupEnv("METRICFLOW_MAX_INFLIGHT")
+	if !ok {
+		return maxInFlight, nil
+	}
+
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, fmt.Errorf("METRICFLOW_MAX_INFLIGHT=%q is not an integer", v)
+	}
+	if n < 1 {
+		return 0, fmt.Errorf("METRICFLOW_MAX_INFLIGHT=%d must be at least 1; "+
+			"zero would shed every request", n)
+	}
+	return n, nil
+}
 
 // limiter bounds concurrent in-flight requests and refuses the excess.
 //

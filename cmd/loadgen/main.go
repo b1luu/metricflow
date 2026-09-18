@@ -34,6 +34,7 @@ type config struct {
 	badFrac  float64       // fraction of events that should be rejectable
 	batch    int           // events per request; 1 uses the single-event endpoint
 	verify   bool          // cross-check the server's count afterwards
+	wantShed bool          // fail unless the server shed at least one request
 	runID    string        // makes this run's metric names unique
 }
 
@@ -60,6 +61,7 @@ func parseFlags(args []string) (config, error) {
 	fs.Float64Var(&c.badFrac, "bad", 0, "fraction of events made deliberately invalid (0..1)")
 	fs.IntVar(&c.batch, "batch", 1, "events per request; 1 posts to /ingest, more posts NDJSON to /ingest/batch")
 	fs.BoolVar(&c.verify, "verify", true, "after the run, check the server recorded exactly what it accepted")
+	fs.BoolVar(&c.wantShed, "expect-shed", false, "fail unless the server shed at least one request (503)")
 
 	if err := fs.Parse(args); err != nil {
 		return config{}, err
@@ -198,13 +200,15 @@ func (l *latencies) quantile(q float64) time.Duration {
 // events, good, accepted and rejected count *events* - which stop being the
 // same thing the moment one request carries a hundred of them.
 type tally struct {
-	byStatus map[int]int // HTTP responses, by status code
-	failed   int         // transport errors: no response at all
-	events   int         // events put on the wire
-	good     int         // events the generator intended to be valid
-	accepted int         // events the server said it accepted
-	rejected int         // events the server said it rejected
-	lat      *latencies
+	byStatus  map[int]int // HTTP responses, by status code
+	failed    int         // transport errors: no response at all
+	events    int         // events put on the wire
+	good      int         // intended-valid events in requests the server answered
+	accepted  int         // events the server said it accepted
+	rejected  int         // events the server said it rejected
+	shedEv    int         // events in requests refused for capacity (503)
+	unknownEv int         // events in requests that got no response at all
+	lat       *latencies
 }
 
 func newTally() tally { return tally{byStatus: map[int]int{}, lat: newLatencies()} }
@@ -218,6 +222,8 @@ func (t *tally) merge(o tally) {
 	t.good += o.good
 	t.accepted += o.accepted
 	t.rejected += o.rejected
+	t.shedEv += o.shedEv
+	t.unknownEv += o.unknownEv
 	t.lat.merge(o.lat)
 }
 
@@ -322,8 +328,9 @@ func sendUntil(ctx context.Context, client *http.Client, cfg config, workerID in
 	// are below the requested fraction. Two runs with the same flags then
 	// send the same mix, which makes them comparable.
 	nBad := 0
-	nextBody := func(now time.Time) string {
+	nextBody := func(now time.Time) (string, int) {
 		var b strings.Builder
+		good := 0
 		for j := 0; j < perRequest; j++ {
 			t.events++
 			if float64(nBad) < cfg.badFrac*float64(t.events) {
@@ -331,18 +338,18 @@ func sendUntil(ctx context.Context, client *http.Client, cfg config, workerID in
 				nBad++
 			} else {
 				b.WriteString(eventBody(metric, float64(t.events%10+1), now))
-				t.good++
+				good++
 			}
 			// Harmless for the single-event endpoint, which trims trailing
 			// whitespace, and required between events in a batch.
 			b.WriteByte('\n')
 		}
-		return b.String()
+		return b.String(), good
 	}
 
 	for ctx.Err() == nil {
 		now := time.Now()
-		body := nextBody(now)
+		body, good := nextBody(now)
 
 		// Deliberately NOT http.NewRequestWithContext(ctx, ...): ctx ends
 		// the run, and binding it to the request would cancel whatever is
@@ -355,16 +362,39 @@ func sendUntil(ctx context.Context, client *http.Client, cfg config, workerID in
 		req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
 		if err != nil {
 			t.failed++
+			t.unknownEv += perRequest
 			continue
 		}
 
 		start := time.Now()
 		resp, err := client.Do(req)
 		if err != nil {
+			// No response means we cannot know what the server did with
+			// these events - it may have recorded them and failed on the
+			// way back. Counted apart from good rather than guessed at;
+			// verify() widens its check by exactly this much.
 			t.failed++
+			t.unknownEv += perRequest
 			continue
 		}
 		t.lat.add(time.Since(start))
+
+		// A 503 is the server shedding for capacity, not judging these
+		// events. It never looked at them, so they belong in neither good
+		// nor accepted - counting them as good would make the generator
+		// report a MISMATCH every time the server correctly defended
+		// itself.
+		if resp.StatusCode == http.StatusServiceUnavailable {
+			t.shedEv += perRequest
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			t.byStatus[resp.StatusCode]++
+			continue
+		}
+
+		// The server answered on the merits, so its verdict is comparable
+		// to what we meant to send.
+		t.good += good
 
 		// How many events the server took is read from the reply in batch
 		// mode, because a 200 no longer means "one event accepted" - a
@@ -441,6 +471,17 @@ func (t tally) report(w io.Writer, elapsed, clockRes time.Duration) {
 			fmt.Fprintf(w, "  (%.0f events/s)", float64(t.events)/secs)
 		}
 		fmt.Fprintf(w, "  %d accepted, %d rejected\n", t.accepted, t.rejected)
+	}
+
+	// Shedding is the server working, not failing, so it gets its own line
+	// rather than hiding inside the status histogram.
+	if t.shedEv > 0 {
+		fmt.Fprintf(w, "shed  %d events in %d requests refused for capacity (503)\n",
+			t.shedEv, t.byStatus[http.StatusServiceUnavailable])
+	}
+	if t.unknownEv > 0 {
+		fmt.Fprintf(w, "unknown  %d events in %d requests that got no response\n",
+			t.unknownEv, t.failed)
 	}
 
 	pct := func(n int) float64 {
@@ -554,6 +595,25 @@ func verify(client *http.Client, cfg config, total tally, elapsed time.Duration,
 	// 200s when one request is one event, and the sum of the batch replies'
 	// accepted fields when it is not.
 	accepted := total.accepted
+
+	// Requests that got no response are the one case where exact equality
+	// is not the server's to honour: it may have recorded those events and
+	// then failed on the way back, which is at-least-once and correct. So
+	// the check widens by exactly that many events - and no further, which
+	// is what still makes it a gate.
+	if total.unknownEv > 0 {
+		if recorded < accepted || recorded > accepted+total.unknownEv {
+			return fmt.Errorf("server accepted %d events and recorded %d; "+
+				"with %d events in requests that got no response, anything in [%d,%d] "+
+				"would be consistent",
+				accepted, recorded, total.unknownEv, accepted, accepted+total.unknownEv)
+		}
+		fmt.Fprintf(w, "verify: OK - %d accepted, %d recorded "+
+			"(%d events unresolved: no response, so at-least-once applies)\n",
+			accepted, recorded, total.unknownEv)
+		return nil
+	}
+
 	if recorded != accepted {
 		return fmt.Errorf("server accepted %d events but recorded %d (difference %d)",
 			accepted, recorded, accepted-recorded)
@@ -592,5 +652,15 @@ func main() {
 			fmt.Fprintln(os.Stderr, "verify:", err)
 			os.Exit(1)
 		}
+	}
+
+	// Without this, a run meant to exercise load shedding passes just as
+	// happily against a server with no limiter at all - the strongest
+	// possible way for that gate to be worthless.
+	if cfg.wantShed && total.byStatus[http.StatusServiceUnavailable] == 0 {
+		fmt.Fprintf(os.Stderr, "expect-shed: the server never shed a request; "+
+			"either it is not limiting concurrency or %d workers did not saturate it\n",
+			cfg.workers)
+		os.Exit(1)
 	}
 }

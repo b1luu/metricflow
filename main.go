@@ -465,7 +465,15 @@ func run(ctx context.Context, ln net.Listener) error {
 		alerter.Run(ctx, evalInterval)
 	}()
 
-	srv := newServer(routes(store, alerter, newLimiter(maxInFlight)))
+	// Before serving anything, like the alert rules above: a limit the
+	// operator got wrong should stop the process, not be silently ignored.
+	limit, err := inFlightLimit()
+	if err != nil {
+		return err
+	}
+	log.Printf("serving at most %d requests at once", limit)
+
+	srv := newServer(routes(store, alerter, newLimiter(limit)))
 
 	errc := make(chan error, 1)
 	go func() {
