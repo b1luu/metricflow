@@ -448,7 +448,7 @@ func run(ctx context.Context, ln net.Listener) error {
 		alerter.Run(ctx, evalInterval)
 	}()
 
-	srv := &http.Server{Handler: routes(store, alerter)}
+	srv := newServer(routes(store, alerter))
 
 	errc := make(chan error, 1)
 	go func() {
