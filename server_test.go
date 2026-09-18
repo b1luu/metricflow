@@ -5,6 +5,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -97,5 +100,165 @@ func TestServerDisconnectsAClientThatNeverFinishesItsHeaders(t *testing.T) {
 	// firing, which would mean it was still waiting.
 	if ne, ok := err.(net.Error); ok && ne.Timeout() {
 		t.Fatal("the server was still holding the connection after the read-header timeout")
+	}
+}
+
+// --- load shedding ---
+
+// The three claims in one test, because they only mean anything together:
+// requests up to capacity are admitted, the next is refused, and it is
+// refused *immediately* rather than waiting for a slot. The last one is the
+// actual design decision - a limiter that queued would pass the first two.
+func TestLimiterAdmitsToCapacityThenShedsWithoutWaiting(t *testing.T) {
+	const capacity = 4
+
+	entered := make(chan struct{}, capacity)
+	release := make(chan struct{})
+
+	l := newLimiter(capacity)
+	h := l.limit(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		entered <- struct{}{}
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	get := func() *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/stats", nil))
+		return rec
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < capacity; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if rec := get(); rec.Code != http.StatusOK {
+				t.Errorf("a request within capacity got %d, want 200", rec.Code)
+			}
+		}()
+	}
+	for i := 0; i < capacity; i++ {
+		<-entered // every slot is genuinely occupied before we push further
+	}
+
+	// The handlers above are still blocked, so a limiter that queued would
+	// never return from this. Bounded rather than left to hang, so the
+	// failure reads as a failure instead of a ten-minute test timeout.
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() { done <- get() }()
+
+	select {
+	case rec := <-done:
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Errorf("request past capacity got %d, want 503", rec.Code)
+		}
+		if rec.Header().Get("Retry-After") == "" {
+			t.Error("no Retry-After on a shed request; the client has nothing to back off on")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the request past capacity blocked; the limiter is queueing, not shedding")
+	}
+
+	if got := l.shedded(); got != 1 {
+		t.Errorf("shedded = %d, want 1", got)
+	}
+
+	// And the capacity comes back once the handlers finish.
+	close(release)
+	wg.Wait()
+
+	release = make(chan struct{})
+	close(release)
+	if rec := get(); rec.Code != http.StatusOK {
+		t.Errorf("after the in-flight requests finished, got %d, want 200", rec.Code)
+	}
+}
+
+// A leaked slot is permanent: the server would shed a little more after
+// every panic until it shed everything. That is a slow, silent failure of
+// exactly the kind a defer exists to prevent, so it gets a test.
+func TestLimiterReleasesItsSlotWhenAHandlerPanics(t *testing.T) {
+	l := newLimiter(1)
+	h := l.limit(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		panic("boom")
+	}))
+
+	call := func() (rec *httptest.ResponseRecorder, panicked bool) {
+		rec = httptest.NewRecorder()
+		defer func() { panicked = recover() != nil }()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/stats", nil))
+		return rec, false
+	}
+
+	if _, panicked := call(); !panicked {
+		t.Fatal("the handler was supposed to panic; this test proves nothing otherwise")
+	}
+
+	// Admitted means it reaches the handler and panics again. Shed means
+	// the only slot never came back.
+	rec, panicked := call()
+	if !panicked {
+		t.Errorf("second request was not admitted (status %d) - the panic leaked the slot", rec.Code)
+	}
+}
+
+// /health must never be shed. A health check that fails under load makes an
+// overloaded server look like a dead one, so whatever is watching kills or
+// depools it - turning a server that was still serving most of its traffic
+// into one serving none, and moving its load onto equally-loaded neighbours.
+//
+// A limiter of capacity zero sheds everything, which makes the exemption the
+// only thing that can produce a 200 here.
+func TestHealthIsNeverShed(t *testing.T) {
+	s := newStore()
+	a, err := newAlerter(time.Now(), s, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := routes(s, a, newLimiter(0))
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if rec.Code != http.StatusOK {
+		t.Errorf("/health under a fully shedding limiter: %d, want 200", rec.Code)
+	}
+
+	// Everything else must be shed, or the test above proves nothing about
+	// the exemption - it would just mean the limiter is not wired in.
+	shed := []struct {
+		method, path string
+	}{
+		{http.MethodPost, "/ingest"},
+		{http.MethodPost, "/ingest/batch"},
+		{http.MethodGet, "/stats"},
+		{http.MethodGet, "/alerts"},
+	}
+	for _, c := range shed {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(c.method, c.path, strings.NewReader("")))
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Errorf("%s %s: %d, want 503 - the limiter is not covering this route",
+				c.method, c.path, rec.Code)
+		}
+	}
+}
+
+// Shedding has to be cheap, or it is not a defence. If refusing a request
+// cost anything like serving one, an overloaded server would still be
+// overloaded, just with worse output.
+func BenchmarkShedRequest(b *testing.B) {
+	l := newLimiter(0) // sheds everything
+	h := l.limit(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b.Fatal("a shedding limiter reached the handler")
+	}))
+
+	w := &discardWriter{}
+	req := httptest.NewRequest(http.MethodGet, "/stats", nil)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		h.ServeHTTP(w, req)
 	}
 }

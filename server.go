@@ -10,6 +10,7 @@ package main
 
 import (
 	"net/http"
+	"sync/atomic"
 	"time"
 )
 
@@ -70,3 +71,63 @@ func newServer(h http.Handler) *http.Server {
 		MaxHeaderBytes:    maxHeaderBytes,
 	}
 }
+
+// maxInFlight caps how many requests may be in a handler at once.
+//
+// net/http runs every connection on its own goroutine and imposes no limit,
+// so under a genuine firehose the server's concurrency is whatever clients
+// decide it is. The number itself is chosen to be far above real load rather
+// than tuned: a reporter fleet holds one keep-alive connection per agent and
+// sends one request at a time, so 256 is comfortable for a fleet several
+// times larger than anything this project simulates, while still bounding
+// the worst case - 256 batch bodies being decoded at once, rather than
+// however many sockets an attacker can open.
+const maxInFlight = 256
+
+// limiter bounds concurrent in-flight requests and refuses the excess.
+//
+// The decision it encodes is shed, don't queue. Under sustained overload a
+// queue does not reduce the work, it only hides it: latency grows without
+// bound, every client waits longer for a response it will eventually time
+// out on, and the server spends its capacity on requests nobody is still
+// listening for. Shedding keeps the requests it does serve fast and hands
+// the rest an immediate, honest answer they can act on - which for a
+// metrics reporter means "retry, or drop this interval", both far better
+// than hanging.
+//
+// The slots channel is a counting semaphore. The select below never blocks:
+// either a slot is free right now, or the request is refused.
+type limiter struct {
+	slots chan struct{}
+	shed  atomic.Int64
+}
+
+func newLimiter(n int) *limiter {
+	return &limiter{slots: make(chan struct{}, n)}
+}
+
+// limit wraps h so at most n requests are inside it at once.
+func (l *limiter) limit(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case l.slots <- struct{}{}:
+			// Deferred, so the slot comes back even if the handler panics.
+			// A leaked slot is permanent: the server would shed a little
+			// more after every panic until it shed everything.
+			defer func() { <-l.slots }()
+			h.ServeHTTP(w, r)
+		default:
+			l.shed.Add(1)
+			// Retry-After is the part that makes this cooperative rather
+			// than just a refusal - it tells a client to back off instead
+			// of immediately trying again and deepening the overload.
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "server at capacity", http.StatusServiceUnavailable)
+		}
+	})
+}
+
+// shedded is how many requests have been refused for capacity. Exported to
+// tests rather than to clients: it is a property of the server, not of the
+// metrics, and putting it in /stats would mix the two.
+func (l *limiter) shedded() int64 { return l.shed.Load() }

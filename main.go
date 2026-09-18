@@ -393,14 +393,31 @@ func (s *Store) handleStats(w http.ResponseWriter, r *http.Request) {
 }
 
 // routes builds the request multiplexer. Separate from main so tests can
-// exercise the wiring (path -> handler, method gating) directly.
-func routes(s *Store, a *Alerter) http.Handler {
+// exercise the wiring (path -> handler, method gating, shedding) directly.
+//
+// /health is deliberately outside the limiter, and it is the one exemption
+// worth arguing for. A health check that gets shed makes an overloaded
+// server look like a dead one, so whatever is watching it - an orchestrator,
+// a load balancer - responds by killing or depooling the instance. That
+// turns a server which was still serving most of its traffic into one
+// serving none, and moves its load onto its equally-loaded neighbours. The
+// check costs nothing to answer, so exempting it is close to free; being
+// wrong about it is not.
+func routes(s *Store, a *Alerter, l *limiter) http.Handler {
 	mux := http.NewServeMux()
+
+	// Shed-able: real work, and the traffic a firehose actually consists of.
+	limited := map[string]http.HandlerFunc{
+		"/ingest":       allow(http.MethodPost, s.handleIngest),
+		"/ingest/batch": allow(http.MethodPost, s.handleIngestBatch),
+		"/stats":        allow(http.MethodGet, s.handleStats),
+		"/alerts":       allow(http.MethodGet, a.handleAlerts),
+	}
+	for path, h := range limited {
+		mux.Handle(path, l.limit(h))
+	}
+
 	mux.HandleFunc("/health", allow(http.MethodGet, handleHealth))
-	mux.HandleFunc("/ingest", allow(http.MethodPost, s.handleIngest))
-	mux.HandleFunc("/ingest/batch", allow(http.MethodPost, s.handleIngestBatch))
-	mux.HandleFunc("/stats", allow(http.MethodGet, s.handleStats))
-	mux.HandleFunc("/alerts", allow(http.MethodGet, a.handleAlerts))
 	return mux
 }
 
@@ -448,7 +465,7 @@ func run(ctx context.Context, ln net.Listener) error {
 		alerter.Run(ctx, evalInterval)
 	}()
 
-	srv := newServer(routes(store, alerter))
+	srv := newServer(routes(store, alerter, newLimiter(maxInFlight)))
 
 	errc := make(chan error, 1)
 	go func() {

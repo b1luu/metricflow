@@ -924,7 +924,7 @@ func TestRoutesWireHandlers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := routes(newStore(), a)
+	h := routes(newStore(), a, newLimiter(maxInFlight))
 
 	cases := []struct {
 		method, path string
