@@ -956,3 +956,264 @@ func TestConcurrentTruncatedBatchesStayHonest(t *testing.T) {
 		t.Errorf("accepted %d in total, want %d", accepted.Load(), want)
 	}
 }
+
+// --- exactness under load shedding ---
+
+// saturate drives clients x perClient concurrent requests through h and
+// reports how many were served and how many were refused for capacity.
+func saturate(h http.Handler, clients, perClient int, build func() *http.Request) (ok, shed int64) {
+	var served, refused atomic.Int64
+
+	var wg sync.WaitGroup
+	for c := 0; c < clients; c++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < perClient; i++ {
+				rec := httptest.NewRecorder()
+				h.ServeHTTP(rec, build())
+				switch rec.Code {
+				case http.StatusServiceUnavailable:
+					refused.Add(1)
+				default:
+					served.Add(1)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	return served.Load(), refused.Load()
+}
+
+// Shedding is only safe if a shed request is *completely* shed - refused
+// before the handler, so nothing is recorded for it. A request that were
+// half-applied and then refused would make the 503 a lie, and leave the
+// store holding events no client was ever told about. That is worse than
+// dropping them, because it is silent.
+//
+// The limiter's capacity is tiny here so that shedding is guaranteed rather
+// than hoped for, and the test asserts it actually happened - otherwise a
+// limiter that never sheds would pass this trivially.
+func TestShedIngestRequestsAreNeverRecorded(t *testing.T) {
+	const (
+		clients   = 32
+		perClient = 40
+		capacity  = 2
+	)
+
+	s := newStore()
+	a, err := newAlerter(time.Now(), s, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := routes(s, a, newLimiter(capacity))
+
+	served, shed := saturate(h, clients, perClient, func() *http.Request {
+		return httptest.NewRequest(http.MethodPost, "/ingest",
+			strings.NewReader(ingestJSON("cpu.load", 1)))
+	})
+
+	if shed == 0 {
+		t.Fatalf("nothing was shed at capacity %d with %d concurrent clients; "+
+			"the test is not exercising the path it claims to", capacity, clients)
+	}
+	if served+shed != int64(clients*perClient) {
+		t.Errorf("served %d + shed %d != %d requests sent", served, shed, clients*perClient)
+	}
+
+	got, ok := mergeAll(s, "cpu.load")
+	if !ok {
+		t.Fatal("nothing recorded at all")
+	}
+	if int64(got.Count) != served {
+		t.Errorf("recorded %d events but only %d requests were served - "+
+			"a shed request reached the store", got.Count, served)
+	}
+}
+
+// The same property for batches, where "accepted" is a number in the reply
+// rather than a status code. A shed batch contributes nothing, so the sum
+// over every reply must still equal what the store holds - the invariant
+// §25 introduced, now under overload.
+func TestShedBatchesContributeNothing(t *testing.T) {
+	const (
+		clients   = 32
+		perClient = 20
+		batchSize = 25
+		capacity  = 2
+	)
+
+	s := newStore()
+	a, err := newAlerter(time.Now(), s, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := routes(s, a, newLimiter(capacity))
+
+	body := ndjson(validEvents("cpu.load", batchSize)...)
+
+	var (
+		accepted atomic.Int64
+		shed     atomic.Int64
+		wg       sync.WaitGroup
+		failures = make(chan string, 16)
+	)
+
+	for c := 0; c < clients; c++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < perClient; i++ {
+				rec := httptest.NewRecorder()
+				h.ServeHTTP(rec, httptest.NewRequest(
+					http.MethodPost, "/ingest/batch", strings.NewReader(body)))
+
+				if rec.Code == http.StatusServiceUnavailable {
+					shed.Add(1)
+					// A shed request must not have been given a batch
+					// reply - the body is the plain-text refusal, and
+					// anything else would mean the handler ran.
+					var resp BatchResponse
+					if json.Unmarshal(rec.Body.Bytes(), &resp) == nil && resp.Accepted > 0 {
+						select {
+						case failures <- fmt.Sprintf("a 503 reported %d accepted", resp.Accepted):
+						default:
+						}
+					}
+					continue
+				}
+
+				var resp BatchResponse
+				if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+					select {
+					case failures <- fmt.Sprintf("status %d, body not JSON: %v", rec.Code, err):
+					default:
+					}
+					continue
+				}
+				accepted.Add(int64(resp.Accepted))
+			}
+		}()
+	}
+	wg.Wait()
+	close(failures)
+
+	for msg := range failures {
+		t.Error(msg)
+	}
+	if shed.Load() == 0 {
+		t.Fatalf("nothing was shed at capacity %d; the test proves nothing", capacity)
+	}
+
+	got, ok := mergeAll(s, "cpu.load")
+	if !ok {
+		t.Fatal("nothing recorded at all")
+	}
+	if int64(got.Count) != accepted.Load() {
+		t.Errorf("replies claimed %d events accepted, store holds %d",
+			accepted.Load(), got.Count)
+	}
+}
+
+// Under saturation the reads have to stay correct too, not just the writes.
+// /stats walks every shard, so it holds locks the writers want; shedding
+// must not turn that into a torn or stale answer for the requests that do
+// get served.
+func TestStatsStaysCorrectWhileRequestsAreShed(t *testing.T) {
+	const (
+		writers   = 24
+		perWriter = 100
+		readers   = 8
+		capacity  = 4
+	)
+
+	s := newStore()
+	a, err := newAlerter(time.Now(), s, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := routes(s, a, newLimiter(capacity))
+
+	// Every event carries the same value, so a served /stats can be checked
+	// against itself: avg, min and max must all equal it exactly, whatever
+	// count the response happened to catch.
+	const value = 7.0
+
+	var (
+		wg        sync.WaitGroup
+		accepted  atomic.Int64
+		snapshots atomic.Int64
+		failures  = make(chan string, 16)
+	)
+
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < perWriter; i++ {
+				rec := httptest.NewRecorder()
+				ev := fmt.Sprintf(`{"name":"shed.metric","value":%v,"ts":%d}`,
+					value, time.Now().UnixMilli())
+				h.ServeHTTP(rec, httptest.NewRequest(
+					http.MethodPost, "/ingest", strings.NewReader(ev)))
+				if rec.Code == http.StatusOK {
+					accepted.Add(1)
+				}
+			}
+		}()
+	}
+
+	for r := 0; r < readers; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < perWriter; i++ {
+				rec := httptest.NewRecorder()
+				h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/stats", nil))
+				if rec.Code != http.StatusOK {
+					continue // shed, which is fine
+				}
+				snapshots.Add(1)
+
+				var resp StatsResponse
+				if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+					select {
+					case failures <- fmt.Sprintf("/stats body not JSON: %v", err):
+					default:
+					}
+					continue
+				}
+				m, ok := resp.Metrics["shed.metric"]
+				if !ok {
+					continue // nothing written yet
+				}
+				if m.Avg != value || m.Min != value || m.Max != value {
+					select {
+					case failures <- fmt.Sprintf("torn read: avg/min/max = %v/%v/%v, want %v",
+						m.Avg, m.Min, m.Max, value):
+					default:
+					}
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(failures)
+
+	for msg := range failures {
+		t.Error(msg)
+	}
+	if snapshots.Load() == 0 {
+		t.Fatal("every /stats was shed; the readers never observed anything")
+	}
+
+	got, ok := mergeAll(s, "shed.metric")
+	if !ok {
+		t.Fatal("nothing recorded")
+	}
+	if int64(got.Count) != accepted.Load() {
+		t.Errorf("server answered 200 to %d ingests but recorded %d",
+			accepted.Load(), got.Count)
+	}
+}
