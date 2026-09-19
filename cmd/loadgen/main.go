@@ -27,15 +27,17 @@ import (
 )
 
 type config struct {
-	target   string        // base URL of the server
-	workers  int           // concurrent request senders
-	duration time.Duration // how long to send for
-	metrics  int           // how many distinct metric names to spread across
-	badFrac  float64       // fraction of events that should be rejectable
-	batch    int           // events per request; 1 uses the single-event endpoint
-	verify   bool          // cross-check the server's count afterwards
-	wantShed bool          // fail unless the server shed at least one request
-	runID    string        // makes this run's metric names unique
+	target      string        // base URL of the server
+	workers     int           // concurrent request senders
+	duration    time.Duration // how long to send for
+	metrics     int           // how many distinct metric names to spread across
+	badFrac     float64       // fraction of events that should be rejectable
+	batch       int           // events per request; 1 uses the single-event endpoint
+	verify      bool          // cross-check the server's count afterwards
+	wantShed    bool          // fail unless the server shed at least one request
+	cardinality int           // distinct names per worker; 0 keeps one name per worker
+	wantCard    bool          // fail unless the server refused a name for cardinality
+	runID       string        // makes this run's metric names unique
 }
 
 // metricName is the metric a given worker reports under. The run ID keeps
@@ -50,6 +52,17 @@ func (c config) metricName(worker int) string {
 	return fmt.Sprintf("metric.%s.%d", c.runID, n)
 }
 
+// cardinalityName is the nth name a worker uses when -cardinality is on.
+//
+// The names are still enumerable - worker count times -cardinality of them,
+// all carrying the run ID - which is what keeps verify() exact. A generator
+// that invented truly unbounded names would flood the store just as well and
+// then have no way to ask what happened to them, so the harness would lose
+// the one claim it exists to make.
+func (c config) cardinalityName(worker, n int) string {
+	return fmt.Sprintf("%s.card.%d", c.metricName(worker), n%c.cardinality)
+}
+
 func parseFlags(args []string) (config, error) {
 	fs := flag.NewFlagSet("loadgen", flag.ContinueOnError)
 
@@ -62,6 +75,8 @@ func parseFlags(args []string) (config, error) {
 	fs.IntVar(&c.batch, "batch", 1, "events per request; 1 posts to /ingest, more posts NDJSON to /ingest/batch")
 	fs.BoolVar(&c.verify, "verify", true, "after the run, check the server recorded exactly what it accepted")
 	fs.BoolVar(&c.wantShed, "expect-shed", false, "fail unless the server shed at least one request (503)")
+	fs.IntVar(&c.cardinality, "cardinality", 0, "distinct metric names per worker; 0 uses one, higher floods the store")
+	fs.BoolVar(&c.wantCard, "expect-cardinality", false, "fail unless the server refused a metric name for cardinality")
 
 	if err := fs.Parse(args); err != nil {
 		return config{}, err
@@ -80,6 +95,8 @@ func parseFlags(args []string) (config, error) {
 		return config{}, fmt.Errorf("-bad must be between 0 and 1, got %v", c.badFrac)
 	case c.batch < 1:
 		return config{}, fmt.Errorf("-batch must be >= 1, got %d", c.batch)
+	case c.cardinality < 0:
+		return config{}, fmt.Errorf("-cardinality must be >= 0, got %d", c.cardinality)
 	}
 	return c, nil
 }
@@ -208,6 +225,7 @@ type tally struct {
 	rejected  int         // events the server said it rejected
 	shedEv    int         // events in requests refused for capacity (503)
 	unknownEv int         // events in requests that got no response at all
+	cardEv    int         // valid events the server refused for cardinality
 	lat       *latencies
 }
 
@@ -224,6 +242,7 @@ func (t *tally) merge(o tally) {
 	t.rejected += o.rejected
 	t.shedEv += o.shedEv
 	t.unknownEv += o.unknownEv
+	t.cardEv += o.cardEv
 	t.lat.merge(o.lat)
 }
 
@@ -333,11 +352,22 @@ func sendUntil(ctx context.Context, client *http.Client, cfg config, workerID in
 		good := 0
 		for j := 0; j < perRequest; j++ {
 			t.events++
+
+			// With -cardinality on, every event gets a different name, so
+			// the store fills with names rather than with data. The bad
+			// shapes keep the worker's base name: they are about the
+			// contract, not about cardinality, and mixing the two would
+			// make a rejection impossible to attribute.
+			name := metric
+			if cfg.cardinality > 0 {
+				name = cfg.cardinalityName(workerID, t.events)
+			}
+
 			if float64(nBad) < cfg.badFrac*float64(t.events) {
 				b.WriteString(bad[nBad%len(bad)](metric, now))
 				nBad++
 			} else {
-				b.WriteString(eventBody(metric, float64(t.events%10+1), now))
+				b.WriteString(eventBody(name, float64(t.events%10+1), now))
 				good++
 			}
 			// Harmless for the single-event endpoint, which trims trailing
@@ -392,6 +422,20 @@ func sendUntil(ctx context.Context, client *http.Client, cfg config, workerID in
 			continue
 		}
 
+		// A 429 is the server refusing a metric *name* for cardinality.
+		// Like a 503 it is not a judgement on the values, but unlike a 503
+		// the server did answer on the merits, so the events are counted
+		// as good and separately as refused - and the report checks that
+		// accepted plus refused accounts for all of them.
+		if resp.StatusCode == http.StatusTooManyRequests {
+			t.good += good
+			t.cardEv += good
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			t.byStatus[resp.StatusCode]++
+			continue
+		}
+
 		// The server answered on the merits, so its verdict is comparable
 		// to what we meant to send.
 		t.good += good
@@ -406,6 +450,14 @@ func sendUntil(ctx context.Context, client *http.Client, cfg config, workerID in
 			if err := json.NewDecoder(resp.Body).Decode(&br); err == nil {
 				t.accepted += br.Accepted
 				t.rejected += br.Rejected
+
+				// Rejects beyond the ones we deliberately made bad are the
+				// server refusing events we meant to be valid, which in a
+				// batch means cardinality - it is the only refusal of a
+				// well-formed event this server has.
+				if extra := br.Rejected - (perRequest - good); extra > 0 {
+					t.cardEv += extra
+				}
 			}
 		} else if resp.StatusCode == http.StatusOK {
 			t.accepted++
@@ -483,6 +535,10 @@ func (t tally) report(w io.Writer, elapsed, clockRes time.Duration) {
 		fmt.Fprintf(w, "unknown  %d events in %d requests that got no response\n",
 			t.unknownEv, t.failed)
 	}
+	if t.cardEv > 0 {
+		fmt.Fprintf(w, "cardinality  %d valid events refused because the store was full\n",
+			t.cardEv)
+	}
 
 	pct := func(n int) float64 {
 		if sent == 0 {
@@ -519,8 +575,13 @@ func (t tally) report(w io.Writer, elapsed, clockRes time.Duration) {
 	// The generator knows which requests it meant to be valid, so it can
 	// check the server agreed. A mismatch either way is a real finding: a
 	// good request refused, or a deliberately broken one waved through.
-	if t.accepted != t.good {
-		fmt.Fprintf(w, "MISMATCH: sent %d valid events but %d were accepted\n", t.good, t.accepted)
+	// Cardinality refusals are the server correctly enforcing a limit, not
+	// losing anything, so they count toward the reconciliation rather than
+	// against it. Everything the server looked at is either accepted or
+	// refused for a reason we can name.
+	if t.accepted+t.cardEv != t.good {
+		fmt.Fprintf(w, "MISMATCH: sent %d valid events; %d accepted and %d refused for cardinality\n",
+			t.good, t.accepted, t.cardEv)
 	}
 }
 
@@ -587,8 +648,23 @@ func verify(client *http.Client, cfg config, total tally, elapsed time.Duration,
 	}
 
 	recorded := 0
-	for i := 0; i < cfg.metrics; i++ {
-		recorded += stats.Metrics[cfg.metricName(i)].Count
+	if cfg.cardinality > 0 {
+		// In cardinality mode the names are workers x -cardinality of them,
+		// and most were refused and never created, so enumerating them all
+		// to look each one up would be mostly misses. Every name this run
+		// generates carries the run ID, so summing by that prefix finds
+		// exactly this run's metrics and no others - which is the property
+		// the run ID was introduced for in the first place.
+		prefix := fmt.Sprintf("metric.%s.", cfg.runID)
+		for name, m := range stats.Metrics {
+			if strings.HasPrefix(name, prefix) {
+				recorded += m.Count
+			}
+		}
+	} else {
+		for i := 0; i < cfg.metrics; i++ {
+			recorded += stats.Metrics[cfg.metricName(i)].Count
+		}
 	}
 
 	// total.accepted is the server's own answer in both modes: a count of
@@ -657,6 +733,13 @@ func main() {
 	// Without this, a run meant to exercise load shedding passes just as
 	// happily against a server with no limiter at all - the strongest
 	// possible way for that gate to be worthless.
+	if cfg.wantCard && total.cardEv == 0 {
+		fmt.Fprintf(os.Stderr, "expect-cardinality: the server never refused a metric name; "+
+			"either it has no cardinality limit or %d names per worker did not reach it\n",
+			cfg.cardinality)
+		os.Exit(1)
+	}
+
 	if cfg.wantShed && total.byStatus[http.StatusServiceUnavailable] == 0 {
 		fmt.Fprintf(os.Stderr, "expect-shed: the server never shed a request; "+
 			"either it is not limiting concurrency or %d workers did not saturate it\n",

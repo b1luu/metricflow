@@ -385,3 +385,80 @@ func TestBatchMarksCardinalityRejectsRetryable(t *testing.T) {
 			"would fail forever: %+v", contract.Index, contract)
 	}
 }
+
+// A batch rejected entirely for cardinality is the case where 400 would be
+// actively misleading: every event was well-formed and the store was simply
+// full. A client obeying a 400 would stop retrying data it should retry.
+func TestBatchRejectedOnlyForCardinalityIs429(t *testing.T) {
+	s := newStore()
+	now := time.Now()
+	ts := now.UnixMilli()
+
+	names := namesForShard(t, 0, maxMetricsPerShard+3)
+	for _, name := range names[:maxMetricsPerShard] {
+		if err := s.record(now, Event{Name: name, Value: 1, TS: ts}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rec, resp := postBatch(t, s, ndjson(
+		Event{Name: names[maxMetricsPerShard], Value: 1, TS: ts},
+		Event{Name: names[maxMetricsPerShard+1], Value: 1, TS: ts},
+	))
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Errorf("status = %d, want 429 - nothing was wrong with these events", rec.Code)
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Error("no Retry-After on an entirely retryable batch")
+	}
+	if resp.Accepted != 0 || resp.Rejected != 2 {
+		t.Errorf("accepted/rejected = %d/%d, want 0/2", resp.Accepted, resp.Rejected)
+	}
+	for _, e := range resp.Errors {
+		if !e.Retryable {
+			t.Errorf("error at index %d is not marked retryable: %+v", e.Index, e)
+		}
+	}
+}
+
+// One permanent rejection in the batch and it is a 400 again. Mixing a
+// malformed event into a full store must not let the client believe the
+// whole batch is worth resending unchanged.
+func TestBatchWithAnyPermanentRejectIs400(t *testing.T) {
+	s := newStore()
+	now := time.Now()
+	ts := now.UnixMilli()
+
+	names := namesForShard(t, 0, maxMetricsPerShard+2)
+	for _, name := range names[:maxMetricsPerShard] {
+		if err := s.record(now, Event{Name: name, Value: 1, TS: ts}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rec, resp := postBatch(t, s, ndjson(
+		Event{Name: names[maxMetricsPerShard], Value: 1, TS: ts}, // retryable
+		Event{Value: 1, TS: ts},                                  // permanent: no name
+	))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 - one of these events will never be valid", rec.Code)
+	}
+	if resp.Accepted != 0 || resp.Rejected != 2 {
+		t.Errorf("accepted/rejected = %d/%d, want 0/2", resp.Accepted, resp.Rejected)
+	}
+}
+
+// An empty batch keeps its own answer; the retryable check must not swallow
+// the case where the client sent nothing at all.
+func TestBatchEmptyIsStill400WithTheCapInPlay(t *testing.T) {
+	s := newStore()
+	rec, resp := postBatch(t, s, "")
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+	if !strings.Contains(resp.Fatal, "empty batch") {
+		t.Errorf("fatal = %q, want it to say the batch was empty", resp.Fatal)
+	}
+}

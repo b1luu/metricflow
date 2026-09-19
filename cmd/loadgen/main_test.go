@@ -830,3 +830,109 @@ func TestParseFlagsHasExpectShedOffByDefault(t *testing.T) {
 		t.Error("-expect-shed did not set the flag")
 	}
 }
+
+// --- cardinality mode ---
+
+func TestParseFlagsValidatesCardinality(t *testing.T) {
+	if _, err := parseFlags([]string{"-cardinality", "-1"}); err == nil {
+		t.Error("parseFlags accepted a negative cardinality")
+	}
+	c, err := parseFlags(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.cardinality != 0 || c.wantCard {
+		t.Errorf("cardinality defaults to %d / expect=%v, want 0 / false - a normal run "+
+			"should not flood the store", c.cardinality, c.wantCard)
+	}
+}
+
+// The generated names must be distinct, bounded by -cardinality, and carry
+// the run ID - the last one is what lets verify find them by prefix and
+// ignore an earlier run's leftovers.
+func TestCardinalityNamesAreDistinctBoundedAndScoped(t *testing.T) {
+	cfg := config{metrics: 4, runID: "abc", cardinality: 7}
+
+	seen := map[string]bool{}
+	for n := 0; n < 100; n++ {
+		name := cfg.cardinalityName(0, n)
+		seen[name] = true
+		if !strings.HasPrefix(name, "metric.abc.") {
+			t.Fatalf("name %q does not carry the run ID; verify would miss it", name)
+		}
+	}
+	if len(seen) != cfg.cardinality {
+		t.Errorf("worker 0 used %d distinct names, want %d", len(seen), cfg.cardinality)
+	}
+
+	// Different workers must not collide, or the flood is smaller than asked.
+	if cfg.cardinalityName(0, 0) == cfg.cardinalityName(1, 0) {
+		t.Error("two workers generated the same name")
+	}
+}
+
+// A 429 is the server refusing a metric name, not losing the events. They
+// are counted as good (the server judged them) and separately as refused,
+// and the report reconciles the two rather than crying mismatch.
+func TestSendUntilCountsCardinalityRefusalsSeparately(t *testing.T) {
+	var requests atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Retry-After", "60")
+		http.Error(w, "cardinality limit reached", http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	cfg := config{
+		target: srv.URL, workers: 1, duration: 50 * time.Millisecond,
+		metrics: 1, batch: 4, cardinality: 1000,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.duration)
+	defer cancel()
+
+	tal := sendUntil(ctx, newClient(1), cfg, 0)
+
+	if requests.Load() == 0 {
+		t.Fatal("no requests reached the server")
+	}
+	if tal.cardEv != tal.events {
+		t.Errorf("cardEv = %d, want all %d events", tal.cardEv, tal.events)
+	}
+	if tal.good != tal.events {
+		t.Errorf("good = %d, want all %d - the server did judge these", tal.good, tal.events)
+	}
+	if tal.accepted != 0 {
+		t.Errorf("accepted = %d, want 0", tal.accepted)
+	}
+
+	var buf bytes.Buffer
+	tal.report(&buf, time.Second, 0)
+	if strings.Contains(buf.String(), "MISMATCH") {
+		t.Errorf("report cried mismatch over a server enforcing its own limit:\n%s", buf.String())
+	}
+	if !strings.Contains(buf.String(), "cardinality") {
+		t.Errorf("report does not mention the refusals:\n%s", buf.String())
+	}
+}
+
+// In cardinality mode the names are not enumerable from the worker index, so
+// verify sums by run-ID prefix instead. It must still ignore other runs.
+func TestVerifySumsByPrefixInCardinalityMode(t *testing.T) {
+	cfg := config{metrics: 1, runID: "run2", duration: time.Second, cardinality: 10}
+	srv := statsServer(t, "1m0s", map[string]int{
+		"metric.run2.0.card.0": 40,
+		"metric.run2.0.card.1": 60,
+		"metric.run1.0.card.0": 9999, // an earlier run, still in the window
+		"something.else":       5,
+	})
+	defer srv.Close()
+	cfg.target = srv.URL
+
+	tal := newTally()
+	tal.accepted = 100
+
+	if err := verify(newClient(1), cfg, tal, time.Second, io.Discard); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+}

@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 )
 
@@ -108,6 +109,7 @@ func (s *Store) handleIngestBatch(w http.ResponseWriter, r *http.Request) {
 	resp := BatchResponse{Errors: []BatchError{}}
 
 	status := http.StatusOK
+	retryable := 0 // rejects that may succeed later, i.e. cardinality
 	for index := 0; ; index++ {
 		var ev Event
 		err := dec.Decode(&ev)
@@ -133,11 +135,15 @@ func (s *Store) handleIngestBatch(w http.ResponseWriter, r *http.Request) {
 
 		if err := s.admit(now, ev); err != nil {
 			resp.Rejected++
+			mayRetry := errors.Is(err, errCardinality)
+			if mayRetry {
+				retryable++
+			}
 			if len(resp.Errors) < maxBatchErrors {
 				resp.Errors = append(resp.Errors, BatchError{
 					Index:     index,
 					Error:     err.Error(),
-					Retryable: errors.Is(err, errCardinality),
+					Retryable: mayRetry,
 				})
 			}
 			continue
@@ -146,12 +152,25 @@ func (s *Store) handleIngestBatch(w http.ResponseWriter, r *http.Request) {
 		resp.Accepted++
 	}
 
-	// An empty body is a client that meant to send something. Saying 200 to
-	// it would let a broken producer look healthy indefinitely.
+	// Nothing accepted needs a status, and which one depends on whose fault
+	// it was. An empty body is a client that meant to send something, and
+	// saying 200 to it would let a broken producer look healthy forever.
+	//
+	// A batch rejected *entirely* for cardinality is the interesting case:
+	// every event was well-formed and the store was simply full. Answering
+	// 400 there would tell the client to fix something that is not broken,
+	// and a client obeying that would stop retrying data it should retry.
+	// It gets the same 429 the single-event path gives (§27).
 	if status == http.StatusOK && resp.Accepted == 0 {
-		status = http.StatusBadRequest
-		if resp.Rejected == 0 {
+		switch {
+		case resp.Rejected == 0:
+			status = http.StatusBadRequest
 			resp.Fatal = "empty batch: no events in body"
+		case retryable == resp.Rejected:
+			status = http.StatusTooManyRequests
+			w.Header().Set("Retry-After", strconv.Itoa(int(window.Seconds())))
+		default:
+			status = http.StatusBadRequest
 		}
 	}
 
