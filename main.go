@@ -465,6 +465,15 @@ func run(ctx context.Context, ln net.Listener) error {
 		alerter.Run(ctx, evalInterval)
 	}()
 
+	// The sweeper reclaims metrics nobody writes to any more (§27). It
+	// shares the same shutdown signal for the same reason the alerter does:
+	// it holds shard locks, so the process must not exit mid-sweep.
+	sweepDone := make(chan struct{})
+	go func() {
+		defer close(sweepDone)
+		store.Sweep(ctx, sweepInterval)
+	}()
+
 	// Before serving anything, like the alert rules above: a limit the
 	// operator got wrong should stop the process, not be silently ignored.
 	limit, err := inFlightLimit()
@@ -493,7 +502,10 @@ func run(ctx context.Context, ln net.Listener) error {
 	defer cancel()
 	shutdownErr := srv.Shutdown(shutdownCtx)
 
-	<-alertDone // ctx is already cancelled, so this returns promptly
+	// Both background loops watch ctx, which is already cancelled, so these
+	// return promptly.
+	<-alertDone
+	<-sweepDone
 	return shutdownErr
 }
 
