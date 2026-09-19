@@ -206,6 +206,39 @@ pass against a server with no limiter at all. Every request got an answer —
 store exactly. See [DESIGN.md](DESIGN.md) §26 for the timeouts, the
 shed-don't-queue argument, and what this deliberately does not do.
 
+## Cardinality
+
+A metric name that carries a request ID or a UUID is how real metrics systems
+die, so the store bounds both halves of the problem: at most 1024 distinct
+names per shard (32 shards, so ~32k in total), and at most 256 bytes per name.
+Capping only the count would bound nothing — a 1 MiB batch body means names
+could be megabytes each.
+
+Past the limit a **new** name is refused with `429` and `Retry-After`; in a
+batch it is a per-event rejection marked `"retryable": true`, to distinguish
+it from a contract violation that will never succeed. Metrics that already
+exist keep taking writes no matter how full their shard is — a client
+inventing names cannot degrade the metrics that were already there.
+
+A sweeper runs every 10s and removes metrics whose buckets have all aged out,
+so the limit is a high-water mark rather than a one-way door. Refusing costs
+25 ns and zero allocations, four times cheaper than accepting a normal event.
+
+```
+go run ./cmd/loadgen -duration 4s -workers 8 -batch 50 -cardinality 20000 -expect-cardinality
+```
+```
+6627050 events  (1656710 events/s)  2748157 accepted, 40043 rejected
+cardinality  3878893 valid events refused because the store was full
+  200     55764   42.1%
+  429     76777   57.9%
+verify: OK - 2748157 accepted, 2748157 recorded
+```
+
+The store filled to its cap, refused 3.8M events, kept serving — and every
+event it said it accepted was recorded. See [DESIGN.md](DESIGN.md) §27 for why
+the cap is per shard rather than global, and what it deliberately does not do.
+
 ## Test
 
 ```
@@ -233,7 +266,8 @@ reasoning behind these and other choices.
 Done: single-event and batch ingest with validation, windowed aggregation over event time, per-metric
 stats with a configurable query window, percentiles from a bounded histogram,
 an alerting layer with flap suppression, graceful shutdown, a fully
-timed-out HTTP server that sheds load rather than queueing it, a store whose lock
+timed-out HTTP server that sheds load rather than queueing it, a bounded
+metric cardinality with a sweeper to reclaim idle names, a store whose lock
 is sharded by metric name (14.9x on concurrent writes to distinct metrics,
 measured before and after), a batch endpoint that turns that into 50x end to
 end (§25), and a load harness
@@ -250,4 +284,6 @@ torn (§24); and many goroutines writing the *same* metric still serialize,
 because they contend for the same aggregate rather than for the locking
 scheme — 159 ns/op against 10 ns/op for writes to distinct metrics (§24); and
 the concurrency limit is global rather than per-client, so one noisy client can
-consume every slot and shed everyone else (§26).
+consume every slot and shed everyone else (§26) — and for the same reason
+(no notion of client identity) one client's metric names can fill a shard that
+another client's legitimate new metric then cannot enter (§27).

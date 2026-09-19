@@ -190,6 +190,9 @@ request lands. See §16 for the mechanics and what's still open.
 
 ### 10. Bucket eviction happens on write, not on a timer
 
+*Still true for buckets, but no longer the whole story: §27 adds a sweeper,
+because "on write" means a metric nobody writes to is never reclaimed at all.*
+
 Once a bucket ages out of the window it is *ignored* by `mergeBuckets`, but it
 still occupies memory. `record` deletes aged-out buckets for the metric it just
 touched, every time it runs (`evict(series, windowStart(now, window))`).
@@ -1105,6 +1108,161 @@ the transport rather than at the contract.
 - *No rate limiting.* A client within the concurrency limit may send as fast
   as it likes. Concurrency and rate are different quantities, and only the
   first is bounded here.
+
+### 27. Cardinality: the way metrics systems actually die
+
+Every limit so far has bounded a *request* — its size (§17, §25), how long
+it may take, how many may run at once (§26). None of them bounded what a
+request could leave behind. Nothing stopped a client putting a request ID, a
+user ID, or a UUID in a metric name, and every distinct name became a
+permanent map entry. The store had no upper bound on memory that depended on
+anything except client behaviour.
+
+This is not a theoretical failure. A cardinality explosion is the single most
+common way a real metrics system falls over, and it is almost always an
+accident — one service adds a label that happens to be unique per request,
+and the monitoring dies before the thing it was monitoring does.
+
+**Two holes, and they need different fixes.**
+
+*Nothing reclaimed.* §10 chose eviction on write, which quietly meant a metric
+nobody writes to is never evicted by anything: its buckets age out of every
+query but stay in memory, and its map entry lives forever. For a fixed set of
+metrics that is exactly what §10 signed up for. For a client generating names
+it is a leak.
+
+*Nothing refused.* There was no cap on how many distinct names could exist,
+and none on how long one could be.
+
+Neither fix works alone. A sweeper cannot keep up with a client inventing
+names as fast as it can send them, and a cap with no sweeper would fill once
+and stay full, refusing legitimate new metrics forever.
+
+**Sweeping.** `Store.sweep` walks every shard, evicts aged buckets, and
+removes any metric left holding none — a metric with no buckets inside the
+window is indistinguishable from one that never existed, so keeping the key
+is keeping a name rather than data. It runs on a ticker at `bucketWidth`,
+which is the granularity at which anything can age out; sweeping faster would
+walk the same maps to find the same nothing.
+
+One shard at a time, never all at once, for the same reason `/stats` walks
+them that way (§24). A sweep is not a snapshot and does not need to be.
+
+**The cap is per shard, not global.** A global counter would be exact, and
+every ingest would touch it — precisely the single point of contention §24
+spent a slice removing. A per-shard check costs nothing: the shard lock is
+already held and the count is a `len()` on a map already in hand.
+
+What that gives up is exactness. FNV spreads names evenly, so a realistic
+workload fills shards at about the same rate, but an adversary who searches
+for names landing on one shard can exhaust that shard's budget while the rest
+sit empty. That turns out to be the *better* failure: the blast radius is one
+shard and the other 31 are untouched, where a global cap would have let the
+same attacker lock out every metric in the store.
+
+**The check is only on the new-name path,** so an event for a metric that
+already exists never even reads the count. That is both a performance
+property and the point of the whole limit: a full shard keeps accepting
+writes to every metric it already holds, so a client inventing names cannot
+degrade the metrics that were already there.
+
+**Ordering, which is load-bearing.** `admit` is now the single definition of
+"the server took this event" — the contract check, then the capacity check,
+shared by both ingest paths so they cannot drift. Validation comes first so a
+malformed event is refused on its own merits before it can consume a
+cardinality slot. Otherwise a client sending garbage could fill the store
+with names that were never going to be valid, which is the cheapest possible
+denial of service.
+
+**Bounding the name, not just the count.** Writing this section exposed the
+hole that made the cap nearly worthless: nothing limited how long a name
+could be, and a batch body may be 1 MiB. 32 shards × 1024 names × ~1 MB is
+tens of gigabytes. The two dimensions multiply, and capping one alone bounds
+nothing. `maxMetricNameLen` is 256 bytes — generous against real names of
+well under a hundred — which puts name memory at a few megabytes at full
+cardinality.
+
+**Status codes, and why not the obvious ones.** A cardinality refusal is a
+**429** with `Retry-After`, not a 400 and not a 503.
+
+- 400 would tell a client its request was malformed. It wasn't; the name is
+  perfectly well-formed and the store is simply full.
+- 503 is already this server's answer for too many requests at once (§26).
+  Merging two unrelated conditions into one code would leave an operator
+  unable to tell overload from a naming bug.
+- 429 says what is actually true — you are asking for more than you are
+  allowed — and carries backoff guidance. `Retry-After` is the window rather
+  than the sweep interval, because a slot frees when some other metric ages
+  out entirely, not merely when a sweep runs.
+
+An oversized *name*, by contrast, is a 400: it will never be acceptable at
+that length whatever the store does next.
+
+**In a batch it is a per-event rejection,** so `BatchError` gains
+`Retryable`. The distinction matters enormously to a client: a contract
+violation is permanent and resending it wastes both sides' time, while a
+cardinality refusal may succeed later. Without the field a client would have
+to parse the message to tell them apart, which is no contract at all.
+
+That has a consequence worth stating, because the live run caught it. A batch
+rejected *entirely* for cardinality was answering 400 under §25's "nothing
+accepted means client error" rule. But every event in it was well-formed, and
+a client obeying that 400 would stop retrying data it should retry. Such a
+batch now gets 429. One permanent rejection anywhere in it puts it back to
+400, because then some of it really will never be valid.
+
+**The measurements** (Ryzen 7 7800X3D, `-count=3`, median):
+
+| | ns/op | allocs |
+| --- | --- | --- |
+| `record`, metric already exists | 99.4 | 0 |
+| `record`, metric is new | 370 | 6 |
+| `record`, refused by the cap | 25 | 0 |
+| `sweep`, nothing to reclaim | 45 per metric | 0 |
+| `sweep`, reclaiming everything | 167 per metric | — |
+
+The first line is the one that had to be checked: 99.4 ns against §24's 100 ns
+for the same benchmark, so the cap really is free for events on existing
+metrics.
+
+The third is the shape a limit like this should have. A client flooding new
+names is refused for 25 ns and zero allocations — four times cheaper than a
+legitimate update, fifteen times cheaper than the metric creation it is
+trying to force. An attack that costs the server less per event than ordinary
+traffic is not much of an attack.
+
+Sweeping is a standing tax on a healthy server, since it runs whether or not
+anything went idle: at a completely full store that is 1.5 ms every 10 s, a
+0.015% duty cycle, allocating nothing. The number that matters for ingest is
+not the total but the per-shard lock hold, because a sweep takes one shard at
+a time — a full shard reclaiming everything is about 170 µs, which is the
+longest any writer can be made to wait on it.
+
+**Live**, 8 workers sending 50-event batches with 20 000 names each:
+6 627 050 events, **3 878 893 refused for cardinality**, 57.9% of requests
+answered 429 — and `verify` exact at 2 748 157 accepted and 2 748 157
+recorded. The store filled to its cap and kept serving. `-expect-cardinality`
+fails the run if the server never refused a name, so the gate cannot pass
+against a server with no limit.
+
+**What this deliberately does not do.**
+
+- *No per-client attribution.* Same gap as §26's global slots, and the same
+  cause: this server has no notion of client identity. One client's names can
+  fill a shard that another client's legitimate new metric then can't enter.
+  Fixing it needs identity first, which is a larger change than a limit.
+- *No eviction of existing metrics.* A full shard refuses new names rather
+  than making room by dropping an old one. Evicting real data to admit what
+  is usually garbage is the wrong trade, and an LRU here would let an
+  attacker push out exactly the metrics an operator cares about.
+- *The global cap is approximate.* `shardCount × maxMetricsPerShard` is the
+  ceiling, but an uneven hash or a targeted attacker reaches a shard's limit
+  before the store is anywhere near that total. Discussed above — it is the
+  price of keeping the check off the contended path, and the failure it
+  produces is contained rather than total.
+- *No limit on values.* Cardinality is about names. A metric with a wild
+  value distribution costs the same as any other, because §23's histogram is
+  bounded by construction.
 
 ## Testing
 

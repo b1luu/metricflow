@@ -100,6 +100,14 @@ jobs:
       - name: batched traffic with per-event rejects must still verify
         run: ./loadgen -duration 3s -workers 8 -batch 100 -bad 0.25
 
+      # §27: a client inventing metric names must be refused rather than
+      # allowed to grow the store without bound. -expect-cardinality fails
+      # the step if the server never refused one, so it cannot pass against a
+      # server with no limit. verify still has to hold while the cap fires,
+      # which is the actual claim - a refused name touched nothing.
+      - name: a cardinality flood must be refused, and stay exact
+        run: ./loadgen -duration 5s -workers 8 -batch 50 -cardinality 20000 -expect-cardinality
+
       - name: shut down cleanly
         run: |
           kill -TERM "$(cat server.pid)"
