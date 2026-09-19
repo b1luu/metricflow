@@ -384,3 +384,137 @@ func BenchmarkBatchDecodeOnly(b *testing.B) {
 	}
 	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*size), "ns/event")
 }
+
+// --- cardinality and sweeping ---
+
+// The cap is checked only when a name is new, so an event for a metric that
+// already exists should not pay for it at all. BenchmarkRecord is the
+// comparison - this is the same measurement on the path that does create.
+func BenchmarkRecordNewMetric(b *testing.B) {
+	now := time.Now()
+	ts := now.UnixMilli()
+
+	// Names are built up front so the benchmark measures record, not
+	// Sprintf. The store is rebuilt whenever the cap is reached, since past
+	// that point record would be measuring the refusal path instead.
+	names := make([]string, 4096)
+	for i := range names {
+		names[i] = fmt.Sprintf("new.metric.%d", i)
+	}
+
+	s := newStore()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if i%len(names) == 0 {
+			b.StopTimer()
+			s = newStore() // fresh budget
+			b.StartTimer()
+		}
+		if err := s.record(now, Event{Name: names[i%len(names)], Value: 1, TS: ts}); err != nil {
+			b.Fatalf("iteration %d: %v", i, err)
+		}
+	}
+}
+
+// Refusing has to be cheap too. A client flooding new names is exactly the
+// case where the server is doing the most work per event and getting the
+// least for it, so the refusal is the hot path under attack.
+func BenchmarkRecordRefusedByCap(b *testing.B) {
+	now := time.Now()
+	ts := now.UnixMilli()
+
+	// Fill one shard, then aim everything at it.
+	s := newStore()
+	full := make([]string, 0, maxMetricsPerShard)
+	var overflow string
+	for i := 0; len(full) <= maxMetricsPerShard; i++ {
+		name := fmt.Sprintf("card.%d", i)
+		if shardIndex(name) != 0 {
+			continue
+		}
+		if len(full) == maxMetricsPerShard {
+			overflow = name
+			break
+		}
+		full = append(full, name)
+		if err := s.record(now, Event{Name: name, Value: 1, TS: ts}); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	ev := Event{Name: overflow, Value: 1, TS: ts}
+	if err := s.record(now, ev); err == nil {
+		b.Fatal("the shard is not full; this would measure the accept path")
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := s.record(now, ev); err == nil {
+			b.Fatalf("iteration %d was accepted", i)
+		}
+	}
+}
+
+// A sweep that reclaims nothing is the common case - it runs every
+// bucketWidth whether or not anything has gone idle, so its cost is a
+// standing tax on a healthy server.
+func BenchmarkSweepNothingToReclaim(b *testing.B) {
+	const metrics = 2000
+
+	s := newStore()
+	now := time.Now()
+	for i := 0; i < metrics; i++ {
+		ev := Event{Name: fmt.Sprintf("live.metric.%d", i), Value: 1, TS: now.UnixMilli()}
+		if err := s.record(now, ev); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if got, _ := s.sweep(now); got != 0 {
+			b.Fatalf("iteration %d reclaimed %d metrics from a live store", i, got)
+		}
+	}
+	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*metrics), "ns/metric")
+}
+
+// And the case it exists for: a store full of names written once and
+// abandoned. The store is rebuilt each iteration, outside the timer, because
+// a sweep empties it.
+func BenchmarkSweepReclaimingEverything(b *testing.B) {
+	const metrics = 2000
+
+	now := time.Now()
+	old := now.Add(-window - time.Minute)
+	names := make([]string, metrics)
+	for i := range names {
+		names[i] = fmt.Sprintf("idle.metric.%d", i)
+	}
+
+	fill := func() *Store {
+		s := newStore()
+		for _, n := range names {
+			if err := s.record(old, Event{Name: n, Value: 1, TS: old.UnixMilli()}); err != nil {
+				b.Fatal(err)
+			}
+		}
+		return s
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		s := fill()
+		b.StartTimer()
+
+		if got, _ := s.sweep(now); got != metrics {
+			b.Fatalf("iteration %d reclaimed %d of %d metrics", i, got, metrics)
+		}
+	}
+	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*metrics), "ns/metric")
+}
