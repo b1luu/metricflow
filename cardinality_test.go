@@ -462,3 +462,60 @@ func TestBatchEmptyIsStill400WithTheCapInPlay(t *testing.T) {
 		t.Errorf("fatal = %q, want it to say the batch was empty", resp.Fatal)
 	}
 }
+
+// --- name length ---
+
+// The count cap bounds how many names exist; this bounds how big one is.
+// Without it a client could fill its shard budget with megabyte names -
+// the batch body allows 1 MiB - and the count cap would have been close to
+// no cap at all.
+func TestValidateEventRejectsAnOversizedName(t *testing.T) {
+	now := time.Now()
+	ts := now.UnixMilli()
+
+	cases := []struct {
+		name    string
+		length  int
+		wantErr bool
+	}{
+		{"well under the limit", 32, false},
+		{"exactly at the limit", maxMetricNameLen, false},
+		{"one byte over", maxMetricNameLen + 1, true},
+		{"absurd", 1 << 16, true},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ev := Event{Name: strings.Repeat("x", c.length), Value: 1, TS: ts}
+			err := validateEvent(now, ev)
+			switch {
+			case c.wantErr && err == nil:
+				t.Errorf("a %d-byte name was accepted", c.length)
+			case !c.wantErr && err != nil:
+				t.Errorf("a %d-byte name was rejected: %v", c.length, err)
+			case c.wantErr && !strings.Contains(err.Error(), "limit"):
+				t.Errorf("error = %q, want it to name the limit", err)
+			}
+		})
+	}
+}
+
+// An oversized name must not reach the store - it is refused before admit
+// gets as far as consuming a cardinality slot.
+func TestAnOversizedNameConsumesNothing(t *testing.T) {
+	s := newStore()
+	now := time.Now()
+
+	ev := Event{Name: strings.Repeat("x", maxMetricNameLen+1), Value: 1, TS: now.UnixMilli()}
+	if err := s.admit(now, ev); err == nil {
+		t.Fatal("an oversized name was admitted")
+	}
+	if got := metricCount(s); got != 0 {
+		t.Errorf("store holds %d metrics after an oversized name", got)
+	}
+
+	rec := postIngest(s, fmt.Sprintf(`{"name":%q,"value":1,"ts":%d}`, ev.Name, ev.TS))
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 - an oversized name is the client's to fix", rec.Code)
+	}
+}

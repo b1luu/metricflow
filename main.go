@@ -301,6 +301,15 @@ func validateEvent(now time.Time, ev Event) error {
 	if ev.Name == "" {
 		return errors.New("name is required")
 	}
+	// A cap on how many names exist is worth little without a cap on how
+	// big one can be: the batch body limit is 1 MiB, so without this a
+	// client could fill its shard budget with names of a megabyte each and
+	// spend gigabytes doing it (§27). Real metric names are well under a
+	// hundred bytes; this is generous and still bounds the total.
+	if len(ev.Name) > maxMetricNameLen {
+		return fmt.Errorf("name is %d bytes, over the %d-byte limit",
+			len(ev.Name), maxMetricNameLen)
+	}
 	if ev.TS == 0 {
 		return errors.New("ts is required (unix milliseconds)")
 	}

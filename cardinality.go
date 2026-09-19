@@ -44,6 +44,13 @@ const (
 	// same attacker lock out every metric in the store.
 	maxMetricsPerShard = 1024
 
+	// maxMetricNameLen bounds one name, which is the other half of bounding
+	// cardinality. A limit on how many names exist says nothing about how
+	// big each one is, and the two multiply: 32 shards x 1024 names at a
+	// megabyte each - which the 1 MiB batch body would permit - is tens of
+	// gigabytes, so the count cap alone would have been close to no cap.
+	maxMetricNameLen = 256
+
 	// sweepInterval is how often idle metrics are reclaimed. Tied to the
 	// bucket width because that is the granularity at which anything can
 	// actually age out; sweeping faster would walk the same maps to find

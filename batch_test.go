@@ -346,9 +346,11 @@ func TestBatchAcceptsExactlyTheEventCap(t *testing.T) {
 func TestBatchStopsAtTheByteCap(t *testing.T) {
 	s := newStore()
 
-	// Long metric names, so the byte cap is reached well before the event
-	// cap and it is unambiguously the byte cap being tested.
-	name := "cpu.load." + strings.Repeat("x", 4000)
+	// Names as long as the contract allows, so the byte cap is reached in
+	// far fewer than maxBatchEvents events and it is unambiguously the byte
+	// cap being tested. Sized against maxMetricNameLen rather than picked,
+	// so tightening that limit adjusts this test instead of breaking it.
+	name := "cpu.load." + strings.Repeat("x", maxMetricNameLen-len("cpu.load."))
 	ms := time.Now().UnixMilli()
 	var b strings.Builder
 	for b.Len() <= maxBatchBody+8<<10 {
