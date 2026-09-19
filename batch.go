@@ -46,6 +46,14 @@ const (
 type BatchError struct {
 	Index int    `json:"index"`
 	Error string `json:"error"`
+
+	// Retryable separates the two kinds of refusal, which matter very
+	// differently to a client. A contract violation is permanent - that
+	// event will never be valid, and resending it just wastes both sides'
+	// time. A cardinality refusal is about the store being full right now
+	// and may succeed later (§27). Without this a client would have to
+	// parse the message to tell them apart, which is no contract at all.
+	Retryable bool `json:"retryable"`
 }
 
 // BatchResponse is the JSON body of POST /ingest/batch.
@@ -123,18 +131,18 @@ func (s *Store) handleIngestBatch(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 
-		if vErr := validateEvent(now, ev); vErr != nil {
+		if err := s.admit(now, ev); err != nil {
 			resp.Rejected++
 			if len(resp.Errors) < maxBatchErrors {
 				resp.Errors = append(resp.Errors, BatchError{
-					Index: index,
-					Error: vErr.Error(),
+					Index:     index,
+					Error:     err.Error(),
+					Retryable: errors.Is(err, errCardinality),
 				})
 			}
 			continue
 		}
 
-		s.record(now, ev)
 		resp.Accepted++
 	}
 

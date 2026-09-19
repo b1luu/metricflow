@@ -11,6 +11,7 @@ import (
 	"net/http"      // the HTTP server and routing
 	"os"            // os.Interrupt
 	"os/signal"     // catch Ctrl-C / SIGTERM
+	"strconv"       // Retry-After, which is seconds as a string
 	"sync"          // Mutex, to guard each shard's aggs map
 	"syscall"       // SIGTERM
 	"time"
@@ -110,7 +111,7 @@ const (
 // handleIngest validates ev.TS is in [now-window, now+bucketWidth] before
 // calling here; a direct caller that skips that just gets its out-of-range
 // bucket evicted on the spot. See DESIGN.md §16.
-func (s *Store) record(now time.Time, ev Event) {
+func (s *Store) record(now time.Time, ev Event) error {
 	bucket := time.UnixMilli(ev.TS).Truncate(bucketWidth).Unix()
 
 	// One metric lives in exactly one shard, so an ingest takes one lock and
@@ -121,6 +122,17 @@ func (s *Store) record(now time.Time, ev Event) {
 
 	series := sh.aggs[ev.Name]
 	if series == nil {
+		// Creating a name is the only place cardinality can grow, so it is
+		// the only place worth checking - an event for a metric that
+		// already exists never even reads the count. That keeps the cap off
+		// the hot path entirely (§27).
+		//
+		// Existing metrics keep working however full the shard is. That is
+		// the property the whole limit is for: a client inventing names
+		// must not be able to degrade the metrics that were already there.
+		if len(sh.aggs) >= maxMetricsPerShard {
+			return errCardinality
+		}
 		series = make(map[int64]*Agg)
 		sh.aggs[ev.Name] = series
 	}
@@ -149,9 +161,47 @@ func (s *Store) record(now time.Time, ev Event) {
 
 	// Drop buckets that have aged out of the retention window, so a
 	// long-lived metric's map stays bounded to ~numBuckets entries. A
-	// metric that goes silent keeps its last buckets until it resumes -
-	// acceptable, see DESIGN.md §10.
+	// metric that goes silent is not reached here at all, which is what the
+	// sweeper is for (§10, §27).
 	evict(series, windowStart(now, window))
+	return nil
+}
+
+// admit is the single definition of "the server took this event": the
+// contract check and the capacity check, in that order. Both ingest paths
+// go through it so they cannot drift into two different ideas of what is
+// acceptable.
+//
+// Order matters. A malformed event is refused on its own merits before it
+// can consume a cardinality slot, so a client sending garbage cannot fill
+// the store with names that were never going to be valid.
+func (s *Store) admit(now time.Time, ev Event) error {
+	if err := validateEvent(now, ev); err != nil {
+		return err
+	}
+	return s.record(now, ev)
+}
+
+// writeIngestError renders a refusal from admit as an HTTP response.
+//
+// Cardinality is the one refusal here that is about the server rather than
+// the request, and the one that may stop being true, so it gets its own
+// status and a Retry-After. 400 would tell a client its request was
+// malformed, which it wasn't; 503 is already this server's answer for "too
+// many requests at once" (§26), and merging two unrelated conditions into
+// one code would leave an operator unable to tell overload from a naming
+// bug. 429 says what is actually true - you are asking for more than you
+// are allowed - and carries backoff guidance.
+//
+// Retry-After is the window rather than the sweep interval: a slot frees
+// when some other metric ages out entirely, not merely when a sweep runs.
+func writeIngestError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errCardinality) {
+		w.Header().Set("Retry-After", strconv.Itoa(int(window.Seconds())))
+		http.Error(w, err.Error(), http.StatusTooManyRequests)
+		return
+	}
+	http.Error(w, err.Error(), http.StatusBadRequest)
 }
 
 // evict deletes buckets older than cutoff from a metric's series.
@@ -298,12 +348,11 @@ func (s *Store) handleIngest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now()
-	if err := validateEvent(now, ev); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	if err := s.admit(now, ev); err != nil {
+		writeIngestError(w, err)
 		return
 	}
 
-	s.record(now, ev)
 	fmt.Fprintln(w, "got it")
 }
 
