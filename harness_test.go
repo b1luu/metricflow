@@ -15,6 +15,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -1215,5 +1216,216 @@ func TestStatsStaysCorrectWhileRequestsAreShed(t *testing.T) {
 	if int64(got.Count) != accepted.Load() {
 		t.Errorf("server answered 200 to %d ingests but recorded %d",
 			accepted.Load(), got.Count)
+	}
+}
+
+// --- cardinality under concurrency ---
+
+// The cap is a check followed by an insert, which is the classic
+// check-then-act race: if the two were not under one lock, N goroutines
+// could all see room for one more and all take it. Many writers race to
+// create names on a single shard, and the count afterwards must be the cap
+// exactly - not "about" the cap.
+func TestCardinalityCapIsExactUnderConcurrentCreation(t *testing.T) {
+	const writers = 32
+
+	s := newStore()
+	now := time.Now()
+	ts := now.UnixMilli()
+
+	// Twice the cap of names, all on one shard, so the writers genuinely
+	// contend for the last slots rather than running out of candidates.
+	names := namesForShard(t, 0, maxMetricsPerShard*2)
+
+	var (
+		created  atomic.Int64
+		refused  atomic.Int64
+		wg       sync.WaitGroup
+		failures = make(chan string, 16)
+	)
+
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			// Interleaved rather than partitioned, so writers collide on
+			// the same names as well as on the same shard.
+			for i := w; i < len(names); i += writers {
+				err := s.record(now, Event{Name: names[i], Value: 1, TS: ts})
+				switch {
+				case err == nil:
+					created.Add(1)
+				case errors.Is(err, errCardinality):
+					refused.Add(1)
+				default:
+					select {
+					case failures <- fmt.Sprintf("unexpected error: %v", err):
+					default:
+					}
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	close(failures)
+
+	for msg := range failures {
+		t.Error(msg)
+	}
+
+	got := int64(metricCount(s))
+	if got > int64(maxMetricsPerShard) {
+		t.Errorf("store holds %d metrics, past the cap of %d - the check and the "+
+			"insert are not atomic", got, maxMetricsPerShard)
+	}
+	if got != int64(maxMetricsPerShard) {
+		t.Errorf("store holds %d metrics, want exactly the cap %d", got, maxMetricsPerShard)
+	}
+	if created.Load() != got {
+		t.Errorf("%d record calls succeeded but the store holds %d metrics",
+			created.Load(), got)
+	}
+	if refused.Load() == 0 {
+		t.Fatal("nothing was refused; the test never reached the cap")
+	}
+}
+
+// A refused event must not be recorded, and everything else must still add
+// up - the project's standing invariant, now with the cap firing throughout.
+func TestRejectedCardinalityEventsAreNeverRecorded(t *testing.T) {
+	const (
+		writers   = 16
+		perWriter = 200
+	)
+
+	s := newStore()
+	now := time.Now()
+	ts := now.UnixMilli()
+
+	// One shard's worth of names plus a flood of new ones on the same shard,
+	// so most of the traffic is refused.
+	names := namesForShard(t, 0, maxMetricsPerShard+writers*perWriter)
+
+	var (
+		accepted atomic.Int64
+		wg       sync.WaitGroup
+	)
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < perWriter; i++ {
+				// Half the traffic re-uses an early (existing) name, half
+				// invents a fresh one.
+				var name string
+				if i%2 == 0 {
+					name = names[i%64]
+				} else {
+					name = names[maxMetricsPerShard+w*perWriter+i]
+				}
+				if err := s.record(now, Event{Name: name, Value: 1, TS: ts}); err == nil {
+					accepted.Add(1)
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	recorded := 0
+	for _, series := range storeDump(s) {
+		agg, ok := mergeBuckets(series, 0)
+		if !ok {
+			continue
+		}
+		recorded += agg.Count
+	}
+
+	if int64(recorded) != accepted.Load() {
+		t.Errorf("record accepted %d events, store holds %d", accepted.Load(), recorded)
+	}
+	if got := metricCount(s); got > maxMetricsPerShard {
+		t.Errorf("store holds %d metrics, past the cap of %d", got, maxMetricsPerShard)
+	}
+}
+
+// The sweeper deletes map entries while writers are creating them and
+// readers are walking them. It takes the same per-shard lock as everything
+// else, so this is the test that says so - Go panics on concurrent map
+// access even without -race, so a dropped lock anywhere here fails loudly.
+//
+// The invariant is one-sided on purpose: a metric written continuously must
+// never be swept, because its newest bucket is always inside the window.
+// Metrics that stop being written may or may not survive depending on when
+// the sweep lands, and asserting otherwise would be asserting a race.
+func TestSweepingConcurrentlyWithWritersAndReaders(t *testing.T) {
+	const (
+		writers   = 16
+		perWriter = 400
+		readers   = 4
+		sweepers  = 2
+	)
+
+	s := newStore()
+	ts := time.Now().UnixMilli()
+
+	var (
+		wgWork   sync.WaitGroup
+		wgBg     sync.WaitGroup
+		done     atomic.Bool
+		accepted atomic.Int64
+	)
+
+	// Written continuously for the whole test, so no sweep may remove it.
+	const alive = "always.written"
+
+	for w := 0; w < writers; w++ {
+		wgWork.Add(1)
+		go func() {
+			defer wgWork.Done()
+			for i := 0; i < perWriter; i++ {
+				now := time.Now()
+				if err := s.record(now, Event{Name: alive, Value: 1, TS: now.UnixMilli()}); err == nil {
+					accepted.Add(1)
+				}
+				// Plus churn: names that are created and then abandoned,
+				// which is exactly what the sweeper is meant to reclaim.
+				churn := fmt.Sprintf("churn.%d", i)
+				_ = s.record(now, Event{Name: churn, Value: 1, TS: ts})
+			}
+		}()
+	}
+
+	for r := 0; r < readers; r++ {
+		wgBg.Add(1)
+		go func() {
+			defer wgBg.Done()
+			w := &discardWriter{}
+			for !done.Load() {
+				s.handleStats(w, httptest.NewRequest(http.MethodGet, "/stats", nil))
+			}
+		}()
+	}
+
+	for sw := 0; sw < sweepers; sw++ {
+		wgBg.Add(1)
+		go func() {
+			defer wgBg.Done()
+			for !done.Load() {
+				s.sweep(time.Now())
+			}
+		}()
+	}
+
+	wgWork.Wait()
+	done.Store(true)
+	wgBg.Wait()
+
+	got, ok := mergeAll(s, alive)
+	if !ok {
+		t.Fatal("the continuously-written metric was swept away")
+	}
+	if int64(got.Count) != accepted.Load() {
+		t.Errorf("record accepted %d events for %s, store holds %d",
+			accepted.Load(), alive, got.Count)
 	}
 }
