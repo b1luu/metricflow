@@ -1429,3 +1429,312 @@ func TestSweepingConcurrentlyWithWritersAndReaders(t *testing.T) {
 			accepted.Load(), alive, got.Count)
 	}
 }
+
+// --- the bounded query under concurrency ---
+
+// statsVia runs a /stats query and decodes it without a *testing.T, so it is
+// safe to call from a goroutine.
+func statsVia(s *Store, query string) (StatsResponse, error) {
+	rec := httptest.NewRecorder()
+	s.handleStats(rec, httptest.NewRequest(http.MethodGet, "/stats"+query, nil))
+
+	var resp StatsResponse
+	if rec.Code != http.StatusOK {
+		return resp, fmt.Errorf("status %d: %s", rec.Code, rec.Body.String())
+	}
+	err := json.Unmarshal(rec.Body.Bytes(), &resp)
+	return resp, err
+}
+
+// §28 moved the merge out from under a whole-shard lock to a per-metric one,
+// which makes the response even less of a single instant than §24 left it.
+// What must survive is the thing that actually matters: no *metric* is ever
+// torn, because its numbers still come from one merge under one lock.
+//
+// Every event for a metric carries that metric's own constant value, so the
+// invariant is checkable from the response alone.
+func TestBoundedStatsIsNeverTornWhileWritersRun(t *testing.T) {
+	const (
+		metrics   = 200
+		perMetric = 2000
+		readers   = 4
+	)
+
+	s := newStore()
+	ts := time.Now().UnixMilli()
+
+	names := make([]string, metrics)
+	value := map[string]float64{}
+	for i := range names {
+		names[i] = fmt.Sprintf("bounded.%04d", i)
+		value[names[i]] = float64(i + 1)
+	}
+
+	var (
+		writers   sync.WaitGroup
+		readersWG sync.WaitGroup
+		done      atomic.Bool
+		pages     atomic.Int64
+		failures  = make(chan string, 32)
+	)
+	fail := func(msg string) {
+		select {
+		case failures <- msg:
+		default:
+		}
+	}
+
+	for _, name := range names {
+		writers.Add(1)
+		go func(name string) {
+			defer writers.Done()
+			now := time.Now()
+			for i := 0; i < perMetric; i++ {
+				_ = s.record(now, Event{Name: name, Value: value[name], TS: ts})
+			}
+		}(name)
+	}
+
+	// Readers use every part of the new surface, so a lock dropped in any
+	// of the three phases shows up here.
+	queries := []string{"", "?limit=10", "?prefix=bounded.01", "?limit=5&after=bounded.0100"}
+	for r := 0; r < readers; r++ {
+		readersWG.Add(1)
+		go func(r int) {
+			defer readersWG.Done()
+			for !done.Load() {
+				resp, err := statsVia(s, queries[r%len(queries)])
+				if err != nil {
+					fail(err.Error())
+					return
+				}
+				pages.Add(1)
+
+				for name, m := range resp.Metrics {
+					v, known := value[name]
+					if !known {
+						fail(fmt.Sprintf("unknown metric %q in a response", name))
+						continue
+					}
+					if m.Avg != v || m.Min != v || m.Max != v {
+						fail(fmt.Sprintf("%s torn: avg/min/max = %v/%v/%v, want %v",
+							name, m.Avg, m.Min, m.Max, v))
+					}
+				}
+				if len(resp.Metrics) > resp.Matched {
+					fail(fmt.Sprintf("returned %d metrics but matched only %d",
+						len(resp.Metrics), resp.Matched))
+				}
+			}
+		}(r)
+	}
+
+	writers.Wait()
+	done.Store(true)
+	readersWG.Wait()
+	close(failures)
+
+	for msg := range failures {
+		t.Error(msg)
+	}
+	if pages.Load() == 0 {
+		t.Fatal("no query completed; the readers never observed the store")
+	}
+
+	for _, name := range names {
+		got, ok := mergeAll(s, name)
+		if !ok {
+			t.Fatalf("%s: nothing recorded", name)
+		}
+		if got.Count != perMetric {
+			t.Errorf("%s: Count = %d, want %d", name, got.Count, perMetric)
+		}
+	}
+}
+
+// Keyset pagination has to cover a stable set of names even while their
+// values are being hammered - the cursor is a name, so writes that do not
+// create or remove names must not be able to disturb the walk.
+func TestPaginationCoversAStableSetWhileValuesChurn(t *testing.T) {
+	const (
+		metrics  = 300
+		pageSize = 17 // not a divisor of metrics
+		writers  = 8
+	)
+
+	s := newStore()
+	ts := time.Now().UnixMilli()
+
+	names := make([]string, metrics)
+	for i := range names {
+		names[i] = fmt.Sprintf("churn.%04d", i)
+		recordNow(s, names[i], 1) // every name exists before paging starts
+	}
+
+	var (
+		wg   sync.WaitGroup
+		done atomic.Bool
+	)
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			now := time.Now()
+			// Until the walk finishes, not a fixed count: a writer that
+			// ran out of work before paging started would leave this
+			// asserting nothing about concurrency.
+			for i := 0; !done.Load(); i++ {
+				// Writes to existing names only: no name is created or
+				// removed while the walk is in progress.
+				_ = s.record(now, Event{Name: names[i%metrics], Value: 1, TS: ts})
+			}
+		}(w)
+	}
+
+	seen := map[string]int{}
+	after := ""
+	for pages := 0; ; pages++ {
+		if pages > metrics {
+			t.Fatal("pagination did not terminate")
+		}
+		resp, err := statsVia(s, fmt.Sprintf("?limit=%d&after=%s", pageSize, after))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for name := range resp.Metrics {
+			seen[name]++
+		}
+		if !resp.Truncated {
+			break
+		}
+		if resp.Next <= after {
+			t.Fatalf("cursor did not advance: %q after %q", resp.Next, after)
+		}
+		after = resp.Next
+	}
+
+	done.Store(true)
+	wg.Wait()
+
+	for _, name := range names {
+		if seen[name] != 1 {
+			t.Errorf("%s was returned %d times, want exactly 1", name, seen[name])
+		}
+	}
+	if len(seen) != metrics {
+		t.Errorf("saw %d distinct metrics, want %d", len(seen), metrics)
+	}
+}
+
+// The window §28 opened: a name is collected in phase one and merged in
+// phase three, and the sweeper (§27) can delete it in between. aggFor then
+// reports no data and the metric is skipped, which is correct - but it is a
+// race that did not exist when the merge happened under the same lock hold
+// as the walk, so it gets a test rather than an assumption.
+func TestQueryingWhileTheSweeperDeletesMetrics(t *testing.T) {
+	const (
+		readers   = 4
+		sweepers  = 2
+		churn     = 3000
+		perWriter = 2
+	)
+
+	s := newStore()
+
+	var (
+		wgWork   sync.WaitGroup
+		wgBg     sync.WaitGroup
+		done     atomic.Bool
+		pages    atomic.Int64
+		failures = make(chan string, 16)
+	)
+
+	// One metric written continuously, so it can never be swept and must
+	// appear in every unfiltered query that reaches it.
+	const alive = "alive.metric"
+	wgWork.Add(1)
+	go func() {
+		defer wgWork.Done()
+		for i := 0; i < churn; i++ {
+			now := time.Now()
+			_ = s.record(now, Event{Name: alive, Value: 1, TS: now.UnixMilli()})
+		}
+	}()
+
+	// Plus names created and immediately abandoned, stamped old enough that
+	// the very next sweep reclaims them.
+	wgWork.Add(1)
+	go func() {
+		defer wgWork.Done()
+		old := time.Now().Add(-window - time.Minute)
+		for i := 0; i < churn; i++ {
+			for v := 0; v < perWriter; v++ {
+				_ = s.record(old, Event{Name: fmt.Sprintf("doomed.%05d", i),
+					Value: 1, TS: old.UnixMilli()})
+			}
+		}
+	}()
+
+	for r := 0; r < readers; r++ {
+		wgBg.Add(1)
+		go func() {
+			defer wgBg.Done()
+			for !done.Load() {
+				resp, err := statsVia(s, "?limit=50")
+				if err != nil {
+					select {
+					case failures <- err.Error():
+					default:
+					}
+					return
+				}
+				pages.Add(1)
+
+				// A metric that came back must be internally consistent;
+				// one that was swept between phases is simply absent, which
+				// is the correct outcome and not an error.
+				for name, m := range resp.Metrics {
+					if m.Count <= 0 {
+						select {
+						case failures <- fmt.Sprintf("%s returned with Count=%d", name, m.Count):
+						default:
+						}
+					}
+					if m.Min > m.Max {
+						select {
+						case failures <- fmt.Sprintf("%s has Min %v > Max %v", name, m.Min, m.Max):
+						default:
+						}
+					}
+				}
+			}
+		}()
+	}
+
+	for sw := 0; sw < sweepers; sw++ {
+		wgBg.Add(1)
+		go func() {
+			defer wgBg.Done()
+			for !done.Load() {
+				s.sweep(time.Now())
+			}
+		}()
+	}
+
+	wgWork.Wait()
+	done.Store(true)
+	wgBg.Wait()
+	close(failures)
+
+	for msg := range failures {
+		t.Error(msg)
+	}
+	if pages.Load() == 0 {
+		t.Fatal("no query completed")
+	}
+
+	// The continuously-written metric survived everything.
+	if _, ok := mergeAll(s, alive); !ok {
+		t.Error("the continuously-written metric was swept away")
+	}
+}
