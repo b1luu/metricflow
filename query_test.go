@@ -401,3 +401,125 @@ func TestStatsIsBoundedWithNoParameters(t *testing.T) {
 		t.Error("truncated = false while 250 metrics were left out")
 	}
 }
+
+// --- bounded selection ---
+
+// The bounded selector replaces "collect everything, sort, truncate". It has
+// to agree with that exactly, so the test *is* that comparison, over random
+// input including duplicates of the hard cases: limits larger than the
+// input, limits of one, and inputs already in order or in reverse.
+func TestNameSelectorAgreesWithSortAndTruncate(t *testing.T) {
+	naive := func(in []string, limit int) []string {
+		out := slices.Clone(in)
+		slices.Sort(out)
+		if len(out) > limit {
+			out = out[:limit]
+		}
+		return out
+	}
+
+	// A deterministic pseudo-random order, so a failure is reproducible.
+	shuffled := func(n int) []string {
+		out := make([]string, n)
+		for i := range out {
+			out[i] = fmt.Sprintf("name.%06d", (i*7919+104729)%n)
+		}
+		return out
+	}
+	ascending := func(n int) []string {
+		out := make([]string, n)
+		for i := range out {
+			out[i] = fmt.Sprintf("name.%06d", i)
+		}
+		return out
+	}
+	descending := func(n int) []string {
+		out := ascending(n)
+		slices.Reverse(out)
+		return out
+	}
+
+	shapes := map[string]func(int) []string{
+		"shuffled":   shuffled,
+		"ascending":  ascending,
+		"descending": descending,
+	}
+
+	for shape, build := range shapes {
+		for _, n := range []int{0, 1, 2, 7, 999, 1000, 1001, 5000} {
+			for _, limit := range []int{1, 2, 10, 999, 1000} {
+				name := fmt.Sprintf("%s/n=%d/limit=%d", shape, n, limit)
+				t.Run(name, func(t *testing.T) {
+					in := build(n)
+
+					sel := newNameSelector(limit)
+					for _, s := range in {
+						sel.add(s)
+					}
+					got := sel.result()
+
+					if want := naive(in, limit); !slices.Equal(got, want) {
+						t.Errorf("selector gave %d names, sort-and-truncate gave %d; first difference at %s",
+							len(got), len(want), firstDiff(got, want))
+					}
+				})
+			}
+		}
+	}
+}
+
+func firstDiff(a, b []string) string {
+	for i := 0; i < len(a) && i < len(b); i++ {
+		if a[i] != b[i] {
+			return fmt.Sprintf("index %d: %q vs %q", i, a[i], b[i])
+		}
+	}
+	return fmt.Sprintf("length %d vs %d", len(a), len(b))
+}
+
+// The bound is on memory, and it is the reason the selector exists: without
+// it a query against a full store gathers one string header per metric
+// simply to discard almost all of them.
+func TestNameSelectorNeverHoldsMoreThanTwiceItsLimit(t *testing.T) {
+	const limit = 10
+
+	sel := newNameSelector(limit)
+	for i := 0; i < 10_000; i++ {
+		sel.add(fmt.Sprintf("name.%06d", i))
+		if len(sel.names) > 2*limit {
+			t.Fatalf("after %d names the selector holds %d, more than twice its limit of %d",
+				i+1, len(sel.names), limit)
+		}
+		if cap(sel.names) > 2*limit {
+			t.Fatalf("after %d names the backing array grew to %d, past twice the limit",
+				i+1, cap(sel.names))
+		}
+	}
+	if len(sel.result()) != limit {
+		t.Errorf("result holds %d names, want %d", len(sel.result()), limit)
+	}
+}
+
+// matched counts every name the query covered, even the ones the selector
+// threw away immediately - that is what tells a caller it is seeing part of
+// something larger.
+func TestSelectNamesCountsMatchesItDiscards(t *testing.T) {
+	const total = 2000
+
+	s := newStore()
+	now := time.Now()
+	for i := 0; i < total; i++ {
+		ev := Event{Name: fmt.Sprintf("discard.%05d", i), Value: 1, TS: now.UnixMilli()}
+		if err := s.record(now, ev); err != nil {
+			t.Fatalf("metric %d: %v", i, err)
+		}
+	}
+
+	names, matched := s.selectNames(statsQuery{window: window, limit: 5})
+	if len(names) != 5 {
+		t.Errorf("kept %d names, want 5", len(names))
+	}
+	if matched != total {
+		t.Errorf("matched = %d, want %d - discarded names still matched", matched, total)
+	}
+}

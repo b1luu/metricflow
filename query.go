@@ -94,36 +94,92 @@ func (q statsQuery) matches(name string) bool {
 	return strings.HasPrefix(name, q.prefix) && name > q.after
 }
 
-// selectNames returns the names this query covers, sorted, truncated to the
-// limit - and separately how many matched before truncation.
+// nameSelector keeps the smallest `limit` names it is shown, while never
+// holding more than twice that many.
 //
-// Only names are collected here, never aggregates. That is the whole point:
-// holding a shard lock to append strings is cheap and brief, where the old
-// code held it through a bucket merge and a histogram sort for every metric
-// in the shard. Sorting happens after every lock is released.
+// The obvious implementation - collect every matching name, sort, truncate -
+// is correct but allocates in proportion to the store: at full cardinality
+// that was 2.6 MB of names gathered to keep 1000 of them, which is the same
+// "one small request, unbounded work" shape §28 set out to remove, just
+// moved from CPU to memory.
 //
-// Sorted order is not decoration. It makes a response reproducible, and it
-// is what lets `after` page through the store without a cursor the server
-// has to remember - keyset pagination over a key that already exists.
+// Once `limit` names are in hand, any name at or past the largest of them
+// cannot make the final cut, so it is rejected by a single string compare
+// and never stored. The cutoff falls quickly, so nearly every name after the
+// first few hundred costs one comparison and nothing else.
+type nameSelector struct {
+	limit  int
+	names  []string
+	cutoff string // largest name currently kept; meaningful only when full
+	full   bool
+}
+
+func newNameSelector(limit int) *nameSelector {
+	// Room for one compaction's worth of overshoot, allocated once.
+	return &nameSelector{limit: limit, names: make([]string, 0, 2*limit)}
+}
+
+func (ns *nameSelector) add(name string) {
+	// Names are unique across the store - a metric lives in exactly one
+	// shard - so an equal name is the same name, and skipping it is free.
+	if ns.full && name >= ns.cutoff {
+		return
+	}
+	ns.names = append(ns.names, name)
+	if len(ns.names) >= 2*ns.limit {
+		ns.compact()
+	}
+}
+
+func (ns *nameSelector) compact() {
+	slices.Sort(ns.names)
+	if len(ns.names) > ns.limit {
+		ns.names = ns.names[:ns.limit]
+	}
+	if len(ns.names) == ns.limit {
+		ns.full = true
+		ns.cutoff = ns.names[ns.limit-1]
+	}
+}
+
+// result returns the kept names, sorted.
+func (ns *nameSelector) result() []string {
+	ns.compact()
+	return ns.names
+}
+
+// selectNames returns the names this query covers, sorted and truncated to
+// the limit - and separately how many matched before truncation.
+//
+// Only names are looked at here, never aggregates. That is the whole point:
+// holding a shard lock to test and maybe keep a string is cheap and brief,
+// where the old code held it through a bucket merge and a histogram sort for
+// every metric in the shard.
+//
+// Sorted order is not decoration. It makes a truncated response
+// reproducible - map order is random, so an unsorted selection would return
+// a different subset every call - and it is what lets `after` page through
+// the store with no cursor the server has to remember.
 func (s *Store) selectNames(q statsQuery) (names []string, matched int) {
+	sel := newNameSelector(q.limit)
+
 	for i := range s.shards {
 		sh := &s.shards[i]
 
 		sh.mu.Lock()
 		for name := range sh.aggs {
 			if q.matches(name) {
-				names = append(names, name)
+				// Counted before the selector decides, because matched is
+				// the whole truth about the query and the selector only
+				// keeps the part that fits.
+				matched++
+				sel.add(name)
 			}
 		}
 		sh.mu.Unlock()
 	}
 
-	matched = len(names)
-	slices.Sort(names)
-	if len(names) > q.limit {
-		names = names[:q.limit]
-	}
-	return names, matched
+	return sel.result(), matched
 }
 
 // handleStats: GET /stats - per-metric aggregate over a time window, as JSON.
