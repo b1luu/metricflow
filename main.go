@@ -430,7 +430,11 @@ func routes(s *Store, a *Alerter, l *limiter) http.Handler {
 	}
 
 	mux.HandleFunc("/health", allow(http.MethodGet, handleHealth))
-	return mux
+
+	// Outermost, so it covers /health and the limiter as well as the
+	// handlers - a route that is exempt from shedding should not also be
+	// exempt from having its panics turned into an answer.
+	return recoverPanic(mux)
 }
 
 // defaultRules is this program's alert configuration. Rules live in code on

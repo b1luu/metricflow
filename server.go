@@ -9,9 +9,12 @@ package main
 // client and a genuine firehose, so the failure modes are not hypothetical.
 
 import (
+	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -165,3 +168,75 @@ func (l *limiter) limit(h http.Handler) http.Handler {
 // tests rather than to clients: it is a property of the server, not of the
 // metrics, and putting it in /stats would mix the two.
 func (l *limiter) shedded() int64 { return l.shed.Load() }
+
+// --- panic recovery on the request path ---
+
+// statusWriter records whether anything has been written yet, which is the
+// only thing that decides what a recovered panic can still do about the
+// response.
+type statusWriter struct {
+	http.ResponseWriter
+	wrote bool
+}
+
+func (sw *statusWriter) WriteHeader(code int) {
+	sw.wrote = true
+	sw.ResponseWriter.WriteHeader(code)
+}
+
+func (sw *statusWriter) Write(b []byte) (int, error) {
+	sw.wrote = true
+	return sw.ResponseWriter.Write(b)
+}
+
+// recoverPanic turns a panicking handler into a 500 instead of a dropped
+// connection.
+//
+// net/http already recovers handler panics, so this is not about keeping the
+// server alive - it is about what the client is told. The stdlib's recovery
+// closes the connection without a response, so a client sees a transport
+// error and cannot tell a server bug from a network blip. For this project
+// that distinction is load-bearing: §26 taught loadgen that a request with
+// no response is *unknown*, because the server may have recorded it before
+// failing, and verify widens its check by exactly that much. A panic that
+// arrives as a 500 is a definite failure and stays out of that bucket; the
+// same panic as a dropped connection quietly erodes the exactness claim.
+//
+// It also keeps the connection usable, which matters to a keep-alive client
+// that would otherwise pay a handshake for someone else's bug.
+//
+// Two cases it deliberately does not swallow:
+//
+//   - http.ErrAbortHandler is the documented way to abandon a response on
+//     purpose. Converting it to a 500 would break the one panic that is not
+//     a bug.
+//   - A panic after the response has started cannot become a 500, because
+//     the status is already sent. Swallowing it would hand the client a
+//     truncated body under a 200 - corrupt data that looks complete, which
+//     is the worst outcome available in a project built on exactness. It is
+//     re-panicked so net/http drops the connection and the client sees a
+//     broken transfer, which is at least honest.
+func recoverPanic(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sw := &statusWriter{ResponseWriter: w}
+
+		defer func() {
+			v := recover()
+			if v == nil {
+				return
+			}
+			if err, ok := v.(error); ok && errors.Is(err, http.ErrAbortHandler) {
+				panic(v) // deliberate, and net/http's to handle
+			}
+
+			log.Printf("PANIC in %s %s: %v\n%s", r.Method, r.URL.Path, v, debug.Stack())
+
+			if sw.wrote {
+				panic(v) // too late for a status; let the connection break
+			}
+			http.Error(sw, "internal error", http.StatusInternalServerError)
+		}()
+
+		h.ServeHTTP(sw, r)
+	})
+}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -480,5 +481,171 @@ func TestAPanickingSweeperDoesNotKillTheProcess(t *testing.T) {
 	recordNow(s, "still.here", 1)
 	if got, ok := mergeAll(s, "still.here"); !ok || got.Count != 1 {
 		t.Errorf("store unusable after a supervised panic: %+v (ok=%v)", got, ok)
+	}
+}
+
+// --- panic recovery on the request path ---
+
+// The point is not keeping the server alive - net/http already does that.
+// It is that the client gets a definite answer. A dropped connection lands
+// in loadgen's "unknown" bucket (§26), where the server may or may not have
+// recorded the events; a 500 is a fact.
+func TestRecoverPanicAnswers500AndKeepsTheConnection(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/boom", func(http.ResponseWriter, *http.Request) {
+		panic("handler exploded")
+	})
+	mux.HandleFunc("/fine", func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprintln(w, "ok")
+	})
+
+	var srv *httptest.Server
+	out := captureLog(t, func() {
+		srv = httptest.NewServer(recoverPanic(mux))
+		defer srv.Close()
+
+		resp, err := srv.Client().Get(srv.URL + "/boom")
+		if err != nil {
+			t.Fatalf("the connection was dropped instead of answered: %v", err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusInternalServerError {
+			t.Errorf("status = %d, want 500 (body %q)", resp.StatusCode, body)
+		}
+
+		// The same connection must still be usable, or a keep-alive client
+		// pays a handshake for somebody else's bug.
+		resp, err = srv.Client().Get(srv.URL + "/fine")
+		if err != nil {
+			t.Fatalf("the next request failed: %v", err)
+		}
+		body, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || strings.TrimSpace(string(body)) != "ok" {
+			t.Errorf("after a panic: status %d body %q, want 200 and ok", resp.StatusCode, body)
+		}
+	})
+
+	// A swallowed panic that leaves no trace is a bug hidden behind a
+	// healthy-looking server.
+	if !strings.Contains(out, "PANIC in GET /boom") {
+		t.Errorf("the panic was not logged with its method and path:\n%s", out)
+	}
+	if !strings.Contains(out, "handler exploded") {
+		t.Errorf("the panic value was not logged:\n%s", out)
+	}
+}
+
+// http.ErrAbortHandler is the documented way to abandon a response on
+// purpose. Turning it into a 500 would break the one panic that is not a bug.
+func TestRecoverPanicLetsErrAbortHandlerThrough(t *testing.T) {
+	h := recoverPanic(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		panic(http.ErrAbortHandler)
+	}))
+
+	var got any
+	func() {
+		defer func() { got = recover() }()
+		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
+	}()
+
+	if got == nil {
+		t.Fatal("ErrAbortHandler was swallowed; net/http never saw the deliberate abort")
+	}
+	if err, ok := got.(error); !ok || !errors.Is(err, http.ErrAbortHandler) {
+		t.Errorf("re-panicked with %v, want http.ErrAbortHandler", got)
+	}
+}
+
+// A panic after the response has started cannot become a 500 - the status is
+// already on the wire. Swallowing it would hand the client a truncated body
+// under a 200, which is corrupt data that looks complete: the worst outcome
+// available in a project built on exactness.
+func TestRecoverPanicDoesNotHideATruncatedResponse(t *testing.T) {
+	h := recoverPanic(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, `{"metrics":{"a":`)
+		panic("died mid-body")
+	}))
+
+	rec := httptest.NewRecorder()
+	var got any
+	_ = captureLog(t, func() {
+		defer func() { got = recover() }()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/stats", nil))
+	})
+
+	if got == nil {
+		t.Fatal("a mid-response panic was swallowed; the client would see a truncated body under a 200")
+	}
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d; the 200 was already sent and cannot be rewritten", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "internal error") {
+		t.Error("an error message was appended to a partial body, corrupting it further")
+	}
+}
+
+// Recovery must not change anything about a request that does not panic.
+func TestRecoverPanicIsTransparentOtherwise(t *testing.T) {
+	h := recoverPanic(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTeapot)
+		fmt.Fprint(w, `{"ok":true}`)
+	}))
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+
+	if rec.Code != http.StatusTeapot {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusTeapot)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/json" {
+		t.Errorf("Content-Type = %q, want application/json", got)
+	}
+	if rec.Body.String() != `{"ok":true}` {
+		t.Errorf("body = %q, want it untouched", rec.Body.String())
+	}
+}
+
+// recoverPanic wraps the whole mux rather than each handler, so one route
+// proving it is in the chain proves it for every route - including /health,
+// which is exempt from shedding but must not be exempt from having its
+// panics turned into an answer.
+//
+// The panic is a real one rather than a test hook: a Store whose shard maps
+// were never initialised makes record panic on "assignment to entry in nil
+// map", which is a plausible shape for an actual bug.
+//
+// Note there is deliberately no recover() in this test. If the middleware
+// were missing, the panic would escape and take the test binary down - which
+// is exactly what it used to do to the server.
+func TestRoutesAreWrappedInPanicRecovery(t *testing.T) {
+	a, err := newAlerter(time.Now(), newStore(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := routes(&Store{}, a, newLimiter(maxInFlight))
+
+	rec := httptest.NewRecorder()
+	out := captureLog(t, func() {
+		h.ServeHTTP(rec, httptest.NewRequest(
+			http.MethodPost, "/ingest", strings.NewReader(ingestJSON("cpu.load", 1))))
+	})
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", rec.Code)
+	}
+	if !strings.Contains(out, "PANIC in POST /ingest") {
+		t.Errorf("the panic was not logged:\n%s", out)
+	}
+
+	// And the rest of the mux still works through the same wrapper.
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if rec.Code != http.StatusOK {
+		t.Errorf("/health returned %d through the recovery wrapper, want 200", rec.Code)
 	}
 }
