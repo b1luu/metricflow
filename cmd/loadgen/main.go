@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -610,25 +611,94 @@ type statsResponse struct {
 		Min   float64 `json:"min"`
 		Max   float64 `json:"max"`
 	} `json:"metrics"`
+
+	// The server bounds how many metrics one response computes (§28), so a
+	// single GET is no longer the whole store. These are how it says so.
+	Matched   int    `json:"matched"`
+	Truncated bool   `json:"truncated"`
+	Next      string `json:"next"`
+}
+
+// runPrefix is the name prefix every metric this run generates shares. It
+// scopes verification to this run, and passing it to the server narrows the
+// work a query does rather than filtering afterwards.
+func (c config) runPrefix() string {
+	if c.runID == "" {
+		return "metric."
+	}
+	return fmt.Sprintf("metric.%s.", c.runID)
+}
+
+// maxVerifyPages bounds the paging loop. A harness that can hang is worse
+// than one that fails: this turns a server whose cursor does not advance
+// into an error with a number in it rather than a build that never ends.
+const maxVerifyPages = 10000
+
+// fetchRecorded pages through /stats and sums the counts of this run's
+// metrics.
+//
+// Paging is not optional any more. /stats returns at most the server's own
+// limit, so the single GET this used to do would have silently counted the
+// first page and declared everything else lost - which is exactly the
+// "wrong data with a 200 on it" that §28's truncated flag exists to prevent
+// a client from believing.
+//
+// The prefix is also applied client-side, not only sent. Verification must
+// not depend on the server having honoured a query parameter, since a server
+// that ignored it is precisely the kind of bug this is here to catch.
+func fetchRecorded(client *http.Client, cfg config) (recorded int, window string, err error) {
+	prefix := cfg.runPrefix()
+	base := strings.TrimSuffix(cfg.target, "/") + "/stats"
+	after := ""
+
+	for page := 0; ; page++ {
+		if page >= maxVerifyPages {
+			return 0, "", fmt.Errorf("/stats did not finish paging after %d pages", maxVerifyPages)
+		}
+
+		u := fmt.Sprintf("%s?prefix=%s&after=%s",
+			base, url.QueryEscape(prefix), url.QueryEscape(after))
+
+		resp, err := client.Get(u)
+		if err != nil {
+			return 0, "", fmt.Errorf("fetching /stats: %w", err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			return 0, "", fmt.Errorf("/stats returned %d", resp.StatusCode)
+		}
+
+		var stats statsResponse
+		decErr := json.NewDecoder(resp.Body).Decode(&stats)
+		resp.Body.Close()
+		if decErr != nil {
+			return 0, "", fmt.Errorf("decoding /stats: %w", decErr)
+		}
+		window = stats.Window
+
+		for name, m := range stats.Metrics {
+			if strings.HasPrefix(name, prefix) {
+				recorded += m.Count
+			}
+		}
+
+		if !stats.Truncated {
+			return recorded, window, nil
+		}
+		if stats.Next <= after {
+			return 0, "", fmt.Errorf("/stats cursor did not advance past %q", after)
+		}
+		after = stats.Next
+	}
 }
 
 // verify is the claim the in-process benchmarks cannot make: after a real
 // run over a real socket, the server recorded exactly as many events as it
 // told us it accepted. Returns an error if they disagree.
 func verify(client *http.Client, cfg config, total tally, elapsed time.Duration, w io.Writer) error {
-	resp, err := client.Get(strings.TrimSuffix(cfg.target, "/") + "/stats")
+	recorded, reportedWindow, err := fetchRecorded(client, cfg)
 	if err != nil {
-		return fmt.Errorf("fetching /stats: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("/stats returned %d", resp.StatusCode)
-	}
-
-	var stats statsResponse
-	if err := json.NewDecoder(resp.Body).Decode(&stats); err != nil {
-		return fmt.Errorf("decoding /stats: %w", err)
+		return err
 	}
 
 	// The server reports the window it applied, so we can tell whether this
@@ -636,35 +706,15 @@ func verify(client *http.Client, cfg config, total tally, elapsed time.Duration,
 	// longer than the window has already had its early events evicted -
 	// the server would be *correct* to report fewer, so asserting equality
 	// would be the harness lying, not the server.
-	win, err := time.ParseDuration(stats.Window)
+	win, err := time.ParseDuration(reportedWindow)
 	if err != nil {
-		return fmt.Errorf("unparseable window %q from /stats: %w", stats.Window, err)
+		return fmt.Errorf("unparseable window %q from /stats: %w", reportedWindow, err)
 	}
 	if elapsed >= win {
 		fmt.Fprintf(w, "verify: skipped - the run (%s) is at least as long as the server's "+
 			"%s window, so the earliest events have already aged out\n",
 			elapsed.Round(time.Millisecond), win)
 		return nil
-	}
-
-	recorded := 0
-	if cfg.cardinality > 0 {
-		// In cardinality mode the names are workers x -cardinality of them,
-		// and most were refused and never created, so enumerating them all
-		// to look each one up would be mostly misses. Every name this run
-		// generates carries the run ID, so summing by that prefix finds
-		// exactly this run's metrics and no others - which is the property
-		// the run ID was introduced for in the first place.
-		prefix := fmt.Sprintf("metric.%s.", cfg.runID)
-		for name, m := range stats.Metrics {
-			if strings.HasPrefix(name, prefix) {
-				recorded += m.Count
-			}
-		}
-	} else {
-		for i := 0; i < cfg.metrics; i++ {
-			recorded += stats.Metrics[cfg.metricName(i)].Count
-		}
 	}
 
 	// total.accepted is the server's own answer in both modes: a count of

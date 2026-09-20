@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -934,5 +935,141 @@ func TestVerifySumsByPrefixInCardinalityMode(t *testing.T) {
 
 	if err := verify(newClient(1), cfg, tal, time.Second, io.Discard); err != nil {
 		t.Fatalf("verify: %v", err)
+	}
+}
+
+// --- paging through /stats ---
+
+// pagedStatsServer serves a metric set the way the real server now does:
+// sorted, at most pageSize per response, with truncated and next set. A
+// verify that does not page sees only the first slice of it.
+func pagedStatsServer(t *testing.T, window string, counts map[string]int, pageSize int) *httptest.Server {
+	t.Helper()
+
+	names := make([]string, 0, len(counts))
+	for n := range counts {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		prefix := r.URL.Query().Get("prefix")
+		after := r.URL.Query().Get("after")
+
+		matched := make([]string, 0, len(names))
+		for _, n := range names {
+			if strings.HasPrefix(n, prefix) && n > after {
+				matched = append(matched, n)
+			}
+		}
+
+		page := matched
+		if len(page) > pageSize {
+			page = page[:pageSize]
+		}
+
+		type metric struct {
+			Count int     `json:"count"`
+			Avg   float64 `json:"avg"`
+			Min   float64 `json:"min"`
+			Max   float64 `json:"max"`
+		}
+		out := struct {
+			Window    string            `json:"window"`
+			Metrics   map[string]metric `json:"metrics"`
+			Matched   int               `json:"matched"`
+			Truncated bool              `json:"truncated"`
+			Next      string            `json:"next,omitempty"`
+		}{Window: window, Metrics: map[string]metric{}, Matched: len(matched)}
+
+		for _, n := range page {
+			out.Metrics[n] = metric{Count: counts[n]}
+		}
+		if len(matched) > len(page) {
+			out.Truncated = true
+			out.Next = page[len(page)-1]
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(out)
+	}))
+	return srv
+}
+
+// The regression this guards: /stats is bounded now, so a verify that reads
+// one page counts a fraction of the store and reports every other event as
+// lost. Against a real server that was 56000 of 1790472.
+func TestVerifyPagesThroughABoundedStats(t *testing.T) {
+	const (
+		metrics   = 250
+		perMetric = 40
+		pageSize  = 17 // not a divisor of metrics
+	)
+
+	cfg := config{metrics: 1, runID: "abc", duration: time.Second, cardinality: 10}
+
+	counts := map[string]int{}
+	for i := 0; i < metrics; i++ {
+		counts[fmt.Sprintf("metric.abc.0.card.%04d", i)] = perMetric
+	}
+	// Another run's data, still inside the window, must stay excluded.
+	counts["metric.zzz.0.card.0000"] = 999999
+
+	srv := pagedStatsServer(t, "1m0s", counts, pageSize)
+	defer srv.Close()
+	cfg.target = srv.URL
+
+	tal := newTally()
+	tal.accepted = metrics * perMetric
+
+	if err := verify(newClient(1), cfg, tal, time.Second, io.Discard); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+}
+
+// A server whose cursor does not advance would hang a paging client
+// forever. A harness that can hang is worse than one that fails.
+func TestVerifyGivesUpOnACursorThatDoesNotAdvance(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// Always truncated, always the same cursor.
+		fmt.Fprint(w, `{"window":"1m0s","metrics":{},"matched":10,"truncated":true,"next":"stuck"}`)
+	}))
+	defer srv.Close()
+
+	cfg := config{metrics: 1, runID: "abc", duration: time.Second, target: srv.URL}
+	tal := newTally()
+	tal.accepted = 1
+
+	err := verify(newClient(1), cfg, tal, time.Second, io.Discard)
+	if err == nil {
+		t.Fatal("verify followed a stuck cursor without complaining")
+	}
+	if !strings.Contains(err.Error(), "cursor did not advance") {
+		t.Errorf("error = %q, want it to name the stuck cursor", err)
+	}
+}
+
+// Filtering by prefix is applied client-side as well as sent, because a
+// server that ignored the parameter is exactly the bug this is here to
+// catch - verification must not rest on the thing under test cooperating.
+func TestVerifyFiltersByPrefixEvenIfTheServerDoesNot(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		// Ignores prefix entirely and hands back everything it has.
+		fmt.Fprint(w, `{"window":"1m0s","metrics":{
+			"metric.abc.0":{"count":100},
+			"metric.other.0":{"count":500},
+			"unrelated":{"count":9000}
+		},"matched":3,"truncated":false}`)
+	}))
+	defer srv.Close()
+
+	cfg := config{metrics: 1, runID: "abc", duration: time.Second, target: srv.URL}
+	tal := newTally()
+	tal.accepted = 100
+
+	if err := verify(newClient(1), cfg, tal, time.Second, io.Discard); err != nil {
+		t.Fatalf("verify counted metrics outside this run: %v", err)
 	}
 }
