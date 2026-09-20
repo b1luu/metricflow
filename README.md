@@ -25,7 +25,7 @@ exits; a second `Ctrl-C` kills immediately.
 | GET    | `/health` | Liveness check. Returns `ok`.                          |
 | POST   | `/ingest` | Submit one metric event as a JSON body.                |
 | POST   | `/ingest/batch` | Submit many events as newline-delimited JSON.    |
-| GET    | `/stats`  | Per-metric count/avg/min/max and p50/p90/p99 over a time window (JSON, default 60s). |
+| GET    | `/stats`  | Per-metric count/avg/min/max and p50/p90/p99 over a time window (JSON, default 60s). Bounded — see below. |
 | GET    | `/alerts` | Current state of every alert rule (JSON).              |
 
 `/alerts` reports each rule as `ok`, `pending`, `firing`, or `nodata`, with
@@ -70,6 +70,30 @@ events per request — past that you are buying very little and paying for it in
 latency and in how much one dropped connection costs. See [DESIGN.md](DESIGN.md)
 §25 for the measurements and for what the batch path deliberately does *not*
 optimise.
+
+## Querying
+
+`/stats` is bounded. It computes at most 1000 metrics per request, whatever
+the store holds, and says so:
+
+```json
+{"window":"1m0s","metrics":{...},"matched":32768,"truncated":true,"next":"svc.api.z"}
+```
+
+`?prefix=` narrows by name, `?limit=` narrows how many metrics are computed
+(it may only narrow — asking for more is a `400`, not a silent clamp), and
+`?after=` continues from a previous page's `next`.
+
+This exists because it was the last unbounded thing in the server. With the
+store at its cardinality ceiling, one ~30-byte `GET /stats` used to cost
+77 ms of CPU and 62 MB of allocation — and the concurrency limiter will admit
+256 at once. It is now 3.7 ms and 1.2 MB, and the allocation count no longer
+depends on how many metrics exist at all. A narrow `?prefix=` query is 364 µs.
+
+Two details worth knowing as a client: `matched` counts metric *names*, so a
+page can hold fewer metrics than its limit without being the last page (a
+metric whose data has aged out is skipped); and `next` is the last name
+*considered*, so following it never stalls on such a gap.
 
 ## Percentiles
 
@@ -266,7 +290,9 @@ reasoning behind these and other choices.
 Done: single-event and batch ingest with validation, windowed aggregation over event time, per-metric
 stats with a configurable query window, percentiles from a bounded histogram,
 an alerting layer with flap suppression, graceful shutdown, a fully
-timed-out HTTP server that sheds load rather than queueing it, a bounded
+timed-out HTTP server that sheds load rather than queueing it, panic
+recovery on both the request path and the background loops, a bounded and
+pageable query path, a bounded
 metric cardinality with a sweeper to reclaim idle names, a store whose lock
 is sharded by metric name (14.9x on concurrent writes to distinct metrics,
 measured before and after), a batch endpoint that turns that into 50x end to
@@ -286,4 +312,6 @@ scheme — 159 ns/op against 10 ns/op for writes to distinct metrics (§24); and
 the concurrency limit is global rather than per-client, so one noisy client can
 consume every slot and shed everyone else (§26) — and for the same reason
 (no notion of client identity) one client's metric names can fill a shard that
-another client's legitimate new metric then cannot enter (§27).
+another client's legitimate new metric then cannot enter (§27); and listing
+metrics is still O(cardinality) even when the answer is bounded, because
+"which metrics exist" has no index behind it (§28).

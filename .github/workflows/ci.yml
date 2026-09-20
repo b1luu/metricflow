@@ -108,6 +108,32 @@ jobs:
       - name: a cardinality flood must be refused, and stay exact
         run: ./loadgen -duration 5s -workers 8 -batch 50 -cardinality 20000 -expect-cardinality
 
+      # §28: the flood above leaves the store at its cardinality ceiling,
+      # which is exactly the state that used to make one GET /stats cost
+      # 77 ms and 62 MB. The response must now be a strict, self-describing
+      # subset. Asserted as a property rather than against the constant, so
+      # this does not have to be edited when the limit is tuned.
+      - name: /stats must stay bounded with the store full
+        run: |
+          body=$(curl -sf --max-time 10 localhost:8080/stats)
+          returned=$(echo "$body" | jq '.metrics | length')
+          matched=$(echo "$body" | jq '.matched')
+          truncated=$(echo "$body" | jq '.truncated')
+          echo "returned=$returned matched=$matched truncated=$truncated"
+
+          if [ "$matched" -lt 1000 ]; then
+            echo "only $matched metrics matched; the flood did not fill the store, so this proves nothing"
+            exit 1
+          fi
+          if [ "$returned" -ge "$matched" ]; then
+            echo "/stats returned $returned of $matched metrics - the response is not bounded"
+            exit 1
+          fi
+          if [ "$truncated" != "true" ]; then
+            echo "/stats dropped $((matched - returned)) metrics without saying so"
+            exit 1
+          fi
+
       - name: shut down cleanly
         run: |
           kill -TERM "$(cat server.pid)"

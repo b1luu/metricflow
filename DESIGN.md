@@ -1264,6 +1264,155 @@ against a server with no limit.
   value distribution costs the same as any other, because §23's histogram is
   bounded by construction.
 
+### 28. Bounding the cost of a query, and surviving a panic
+
+§27 fixed the last unbounded *input* and, in doing so, created the problem
+this section is about. Capping cardinality bounded memory — but it also made
+the ceiling reachable and stable. An attacker can push the store to exactly
+`shardCount × maxMetricsPerShard` names and park it there, and every `/stats`
+then merged all 32 768 of them and sorted a histogram per metric for three
+quantiles.
+
+Measured before this change, at full cardinality: **77.2 ms of CPU, 62.2 MB
+of allocation, and a 4.05 MB body — for one ~30-byte unauthenticated GET.**
+§26's limiter admits 256 concurrent requests, so that is ~16 GB of allocation
+churn and 20 CPU-seconds from clients sending 8 KB between them. §26 made
+*shedding* cost 179 ns precisely so overload would be cheap to refuse; this
+was the one endpoint where a single **admitted** request was expensive enough
+to make that irrelevant. The cardinality cap had traded a memory exhaustion
+for a CPU amplification, and the amplification was the larger of the two.
+
+Every limit up to here bounded an input — body size (§17, §25), time and
+concurrency (§26), cardinality (§27). None bounded the work one request could
+ask for.
+
+**Three phases.** `/stats` now collects names under each shard lock in turn,
+then sorts and selects holding no lock at all, then merges each selected
+metric under its own shard lock.
+
+Phase three is where the quiet win is: `aggFor` returns an `Agg` whose
+histogram `mergeBuckets` freshly allocated (§23 pins that with a test), so
+the quantile sort — the expensive part — happens on a private copy *outside*
+the lock, with nobody waiting on it. The lock-hold consequence matters as
+much to ingest as the CPU does: the old code held one shard's lock through
+~1024 merges and sorts; the longest hold is now a single metric's merge.
+
+**Bounded selection.** Collecting every matching name and then sorting would
+still allocate in proportion to the store — 2.6 MB of names gathered to keep
+1000 — which is the same "one small request, unbounded work" shape moved from
+CPU to memory. `nameSelector` keeps the smallest `limit` names while never
+holding more than twice that many: once full, any name at or past the largest
+it is keeping cannot make the cut, so it is rejected by one string compare
+and never stored. The cutoff falls quickly, so nearly every name past the
+first few hundred costs a comparison and nothing else.
+
+| at 32 768 metrics | before | three phases | + bounded selection |
+| --- | --- | --- | --- |
+| `/stats` | 77.2 ms / 62.2 MB | 6.11 ms / 3.83 MB | **3.72 ms / 1.19 MB** |
+| `selectNames` | — | 4.00 ms / 2.64 MB / 23 allocs | **1.33 ms / 32.8 kB / 1 alloc** |
+
+**20.8× faster and 52× less allocated**, with the allocation *count* flat at
+~10 000 whatever the store holds — which is what a bound looks like. A narrow
+`?prefix=` query is 364 µs. 256 concurrent requests now churn ~305 MB rather
+than ~16 GB.
+
+**`?limit=` may only narrow**, exactly as `?window=` may only narrow retention
+(§11): it is both the default and the ceiling, because a limit a caller can
+raise is not a limit and this endpoint is unauthenticated. Out-of-range
+values are rejected rather than clamped — a caller who asks for 50 000 and
+silently receives 1000 has been handed wrong data with a 200 attached.
+
+**Sorted order is load-bearing, not decoration.** Map iteration order in Go is
+deliberately random and the names are spread across 32 shards, so an unsorted
+selection would return a different subset on every call. Sorting makes a
+truncated response reproducible, and it is what lets `?after=` page through
+the store with no cursor the server has to remember — keyset pagination over
+a key that already exists.
+
+**A bounded answer that does not say it is bounded is a wrong answer**, so the
+response carries `matched`, `truncated` and `next`. Two subtleties are worth
+stating because both have tests:
+
+- `matched` counts **names**, not metrics with data. Whether a metric has
+  anything inside the window is only known after merging it, which is exactly
+  the work the limit exists to avoid doing for everything. So a page can hold
+  fewer metrics than its limit without being the last page.
+- `next` is the last name **considered**, not the last one returned. Paging
+  from the last returned name would stall forever on a run of metrics whose
+  buckets have all aged out.
+
+That flag immediately earned itself: bounding `/stats` broke `loadgen`, which
+read one response and summed it, reporting "accepted 1790472 events but
+recorded 56000". `verify` now follows the cursor until the response says it
+is complete. It applies the prefix client-side as well as sending it, because
+a server ignoring the parameter is precisely the bug the harness exists to
+catch, and it bounds its own paging loop — a harness that can hang is worse
+than one that fails.
+
+---
+
+**Panic recovery, which is two different problems.**
+
+`run()` started the alerter and the sweeper as bare goroutines. A panic in
+either takes the whole process down, and that is the worst outcome available
+here: §2 keeps every aggregate in memory, so process death throws away the
+last minute of every metric instantly — the only thing this server actually
+holds. Losing the sweeper degrades memory slowly; losing the alerter stops
+notifications. Losing the process loses everything.
+
+The asymmetry is what decided it. `net/http` *already* recovers a panic in a
+handler — it logs, drops that one connection, and the server carries on — so
+the background loops were strictly **less** safe than the request path, which
+is backwards for code that holds shard locks and runs unattended.
+
+`supervise` recovers, logs with the loop's name and a stack, waits a backoff
+and restarts. It does not give up after N attempts, because stopping silently
+is the one outcome worse than crashing: an alerter that has died looks exactly
+like one with nothing to report. A loop that panics every tick logs every
+tick — noisy and impossible to miss. The backoff stops a loop that panics
+before reaching its ticker from spinning as fast as the CPU allows, and is a
+parameter rather than the constant for the same reason `Alerter.Run` takes its
+interval (§18). Cancellation during the backoff is a `select`, not a sleep,
+because `run()` waits on these loops before the process exits.
+
+On the request path, `recoverPanic` is **not** about keeping the server alive —
+the stdlib does that. It is about what the client is told. A dropped
+connection is a transport error, indistinguishable from a network blip, and
+§26 taught `loadgen` that a request with no response is *unknown*: the server
+may have recorded those events before failing, so `verify` widens its check by
+exactly that much. A panic delivered as a 500 is a definite failure and stays
+out of that bucket; the same panic as a dropped connection quietly erodes the
+exactness claim the whole project rests on.
+
+Two panics it deliberately does not swallow:
+
+- `http.ErrAbortHandler` is the documented way to abandon a response on
+  purpose, so converting it to a 500 would break the one panic that is not a
+  bug.
+- A panic *after* the response has started cannot become a 500, because the
+  status is already on the wire. Swallowing it would hand the client a
+  truncated body under a 200 — corrupt data that looks complete, the worst
+  outcome available in a project built on exactness. It is re-panicked so the
+  connection breaks and the client sees a broken transfer, which is at least
+  honest.
+
+**What this deliberately does not do.**
+
+- *The walk is still O(cardinality).* "Which metrics exist" cannot be answered
+  for less without an index, and an index is a second structure to keep
+  consistent with the store under every write. The walk is now ~300 µs of
+  string comparisons at full cardinality, against the ~77 ms it used to
+  guard, so the remaining floor is not what hurts.
+- *No aggregation across pages.* A caller wanting a total over 32 768 metrics
+  must page and add up. That is the honest consequence of refusing to compute
+  an unbounded answer in one request.
+- *The response is still built in memory before encoding* — but bounded by
+  `limit` now rather than by the store, which was the actual problem.
+- *A supervised loop that panics every tick still does no work.* It stays
+  loud rather than silent, which is the best available outcome without a
+  health signal the loops can fail; giving them one is a larger change than a
+  recover.
+
 ## Testing
 
 See `main_test.go`. ~91% coverage — everything but `main()` (listen + signal
