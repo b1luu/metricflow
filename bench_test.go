@@ -518,3 +518,75 @@ func BenchmarkSweepReclaimingEverything(b *testing.B) {
 	}
 	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*metrics), "ns/metric")
 }
+
+// --- the query path under cardinality ---
+
+// storeWithMetrics fills a store with n metrics, each holding 20 values so
+// every one has a real histogram to merge and sort - the work /stats does.
+// Refusals are tolerated: past the cardinality cap (§27) the store is as
+// full as it will get, which is exactly the case being measured.
+func storeWithMetrics(n int) *Store {
+	s := newStore()
+	now := time.Now()
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("svc.metric.%d", i)
+		for v := 0; v < 20; v++ {
+			_ = s.record(now, Event{Name: name, Value: float64(v%17) + 1, TS: now.UnixMilli()})
+		}
+	}
+	return s
+}
+
+// BenchmarkStatsByCardinality is the measurement §28 exists for: how the
+// cost of one /stats request scales with how many metrics the store holds.
+//
+// Before the limit this was linear all the way to the cardinality ceiling -
+// 77 ms and 62 MB for a single ~30-byte GET, which §26's limiter would admit
+// 256 of at once. It should now flatten once the store passes maxStatsLimit,
+// because past that point the request computes a fixed number of metrics
+// however many exist.
+func BenchmarkStatsByCardinality(b *testing.B) {
+	for _, metrics := range []int{100, 1000, 10000, shardCount * maxMetricsPerShard} {
+		b.Run(fmt.Sprintf("metrics=%d", metrics), func(b *testing.B) {
+			s := storeWithMetrics(metrics)
+			w := &discardWriter{}
+			req := httptest.NewRequest(http.MethodGet, "/stats", nil)
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				s.handleStats(w, req)
+			}
+		})
+	}
+}
+
+// A narrow query must not pay for the store's size beyond the unavoidable
+// walk: ?prefix= matching one metric should cost a walk and one merge, not
+// a thousand merges.
+func BenchmarkStatsNarrowPrefix(b *testing.B) {
+	s := storeWithMetrics(shardCount * maxMetricsPerShard)
+	w := &discardWriter{}
+	req := httptest.NewRequest(http.MethodGet, "/stats?prefix=svc.metric.42&limit=1", nil)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		s.handleStats(w, req)
+	}
+}
+
+// selectNames on its own, so the walk-and-sort floor is visible separately
+// from the per-metric merge work the limit bounds.
+func BenchmarkSelectNames(b *testing.B) {
+	s := storeWithMetrics(shardCount * maxMetricsPerShard)
+	q := statsQuery{window: window, limit: maxStatsLimit}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, matched := s.selectNames(q); matched == 0 {
+			b.Fatal("selected nothing")
+		}
+	}
+}

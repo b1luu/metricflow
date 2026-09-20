@@ -384,70 +384,23 @@ type MetricStats struct {
 
 // StatsResponse is the JSON body of GET /stats. Window echoes back the
 // window actually applied, so the caller knows what it's looking at.
+//
+// The three fields after it exist because the response is now bounded
+// (§28), and a bounded answer that does not say it is bounded is simply a
+// wrong answer. Matched counts every metric name the query covered, before
+// the limit; Truncated says some were not computed; Next is the name to
+// continue from.
+//
+// Matched counts *names*, not metrics with data. Whether a metric has
+// anything inside the window is only known after merging it, which is
+// precisely the work the limit exists to avoid doing for everything - so
+// len(Metrics) can be smaller than both Matched and the limit.
 type StatsResponse struct {
-	Window  string                 `json:"window"`
-	Metrics map[string]MetricStats `json:"metrics"`
-}
-
-// handleStats: GET /stats - per-metric aggregate over a time window, as JSON.
-// Optional ?window=30s (Go duration syntax); defaults to the full
-// retention window, and may not exceed it (older data is already evicted).
-func (s *Store) handleStats(w http.ResponseWriter, r *http.Request) {
-	win := window
-	if q := r.URL.Query().Get("window"); q != "" {
-		d, err := time.ParseDuration(q)
-		if err != nil || d <= 0 {
-			http.Error(w, "invalid window (use e.g. 30s, 1m)", http.StatusBadRequest)
-			return
-		}
-		if d > window {
-			http.Error(w, fmt.Sprintf("window exceeds retention (%s)", window), http.StatusBadRequest)
-			return
-		}
-		win = d
-	}
-
-	cutoff := windowStart(time.Now(), win)
-	resp := StatsResponse{Window: win.String(), Metrics: map[string]MetricStats{}}
-
-	// One shard at a time, rather than one lock over everything.
-	//
-	// This is the trade sharding makes: the response is no longer a single
-	// instant across all metrics - a fast metric in shard 0 may be read a
-	// few microseconds before one in shard 31, and a write can land between
-	// them. Each metric's own numbers remain internally consistent, which is
-	// what a metrics query actually needs; a globally atomic snapshot would
-	// mean holding every shard lock at once and handing ingest back the
-	// exact stall this slice removes (§24).
-	for i := range s.shards {
-		sh := &s.shards[i]
-		sh.mu.Lock()
-		for name, series := range sh.aggs {
-			m, ok := mergeBuckets(series, cutoff)
-			if !ok {
-				continue // no data inside the window
-			}
-			// One pass for all three: asking separately would sort this
-			// metric's bucket keys three times.
-			p := m.h.quantiles(0.50, 0.90, 0.99)
-
-			resp.Metrics[name] = MetricStats{
-				Count: m.Count,
-				Avg:   m.Sum / float64(m.Count),
-				Min:   m.Min,
-				Max:   m.Max,
-				P50:   p[0],
-				P90:   p[1],
-				P99:   p[2],
-			}
-		}
-		sh.mu.Unlock()
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	// Nothing useful to do if this fails: the client hung up mid-read, or
-	// the socket broke. Status and headers are already sent. Ignore it.
-	_ = json.NewEncoder(w).Encode(resp)
+	Window    string                 `json:"window"`
+	Metrics   map[string]MetricStats `json:"metrics"`
+	Matched   int                    `json:"matched"`
+	Truncated bool                   `json:"truncated"`
+	Next      string                 `json:"next,omitempty"`
 }
 
 // routes builds the request multiplexer. Separate from main so tests can
