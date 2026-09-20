@@ -11,6 +11,7 @@ import (
 	"net/http"      // the HTTP server and routing
 	"os"            // os.Interrupt
 	"os/signal"     // catch Ctrl-C / SIGTERM
+	"runtime/debug" // Stack, so a recovered panic is still diagnosable
 	"strconv"       // Retry-After, which is seconds as a string
 	"sync"          // Mutex, to guard each shard's aggs map
 	"syscall"       // SIGTERM
@@ -455,6 +456,67 @@ func defaultRules() []Rule {
 	}
 }
 
+// panicBackoff is how long a supervised loop waits before restarting after
+// a panic. Without it, a loop that panics before reaching its ticker would
+// spin as fast as the CPU allows, turning one bug into a busy loop and a
+// flood of identical log lines.
+const panicBackoff = time.Second
+
+// supervise runs fn until ctx is cancelled, restarting it if it panics,
+// waiting `backoff` between restarts.
+//
+// A panic in a background goroutine is a different problem from a panic in a
+// handler, and much worse. net/http recovers the latter: it logs, drops that
+// one connection, and the server carries on. A bare goroutine has no such
+// net, so a panic in the alerter or the sweeper takes the whole process with
+// it - and §2 keeps every aggregate in memory, so process death is total
+// data loss. Losing the sweeper degrades memory slowly and losing the
+// alerter stops notifications; losing the process throws away the last
+// minute of every metric instantly, which is the only thing the server
+// actually holds.
+//
+// That asymmetry is why this restarts rather than exiting, and why it does
+// not stop after N attempts. A loop that panics every tick logs every tick,
+// which is noisy and impossible to miss - much better than stopping
+// silently, because an alerter that has died looks exactly like one with
+// nothing to report.
+//
+// The backoff is a parameter for the same reason Alerter.Run takes its
+// interval and run() takes its listener: a test needs the behaviour, not the
+// wait. Callers pass panicBackoff.
+func supervise(ctx context.Context, name string, backoff time.Duration, fn func(context.Context)) {
+	for ctx.Err() == nil {
+		if !ranAndPanicked(ctx, name, backoff, fn) {
+			return // returned on its own, which means ctx is done
+		}
+
+		// Wait out the backoff, but never past cancellation - run() waits
+		// on these loops before the process exits, so sleeping through a
+		// shutdown would stall it.
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+	}
+}
+
+// ranAndPanicked calls fn and reports whether it panicked rather than
+// returning. The stack is logged at the point of recovery, because by the
+// time supervise sees the result it is gone.
+func ranAndPanicked(ctx context.Context, name string, backoff time.Duration, fn func(context.Context)) (panicked bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			panicked = true
+			log.Printf("PANIC in %s: %v\nrestarting in %s\n%s",
+				name, r, backoff, debug.Stack())
+		}
+	}()
+
+	fn(ctx)
+	return false
+}
+
 // run serves on ln until ctx is cancelled, then drains in-flight requests
 // (up to 5s) and returns. Split from main so a test can drive the whole
 // lifecycle with a cancellable context instead of a real signal.
@@ -473,7 +535,9 @@ func run(ctx context.Context, ln net.Listener) error {
 	alertDone := make(chan struct{})
 	go func() {
 		defer close(alertDone)
-		alerter.Run(ctx, evalInterval)
+		supervise(ctx, "alerter", panicBackoff, func(ctx context.Context) {
+			alerter.Run(ctx, evalInterval)
+		})
 	}()
 
 	// The sweeper reclaims metrics nobody writes to any more (§27). It
@@ -482,7 +546,9 @@ func run(ctx context.Context, ln net.Listener) error {
 	sweepDone := make(chan struct{})
 	go func() {
 		defer close(sweepDone)
-		store.Sweep(ctx, sweepInterval)
+		supervise(ctx, "sweeper", panicBackoff, func(ctx context.Context) {
+			store.Sweep(ctx, sweepInterval)
+		})
 	}()
 
 	// Before serving anything, like the alert rules above: a limit the

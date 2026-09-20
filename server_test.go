@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -8,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -303,5 +305,180 @@ func TestInFlightLimitFromTheEnvironment(t *testing.T) {
 				t.Errorf("value %q gave %d, want %d", c.value, got, c.want)
 			}
 		})
+	}
+}
+
+// --- supervised background loops ---
+
+// The failure this prevents: an unrecovered panic in a bare goroutine takes
+// the process down, and §2 keeps every aggregate in memory, so that is total
+// data loss. A handler panic costs one connection; a background panic used
+// to cost the last minute of every metric in the store.
+func TestSuperviseRestartsAfterAPanic(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var starts atomic.Int64
+	done := make(chan struct{})
+
+	out := captureLog(t, func() {
+		go func() {
+			defer close(done)
+			supervise(ctx, "flaky", time.Millisecond, func(context.Context) {
+				// Panic the first two times, then block until cancelled.
+				if starts.Add(1) <= 2 {
+					panic("boom")
+				}
+				<-ctx.Done()
+			})
+		}()
+
+		deadline := time.After(10 * time.Second)
+		for starts.Load() < 3 {
+			select {
+			case <-deadline:
+				t.Error("the loop was not restarted after panicking")
+				return
+			default:
+				time.Sleep(5 * time.Millisecond)
+			}
+		}
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Error("supervise did not return after cancellation")
+		}
+	})
+
+	if got := starts.Load(); got < 3 {
+		t.Errorf("the loop ran %d times, want at least 3 (two panics then a clean run)", got)
+	}
+	// A recovered panic that is not loud is worse than a crash: it hides a
+	// bug behind a server that looks healthy.
+	if !strings.Contains(out, "PANIC in flaky") {
+		t.Errorf("the panic was not logged with its loop's name:\n%s", out)
+	}
+	if !strings.Contains(out, "boom") {
+		t.Errorf("the panic value was not logged:\n%s", out)
+	}
+	// The stack is the only thing that makes a recovered panic diagnosable.
+	if !strings.Contains(out, "supervise") && !strings.Contains(out, "goroutine") {
+		t.Errorf("no stack trace in the panic log:\n%s", out)
+	}
+}
+
+// A loop that returns on its own has finished, and supervise must not spin
+// restarting it.
+func TestSuperviseStopsWhenTheLoopReturns(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var runs atomic.Int64
+	started := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		supervise(ctx, "tidy", time.Millisecond, func(ctx context.Context) {
+			runs.Add(1)
+			close(started)
+			<-ctx.Done() // the shape every real loop has
+		})
+	}()
+
+	// Cancelling before the goroutine is scheduled would leave the loop
+	// never entered, and the test would pass or fail on timing alone.
+	<-started
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("supervise did not return when its loop did")
+	}
+	if got := runs.Load(); got != 1 {
+		t.Errorf("the loop ran %d times, want 1 - a clean return must not be restarted", got)
+	}
+}
+
+// testBackoff is long enough that a supervise which slept through it
+// instead of selecting on ctx would be obvious, and short enough not to
+// stall the suite if that ever regresses.
+const testBackoff = 2 * time.Second
+
+// Cancellation during the backoff has to be honoured, or shutdown stalls for
+// up to panicBackoff after any panic - and run() waits on these loops before
+// the process exits.
+func TestSuperviseReturnsPromptlyWhenCancelledDuringBackoff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	panicked := make(chan struct{})
+	done := make(chan struct{})
+
+	_ = captureLog(t, func() {
+		go func() {
+			defer close(done)
+			supervise(ctx, "always-panics", testBackoff, func(context.Context) {
+				select {
+				case panicked <- struct{}{}:
+				default:
+				}
+				panic("boom")
+			})
+		}()
+
+		<-panicked // it is now inside the backoff
+		start := time.Now()
+		cancel()
+
+		select {
+		case <-done:
+			if waited := time.Since(start); waited >= testBackoff {
+				t.Errorf("supervise took %s to notice cancellation; it waited out the "+
+					"%s backoff instead of selecting on ctx", waited, testBackoff)
+			}
+		case <-time.After(10 * time.Second):
+			t.Error("supervise never returned after cancellation during backoff")
+		}
+	})
+}
+
+// The real loops, supervised for real: a panicking sweeper must not take the
+// process with it, and the store must still be usable afterwards.
+func TestAPanickingSweeperDoesNotKillTheProcess(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var ticks atomic.Int64
+	done := make(chan struct{})
+
+	_ = captureLog(t, func() {
+		go func() {
+			defer close(done)
+			supervise(ctx, "sweeper", time.Millisecond, func(ctx context.Context) {
+				ticks.Add(1)
+				panic("sweep exploded")
+			})
+		}()
+
+		deadline := time.After(10 * time.Second)
+		for ticks.Load() < 2 {
+			select {
+			case <-deadline:
+				t.Error("the sweeper was not restarted")
+				return
+			default:
+				time.Sleep(5 * time.Millisecond)
+			}
+		}
+		cancel()
+		<-done
+	})
+
+	// If the panic had escaped, this line would never run.
+	s := newStore()
+	recordNow(s, "still.here", 1)
+	if got, ok := mergeAll(s, "still.here"); !ok || got.Count != 1 {
+		t.Errorf("store unusable after a supervised panic: %+v (ok=%v)", got, ok)
 	}
 }
