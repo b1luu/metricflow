@@ -38,6 +38,7 @@ type config struct {
 	wantShed    bool          // fail unless the server shed at least one request
 	cardinality int           // distinct names per worker; 0 keeps one name per worker
 	wantCard    bool          // fail unless the server refused a name for cardinality
+	clientID    string        // sent as X-Client-ID, so the server can budget us separately
 	runID       string        // makes this run's metric names unique
 }
 
@@ -78,6 +79,7 @@ func parseFlags(args []string) (config, error) {
 	fs.BoolVar(&c.wantShed, "expect-shed", false, "fail unless the server shed at least one request (503)")
 	fs.IntVar(&c.cardinality, "cardinality", 0, "distinct metric names per worker; 0 uses one, higher floods the store")
 	fs.BoolVar(&c.wantCard, "expect-cardinality", false, "fail unless the server refused a metric name for cardinality")
+	fs.StringVar(&c.clientID, "client", "", "value for the X-Client-ID header; empty sends none")
 
 	if err := fs.Parse(args); err != nil {
 		return config{}, err
@@ -100,6 +102,19 @@ func parseFlags(args []string) (config, error) {
 		return config{}, fmt.Errorf("-cardinality must be >= 0, got %d", c.cardinality)
 	}
 	return c, nil
+}
+
+// clientIDHeader is the header the server budgets by. Spelled out here
+// rather than shared with the server, for the same reason statsResponse is
+// redeclared: this is the wire contract, and a generator that imported the
+// server's constants could not notice them changing.
+const clientIDHeader = "X-Client-ID"
+
+// identify stamps this run's client ID on a request, if it has one.
+func (c config) identify(r *http.Request) {
+	if c.clientID != "" {
+		r.Header.Set(clientIDHeader, c.clientID)
+	}
 }
 
 // newClient returns an HTTP client tuned for load generation.
@@ -391,6 +406,9 @@ func sendUntil(ctx context.Context, client *http.Client, cfg config, workerID in
 		// requests; outstanding ones are allowed to finish. Client.Timeout
 		// still bounds a genuinely hung server.
 		req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
+		if err == nil {
+			cfg.identify(req)
+		}
 		if err != nil {
 			t.failed++
 			t.unknownEv += perRequest
@@ -537,7 +555,12 @@ func (t tally) report(w io.Writer, elapsed, clockRes time.Duration) {
 			t.unknownEv, t.failed)
 	}
 	if t.cardEv > 0 {
-		fmt.Fprintf(w, "cardinality  %d valid events refused because the store was full\n",
+		// 429 now covers two server-side limits - the store being full and
+		// this client being over its own name allowance - and the
+		// difference is in the message rather than the protocol. The
+		// generator is an external client and does not parse prose, so it
+		// reports the fact rather than guessing the cause.
+		fmt.Fprintf(w, "refused  %d valid events turned away by a server limit (429)\n",
 			t.cardEv)
 	}
 
@@ -659,7 +682,13 @@ func fetchRecorded(client *http.Client, cfg config) (recorded int, window string
 		u := fmt.Sprintf("%s?prefix=%s&after=%s",
 			base, url.QueryEscape(prefix), url.QueryEscape(after))
 
-		resp, err := client.Get(u)
+		req, err := http.NewRequest(http.MethodGet, u, nil)
+		if err != nil {
+			return 0, "", fmt.Errorf("building the /stats request: %w", err)
+		}
+		cfg.identify(req)
+
+		resp, err := client.Do(req)
 		if err != nil {
 			return 0, "", fmt.Errorf("fetching /stats: %w", err)
 		}
@@ -761,8 +790,9 @@ func main() {
 	// run's still-in-window events as ours.
 	cfg.runID = strconv.FormatInt(time.Now().UnixNano()%1e9, 36)
 
-	fmt.Printf("target=%s workers=%d duration=%s metrics=%d bad=%.0f%% verify=%v run=%s\n",
-		cfg.target, cfg.workers, cfg.duration, cfg.metrics, cfg.badFrac*100, cfg.verify, cfg.runID)
+	fmt.Printf("target=%s workers=%d duration=%s metrics=%d bad=%.0f%% verify=%v client=%q run=%s\n",
+		cfg.target, cfg.workers, cfg.duration, cfg.metrics, cfg.badFrac*100, cfg.verify,
+		cfg.clientID, cfg.runID)
 
 	// Probe before the run: the report must be able to say which of its own
 	// numbers the clock was too coarse to resolve.
@@ -784,8 +814,8 @@ func main() {
 	// happily against a server with no limiter at all - the strongest
 	// possible way for that gate to be worthless.
 	if cfg.wantCard && total.cardEv == 0 {
-		fmt.Fprintf(os.Stderr, "expect-cardinality: the server never refused a metric name; "+
-			"either it has no cardinality limit or %d names per worker did not reach it\n",
+		fmt.Fprintf(os.Stderr, "expect-cardinality: the server never refused a valid event; "+
+			"either it has no name limit or %d names per worker did not reach it\n",
 			cfg.cardinality)
 		os.Exit(1)
 	}

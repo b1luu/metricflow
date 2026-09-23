@@ -108,29 +108,68 @@ jobs:
       - name: a cardinality flood must be refused, and stay exact
         run: ./loadgen -duration 5s -workers 8 -batch 50 -cardinality 20000 -expect-cardinality
 
-      # §28: the flood above leaves the store at its cardinality ceiling,
-      # which is exactly the state that used to make one GET /stats cost
-      # 77 ms and 62 MB. The response must now be a strict, self-describing
-      # subset. Asserted as a property rather than against the constant, so
-      # this does not have to be edited when the limit is tuned.
-      - name: /stats must stay bounded with the store full
+      # §28: a response must be a strict, self-describing subset of what
+      # matched. Asserted as a property rather than against a constant, so
+      # tuning the limit does not mean editing this.
+      #
+      # It uses an explicit small limit rather than filling the store,
+      # because §29 made filling it from one client impossible on purpose -
+      # the flood above now creates a few dozen names rather than 32768. The
+      # bound being tested is the same one either way.
+      - name: /stats must stay bounded and say so
         run: |
-          body=$(curl -sf --max-time 10 localhost:8080/stats)
+          body=$(curl -sf --max-time 10 "localhost:8080/stats?limit=10")
           returned=$(echo "$body" | jq '.metrics | length')
           matched=$(echo "$body" | jq '.matched')
           truncated=$(echo "$body" | jq '.truncated')
-          echo "returned=$returned matched=$matched truncated=$truncated"
+          next=$(echo "$body" | jq -r '.next')
+          echo "returned=$returned matched=$matched truncated=$truncated next=$next"
 
-          if [ "$matched" -lt 1000 ]; then
-            echo "only $matched metrics matched; the flood did not fill the store, so this proves nothing"
+          if [ "$matched" -le 10 ]; then
+            echo "only $matched metrics matched; nothing would be truncated, so this proves nothing"
             exit 1
           fi
-          if [ "$returned" -ge "$matched" ]; then
-            echo "/stats returned $returned of $matched metrics - the response is not bounded"
+          if [ "$returned" -gt 10 ]; then
+            echo "/stats returned $returned metrics for limit=10 - the limit is not honoured"
             exit 1
           fi
           if [ "$truncated" != "true" ]; then
             echo "/stats dropped $((matched - returned)) metrics without saying so"
+            exit 1
+          fi
+          if [ -z "$next" ] || [ "$next" = "null" ]; then
+            echo "a truncated response carried no cursor; a client cannot continue"
+            exit 1
+          fi
+
+      # §29, and the reason the whole slice exists: one client flooding
+      # metric names must not cost a well-behaved client anything. The noisy
+      # run starts first and is still going when the quiet one begins, so the
+      # quiet client is introducing *new* names into a store under attack -
+      # which is exactly the case that used to fail once the flood had filled
+      # it.
+      - name: a noisy client must not starve a quiet one
+        run: |
+          ./loadgen -duration 12s -workers 4 -batch 50 -cardinality 50000 \
+            -client noisy -expect-cardinality > noisy.log 2>&1 &
+          noisy=$!
+          sleep 4
+
+          ./loadgen -duration 4s -workers 4 -batch 50 -client quiet | tee quiet.log
+          wait $noisy || { echo "the noisy run failed:"; cat noisy.log; exit 1; }
+
+          echo "--- noisy ---"; tail -n 6 noisy.log
+
+          if ! grep -q "verify: OK" quiet.log; then
+            echo "the quiet client did not verify while another client flooded names"
+            exit 1
+          fi
+          if grep -q "429" quiet.log; then
+            echo "the quiet client was throttled by another client's flood"
+            exit 1
+          fi
+          if ! grep -q "refused" noisy.log; then
+            echo "the noisy client was never refused; its flood was not actually limited"
             exit 1
           fi
 

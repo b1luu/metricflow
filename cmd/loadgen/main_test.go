@@ -912,7 +912,11 @@ func TestSendUntilCountsCardinalityRefusalsSeparately(t *testing.T) {
 	if strings.Contains(buf.String(), "MISMATCH") {
 		t.Errorf("report cried mismatch over a server enforcing its own limit:\n%s", buf.String())
 	}
-	if !strings.Contains(buf.String(), "cardinality") {
+	// The report says a server limit turned these away without claiming to
+	// know which one: 429 now covers both the store being full and this
+	// client's own name allowance, and the difference is in the message
+	// rather than the protocol.
+	if !strings.Contains(buf.String(), "refused") {
 		t.Errorf("report does not mention the refusals:\n%s", buf.String())
 	}
 }
@@ -1071,5 +1075,112 @@ func TestVerifyFiltersByPrefixEvenIfTheServerDoesNot(t *testing.T) {
 
 	if err := verify(newClient(1), cfg, tal, time.Second, io.Discard); err != nil {
 		t.Fatalf("verify counted metrics outside this run: %v", err)
+	}
+}
+
+// --- client identity ---
+
+func TestParseFlagsClientIDDefaultsToNone(t *testing.T) {
+	c, err := parseFlags(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.clientID != "" {
+		t.Errorf("clientID = %q, want empty - a run that says nothing should send nothing",
+			c.clientID)
+	}
+
+	c, err = parseFlags([]string{"-client", "svc.api"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.clientID != "svc.api" {
+		t.Errorf("clientID = %q, want %q", c.clientID, "svc.api")
+	}
+}
+
+// Every request the generator makes must carry the identity, ingest and
+// verification alike. A run that identified itself for writes but not for
+// reads would be budgeted as two different clients, and its own verification
+// would be competing with it.
+func TestTheClientIDIsSentOnEveryRequest(t *testing.T) {
+	var (
+		mu   sync.Mutex
+		seen = map[string]map[string]bool{} // path -> ids seen on it
+	)
+	track := func(r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if seen[r.URL.Path] == nil {
+			seen[r.URL.Path] = map[string]bool{}
+		}
+		seen[r.URL.Path][r.Header.Get(clientIDHeader)] = true
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		track(r)
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasPrefix(r.URL.Path, "/stats") {
+			fmt.Fprint(w, `{"window":"1m0s","metrics":{},"matched":0,"truncated":false}`)
+			return
+		}
+		fmt.Fprint(w, `{"accepted":1,"rejected":0,"errors":[]}`)
+	}))
+	defer srv.Close()
+
+	cfg := config{
+		target: srv.URL, workers: 1, duration: 50 * time.Millisecond,
+		metrics: 1, batch: 2, clientID: "svc.api", runID: "abc", verify: true,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.duration)
+	defer cancel()
+	if tal := sendUntil(ctx, newClient(1), cfg, 0); tal.events == 0 {
+		t.Fatal("no events were sent")
+	}
+	if _, _, err := fetchRecorded(newClient(1), cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, path := range []string{"/ingest/batch", "/stats"} {
+		ids := seen[path]
+		if len(ids) == 0 {
+			t.Errorf("%s was never requested", path)
+			continue
+		}
+		if !ids["svc.api"] || len(ids) != 1 {
+			t.Errorf("%s saw client IDs %v, want only %q", path, ids, "svc.api")
+		}
+	}
+}
+
+// With no -client, nothing is sent and the server's own default applies -
+// which is the behaviour every earlier run had, and must stay the default so
+// existing invocations are unchanged.
+func TestNoClientIDMeansNoHeader(t *testing.T) {
+	var (
+		got  string
+		seen bool
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got, seen = r.Header.Get(clientIDHeader), true
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	cfg := config{target: srv.URL, workers: 1, duration: 50 * time.Millisecond, metrics: 1}
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.duration)
+	defer cancel()
+	sendUntil(ctx, newClient(1), cfg, 0)
+
+	if !seen {
+		t.Fatal("no request reached the server")
+	}
+	if got != "" {
+		t.Errorf("sent %s = %q with no -client set", clientIDHeader, got)
 	}
 }
