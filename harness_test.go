@@ -1007,7 +1007,7 @@ func TestShedIngestRequestsAreNeverRecorded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := routes(s, a, newLimiter(capacity))
+	h := routes(s, a, newLimiter(capacity), newClients())
 
 	served, shed := saturate(h, clients, perClient, func() *http.Request {
 		return httptest.NewRequest(http.MethodPost, "/ingest",
@@ -1049,7 +1049,7 @@ func TestShedBatchesContributeNothing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := routes(s, a, newLimiter(capacity))
+	h := routes(s, a, newLimiter(capacity), newClients())
 
 	body := ndjson(validEvents("cpu.load", batchSize)...)
 
@@ -1133,7 +1133,7 @@ func TestStatsStaysCorrectWhileRequestsAreShed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := routes(s, a, newLimiter(capacity))
+	h := routes(s, a, newLimiter(capacity), newClients())
 
 	// Every event carries the same value, so a served /stats can be checked
 	// against itself: avg, min and max must all equal it exactly, whatever

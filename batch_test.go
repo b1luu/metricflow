@@ -382,7 +382,7 @@ func TestBatchRouteIsWiredAndPostOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := routes(s, a, newLimiter(maxInFlight))
+	h := routes(s, a, newLimiter(maxInFlight), newClients())
 
 	body := ndjson(Event{Name: "cpu.load", Value: 1, TS: time.Now().UnixMilli()})
 	rec := httptest.NewRecorder()

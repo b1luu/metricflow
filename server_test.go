@@ -219,7 +219,7 @@ func TestHealthIsNeverShed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := routes(s, a, newLimiter(0))
+	h := routes(s, a, newLimiter(0), newClients())
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
@@ -627,7 +627,7 @@ func TestRoutesAreWrappedInPanicRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := routes(&Store{}, a, newLimiter(maxInFlight))
+	h := routes(&Store{}, a, newLimiter(maxInFlight), newClients())
 
 	rec := httptest.NewRecorder()
 	out := captureLog(t, func() {

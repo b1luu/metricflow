@@ -415,7 +415,7 @@ type StatsResponse struct {
 // serving none, and moves its load onto its equally-loaded neighbours. The
 // check costs nothing to answer, so exempting it is close to free; being
 // wrong about it is not.
-func routes(s *Store, a *Alerter, l *limiter) http.Handler {
+func routes(s *Store, a *Alerter, l *limiter, cs *clients) http.Handler {
 	mux := http.NewServeMux()
 
 	// Shed-able: real work, and the traffic a firehose actually consists of.
@@ -425,10 +425,17 @@ func routes(s *Store, a *Alerter, l *limiter) http.Handler {
 		"/stats":        allow(http.MethodGet, s.handleStats),
 		"/alerts":       allow(http.MethodGet, a.handleAlerts),
 	}
+	// identify wraps the limiter rather than the other way round, because
+	// the limiter needs to know who the caller is before deciding whether
+	// to admit them (§29).
 	for path, h := range limited {
-		mux.Handle(path, l.limit(h))
+		mux.Handle(path, cs.identify(l.limit(h)))
 	}
 
+	// /health is outside identify as well as outside the limiter, and for
+	// the same reason (§26): a malformed X-Client-ID from a sidecar would
+	// otherwise make health checks 400, and an orchestrator would kill a
+	// server that was serving everything else perfectly well.
 	mux.HandleFunc("/health", allow(http.MethodGet, handleHealth))
 
 	// Outermost, so it covers /health and the limiter as well as the
@@ -563,7 +570,7 @@ func run(ctx context.Context, ln net.Listener) error {
 	}
 	log.Printf("serving at most %d requests at once", limit)
 
-	srv := newServer(routes(store, alerter, newLimiter(limit)))
+	srv := newServer(routes(store, alerter, newLimiter(limit), newClients()))
 
 	errc := make(chan error, 1)
 	go func() {
