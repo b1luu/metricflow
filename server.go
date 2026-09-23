@@ -137,15 +137,49 @@ func inFlightLimit() (int, error) {
 type limiter struct {
 	slots chan struct{}
 	shed  atomic.Int64
+
+	// Counted apart from shed, because they mean different things to an
+	// operator: shed says the server is saturated, throttled says one
+	// client is over its own share while the server may be nearly idle.
+	throttled atomic.Int64
 }
 
 func newLimiter(n int) *limiter {
 	return &limiter{slots: make(chan struct{}, n)}
 }
 
-// limit wraps h so at most n requests are inside it at once.
+// limit wraps h so at most n requests are inside it at once, and at most
+// perClientInFlight of them belong to any one caller.
+//
+// The caller's own share is checked first. It is the cheaper test - an
+// atomic add against a counter already in hand, rather than a channel send -
+// and checking it first means a client over its limit never touches the
+// shared pool at all, so its excess cannot even momentarily displace anyone.
+//
+// The two refusals get different statuses on purpose. 503 says the *server*
+// is at capacity; 429 says *you* are asking for more than you are allowed,
+// which may be true while the server is nearly idle. Collapsing them would
+// leave an operator unable to tell a saturated fleet from one greedy
+// reporter - the same argument §27 made for not reusing 503 there.
 func (l *limiter) limit(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A request that never passed through identify has no client and is
+		// subject to the global limit alone (§29).
+		if c, _ := clientFrom(r.Context()); c != nil {
+			if !c.acquire() {
+				l.throttled.Add(1)
+				w.Header().Set("Retry-After", "1")
+				http.Error(w, fmt.Sprintf(
+					"too many concurrent requests from this client (max %d)", perClientInFlight),
+					http.StatusTooManyRequests)
+				return
+			}
+			// Deferred for the same reason the shared slot is: a slot
+			// leaked by a panicking handler is permanent, and would throttle
+			// that client a little harder after every panic.
+			defer c.release()
+		}
+
 		select {
 		case l.slots <- struct{}{}:
 			// Deferred, so the slot comes back even if the handler panics.
@@ -164,10 +198,13 @@ func (l *limiter) limit(h http.Handler) http.Handler {
 	})
 }
 
-// shedded is how many requests have been refused for capacity. Exported to
-// tests rather than to clients: it is a property of the server, not of the
-// metrics, and putting it in /stats would mix the two.
-func (l *limiter) shedded() int64 { return l.shed.Load() }
+// shedded is how many requests have been refused because the server was at
+// capacity; throttledCount how many because one client was over its own
+// share. Exported to tests rather than to clients: they are properties of
+// the server, not of the metrics, and putting them in /stats would mix the
+// two.
+func (l *limiter) shedded() int64        { return l.shed.Load() }
+func (l *limiter) throttledCount() int64 { return l.throttled.Load() }
 
 // --- panic recovery on the request path ---
 

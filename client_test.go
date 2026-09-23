@@ -256,3 +256,206 @@ func TestHealthIgnoresAMalformedClientID(t *testing.T) {
 		t.Errorf("/stats with a malformed %s: %d, want 400", clientHeader, rec.Code)
 	}
 }
+
+// --- per-client concurrency ---
+
+// blockingRoutes returns a handler stack whose requests park until released,
+// so a test can hold a precise number of them in flight.
+func blockingRoutes(t *testing.T, global int) (h http.Handler, l *limiter,
+	entered chan string, release chan struct{}) {
+	t.Helper()
+
+	entered = make(chan string, 1024)
+	release = make(chan struct{})
+	l = newLimiter(global)
+	cs := newClients()
+
+	h = cs.identify(l.limit(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, id := clientFrom(r.Context())
+		entered <- id
+		<-release
+		w.WriteHeader(http.StatusOK)
+	})))
+	return h, l, entered, release
+}
+
+// The gap §26 left open, now closed: one client at its own ceiling must not
+// cost anyone else anything. This is the test the whole slice exists for.
+func TestANoisyClientCannotStarveAQuietOne(t *testing.T) {
+	h, l, entered, release := blockingRoutes(t, maxInFlight)
+
+	call := func(id string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/stats", nil)
+		req.Header.Set(clientHeader, id)
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// Fill the noisy client's whole share and hold it there.
+	var wg sync.WaitGroup
+	for i := 0; i < perClientInFlight; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if rec := call("noisy"); rec.Code != http.StatusOK {
+				t.Errorf("a request within the noisy client's share got %d, want 200", rec.Code)
+			}
+		}()
+	}
+	for i := 0; i < perClientInFlight; i++ {
+		<-entered
+	}
+
+	// Its next request is refused - and refused as 429, not 503: the server
+	// is nowhere near capacity, this client is over its share.
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() { done <- call("noisy") }()
+	select {
+	case rec := <-done:
+		if rec.Code != http.StatusTooManyRequests {
+			t.Errorf("the noisy client past its share got %d, want 429", rec.Code)
+		}
+		if rec.Header().Get("Retry-After") == "" {
+			t.Error("no Retry-After on a throttled request")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the request past the per-client share blocked instead of being refused")
+	}
+
+	// And the quiet client sails straight through, which is the point.
+	quiet := make(chan *httptest.ResponseRecorder, 1)
+	go func() { quiet <- call("quiet") }()
+	select {
+	case <-entered: // it reached the handler
+	case rec := <-quiet:
+		t.Fatalf("the quiet client was refused with %d while another client misbehaved", rec.Code)
+	case <-time.After(2 * time.Second):
+		t.Fatal("the quiet client never reached the handler")
+	}
+
+	if l.shedded() != 0 {
+		t.Errorf("shedded = %d; nothing should have hit the global limit", l.shedded())
+	}
+	if l.throttledCount() != 1 {
+		t.Errorf("throttled = %d, want 1", l.throttledCount())
+	}
+
+	close(release)
+	wg.Wait()
+	<-quiet
+}
+
+// A client's share comes back when its requests finish, or the limit is a
+// one-way door that throttles harder over time.
+func TestAClientsShareIsReturned(t *testing.T) {
+	h, _, entered, release := blockingRoutes(t, maxInFlight)
+
+	call := func() *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/stats", nil)
+		req.Header.Set(clientHeader, "api")
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < perClientInFlight; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); call() }()
+	}
+	for i := 0; i < perClientInFlight; i++ {
+		<-entered
+	}
+	close(release)
+	wg.Wait()
+
+	// Every slot is back, so a fresh request is admitted rather than 429'd.
+	release = make(chan struct{})
+	close(release)
+	if rec := call(); rec.Code != http.StatusOK {
+		t.Errorf("after the client's requests finished it got %d, want 200", rec.Code)
+	}
+}
+
+// A leaked per-client slot is permanent, exactly like a leaked shared one:
+// the client would be throttled a little harder after every panic until it
+// was throttled always.
+func TestAClientsSlotSurvivesAPanickingHandler(t *testing.T) {
+	cs := newClients()
+	l := newLimiter(maxInFlight)
+	h := cs.identify(l.limit(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		panic("boom")
+	})))
+
+	call := func() (rec *httptest.ResponseRecorder, panicked bool) {
+		rec = httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/stats", nil)
+		req.Header.Set(clientHeader, "api")
+		defer func() { panicked = recover() != nil }()
+		h.ServeHTTP(rec, req)
+		return rec, false
+	}
+
+	// More panics than the client's whole share, so a leak would exhaust it.
+	for i := 0; i <= perClientInFlight; i++ {
+		if _, panicked := call(); !panicked {
+			t.Fatalf("call %d did not panic; the test proves nothing", i)
+		}
+	}
+	if got := cs.get("api").inFlight.Load(); got != 0 {
+		t.Errorf("the client holds %d slots after panicking handlers, want 0", got)
+	}
+}
+
+// Enough distinct clients still exhaust the shared pool, and that must read
+// as a 503 rather than a 429: the server really is at capacity and no single
+// client is at fault.
+func TestEnoughClientsStillHitTheGlobalLimit(t *testing.T) {
+	const global = 4
+
+	h, l, entered, release := blockingRoutes(t, global)
+
+	call := func(id string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/stats", nil)
+		req.Header.Set(clientHeader, id)
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// One request each from `global` different clients, so nobody is near
+	// their own share but the pool is full.
+	var wg sync.WaitGroup
+	for i := 0; i < global; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			call(fmt.Sprintf("client-%d", i))
+		}(i)
+	}
+	for i := 0; i < global; i++ {
+		<-entered
+	}
+
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() { done <- call("one-more") }()
+	select {
+	case rec := <-done:
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Errorf("status = %d, want 503 - the server is at capacity, not this client", rec.Code)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the request blocked instead of being shed")
+	}
+
+	if l.throttledCount() != 0 {
+		t.Errorf("throttled = %d; no client was over its own share", l.throttledCount())
+	}
+	if l.shedded() != 1 {
+		t.Errorf("shedded = %d, want 1", l.shedded())
+	}
+
+	close(release)
+	wg.Wait()
+}
