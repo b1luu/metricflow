@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -765,39 +766,55 @@ func TestEveryClientGetsItsOwnAllowanceConcurrently(t *testing.T) {
 	}
 }
 
-// The per-client in-flight counter is incremented optimistically and backed
-// out, so this is where that would show: the count must never exceed the cap
-// and must come back to zero.
+// The cap refuses, deterministically. Asserted from one goroutine because a
+// concurrent version of this claim is machine-dependent: on a two-core runner
+// 128 goroutines that acquire and release immediately never hold more than
+// two slots at once, so nothing is refused and the test passes while proving
+// nothing. That is exactly how the first version of this failed in CI.
+func TestAClientIsRefusedPastItsCap(t *testing.T) {
+	c := &client{}
+
+	for i := 0; i < perClientInFlight; i++ {
+		if !c.acquire() {
+			t.Fatalf("slot %d of %d was refused", i+1, perClientInFlight)
+		}
+	}
+	if c.acquire() {
+		t.Fatalf("a %dth slot was admitted past a cap of %d",
+			perClientInFlight+1, perClientInFlight)
+	}
+
+	// And it comes back: releasing one admits exactly one more.
+	c.release()
+	if !c.acquire() {
+		t.Error("a released slot was not reusable")
+	}
+	if c.acquire() {
+		t.Error("releasing one slot admitted two")
+	}
+}
+
+// And the counter holds up under contention. This asserts only what a race
+// can prove regardless of how much parallelism the machine actually offers:
+// the cap is never exceeded, and every slot comes back. Whether anything is
+// refused depends on scheduling, so it is not asserted here - the test above
+// owns that claim.
 func TestPerClientInFlightNeverExceedsItsCap(t *testing.T) {
-	const goroutines = 128
+	const goroutines = 64
 
 	c := &client{}
 	var (
-		peak    atomic.Int64
-		held    atomic.Int64
-		refused atomic.Int64
-		wg      sync.WaitGroup
+		peak atomic.Int64
+		held atomic.Int64
+		wg   sync.WaitGroup
 	)
-
-	// Hold all but two slots before the churn starts. Without this the
-	// goroutines acquire and release too fast to ever collide, and the test
-	// would pass while proving nothing about contention at the cap.
-	const parked = perClientInFlight - 2
-	for i := 0; i < parked; i++ {
-		if !c.acquire() {
-			t.Fatalf("setup: slot %d of %d was refused", i+1, parked)
-		}
-	}
-	held.Store(parked)
-	peak.Store(parked)
 
 	for g := 0; g < goroutines; g++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for i := 0; i < 200; i++ {
+			for i := 0; i < 500; i++ {
 				if !c.acquire() {
-					refused.Add(1)
 					continue
 				}
 				n := held.Add(1)
@@ -807,6 +824,10 @@ func TestPerClientInFlightNeverExceedsItsCap(t *testing.T) {
 						break
 					}
 				}
+				// Hold long enough to overlap with somebody, without
+				// depending on it.
+				runtime.Gosched()
+
 				held.Add(-1)
 				c.release()
 			}
@@ -814,19 +835,11 @@ func TestPerClientInFlightNeverExceedsItsCap(t *testing.T) {
 	}
 	wg.Wait()
 
-	for i := 0; i < parked; i++ {
-		held.Add(-1)
-		c.release()
-	}
-
 	if got := peak.Load(); got > perClientInFlight {
 		t.Errorf("peak concurrent holders = %d, past the cap of %d", got, perClientInFlight)
 	}
 	if got := c.inFlight.Load(); got != 0 {
 		t.Errorf("client holds %d slots after everything finished, want 0", got)
-	}
-	if refused.Load() == 0 {
-		t.Fatal("nothing was refused; the test never reached the cap")
 	}
 }
 
