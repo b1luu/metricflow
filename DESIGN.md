@@ -1102,6 +1102,8 @@ the transport rather than at the contract.
   consume all of them and shed everyone else. Fixing that means per-client
   accounting and an identity to account against, and this server has no
   notion of client identity at all. Named here rather than half-solved.
+  **Closed by §29**, which adds that identity and a per-client share on top
+  of this pool — the global limit here still applies underneath it.
 - *No smoothing.* With no queue whatsoever, a brief burst that a one-deep
   queue would have absorbed is shed instead. That is the accepted cost of
   refusing to hide work, and the right knob for it is the limit, not a queue.
@@ -1251,6 +1253,9 @@ against a server with no limit.
   cause: this server has no notion of client identity. One client's names can
   fill a shard that another client's legitimate new metric then can't enter.
   Fixing it needs identity first, which is a larger change than a limit.
+  **Closed by §29** — as a rate on new names per client rather than a share
+  of this stock, because a stock would need an owner recorded on every metric
+  so the sweeper could give the budget back.
 - *No eviction of existing metrics.* A full shard refuses new names rather
   than making room by dropping an old one. Evicting real data to admit what
   is usually garbage is the wrong trade, and an LRU here would let an
@@ -1412,6 +1417,157 @@ Two panics it deliberately does not swallow:
   loud rather than silent, which is the best available outcome without a
   health signal the loops can fail; giving them one is a larger change than a
   recover.
+
+### 29. Client identity, and the fairness it buys
+
+Three sections ended with the same admission. §26's shed slots are global, so
+one noisy client can consume all 256 and shed everyone else. §27's cardinality
+budget is shared, so one client's names can fill a shard another client's
+legitimate metric then cannot enter. §28 bounded a single query but not a
+client issuing many. All three said the fix needs a notion of client identity,
+which the server did not have.
+
+**Scope, which decides everything else.** The demo scenario is a fleet of
+services under one operator, not a set of mutually distrusting tenants. So the
+failure worth preventing is an *accident*: one buggy service emitting unbounded
+names, or one runaway reporter opening hundreds of connections, degrading
+observability of every other service at exactly the moment somebody needs it.
+
+That calls for **resource fairness**. It does not call for data isolation, and
+the metric namespace stays shared and global on purpose — a fleet's metrics are
+meant to be queried together. Namespacing metrics per client would be a
+different product, and it would break every cross-service query the project
+exists to serve.
+
+**The trust model, stated plainly because the limits would otherwise look like
+a defence they are not.** `X-Client-ID` is self-asserted. That is the same
+contract Cortex and Mimir give `X-Scope-OrgID`: a tenancy boundary, not an
+authentication boundary. It isolates clients that are honest about who they
+are — which is every client that is merely broken, and that is the population
+this is for. A deployment facing untrusted callers must set the header at a
+trusted proxy and strip whatever the caller sent.
+
+An attacker who rotates the header simply gets a fresh budget each time. That
+makes the identity table §27's problem one level up, and it has to be, because
+the identifier comes from the caller: an unbounded set of IDs is an unbounded
+set of counters. So the table is capped, and everyone past the cap shares one
+bucket. **Under a rotating-ID attack the server degrades to precisely the
+global limits it had before this section existed** — which is the honest
+ceiling of what an unauthenticated identity can promise, and worth saying out
+loud rather than leaving a reader to discover.
+
+Overflow is its own bucket rather than the anonymous one, so a rotating caller
+cannot degrade the honest callers who simply sent no header.
+
+A malformed identifier is **rejected**, not quietly demoted — the call §11, §25
+and §28 all made. A client that sent an ID and was silently pooled believes it
+has a budget it does not have, and will be baffled when someone else's traffic
+throttles it.
+
+`/health` is outside `identify` as well as outside the limiter, for §26's
+reason: a malformed header from a sidecar must not make health checks fail, or
+an orchestrator kills a server that is serving everything else perfectly well.
+
+**Per-client concurrency** (closes §26's gap). A request needs its caller's own
+share as well as a slot in the shared pool. The caller's share is checked
+first: it is the cheaper test, and checking it first means a client over its
+limit never touches the shared pool at all, so its excess cannot even
+momentarily displace anyone.
+
+`perClientInFlight` is 32 against a global 256 — a *share*, not a partition.
+Dividing the pool would waste capacity whenever fewer clients are active; this
+only stops any one client taking enough to starve the rest, and eight clients
+would have to misbehave at once before anybody else is shed.
+
+The two refusals get different statuses. **503 says the server is at capacity;
+429 says you are asking for more than you are allowed**, which can be true
+while the server is nearly idle. Collapsing them would leave an operator unable
+to tell a saturated fleet from one greedy reporter.
+
+**Per-client name rate** (closes §27's gap), and this is the design decision
+worth defending. It is a *rate*, not a stock.
+
+A per-client stock limit would have to know which client created each name, so
+the sweeper could return the budget when it reclaimed one — an ownership field
+on every metric and a store restructure to carry it. A rate needs one counter
+per client and nothing on the metric at all. The epoch is derived from the
+clock rather than reset by a ticker, so there is no third background loop to
+run, supervise and shut down, and a client that goes quiet needs no cleanup to
+stop counting.
+
+It **composes with §27 rather than replacing it**: the global cap still bounds
+absolute memory, and this bounds how fast any one client can consume it. A
+service with a stable set of names creates nothing after startup and never
+touches the limit. A service emitting a name per request is held to 64 per
+10 s, so reaching the global ceiling alone would take over an hour of sustained
+flooding — by which time the sweeper has long since reclaimed its earlier
+names, so in practice it never gets there.
+
+Two orderings are load-bearing. The **global cap is checked before the client's
+budget**, so a client is never charged for a name it could not have created
+anyway, and a genuinely full store reports the reason the client cannot fix by
+slowing down. **Validation still comes first**, which now protects two budgets
+instead of one: a malformed event spends neither the store's cardinality nor
+the caller's allowance.
+
+The limit is on *new* names only, so a client that has run out can still write
+to metrics it already has — otherwise a brief flood would silence a service's
+real metrics too.
+
+**The cost** (Ryzen 7 7800X3D, `-count=3`, median):
+
+| | ns/op | allocs |
+| --- | --- | --- |
+| `record`, no client | 96.8 | 0 |
+| `recordFor`, existing metric | 95.4 | 0 |
+| `identify`, per request | 167 | 4 (408 B) |
+| acquire + release, contended | 19.4 | 0 |
+| refused by its own share | **3.1** | 0 |
+
+The first two lines are the one that had to hold: the client budget is
+consulted only when a name is created, so an event for a metric that already
+exists costs exactly what it did before. `identify`'s allocations are the
+request context, paid once per request rather than per event — a rounding error
+at a batch of 1000.
+
+The last line is the shape a fairness limit should have. Refusing a client over
+its share costs 3.1 ns and no allocations: 57× cheaper than §26's shed, and
+some 600× cheaper than serving the request. A client hammering past its limit
+is very nearly free to say no to.
+
+**Live.** A noisy client floods metric names; three seconds in, a quiet client
+starts introducing new names of its own into the store under attack:
+
+| | requests | events accepted |
+| --- | --- | --- |
+| noisy | 99.9% answered `429` | 1 920 |
+| quiet | 100% answered `200` | 2 290 350, `verify: OK` |
+
+And the store went from empty to **132 metrics against a 32 768 ceiling**. The
+same flood before this section filled that ceiling in seconds, at which point
+the quiet client's new names would all have been refused. That is the whole
+difference: the budget is now spent by whoever is spending it.
+
+**What this deliberately does not do.**
+
+- *It is not authentication.* Stated above, and restated here because it is the
+  limit that matters most: this stops accidents, not attackers. An attacker
+  rotating the header falls back to the global limits, which still hold.
+- *No data isolation.* Any client can write to any metric name, and `/stats`
+  shows everything. That is intentional for a single-operator fleet and would
+  be wrong for real tenants.
+- *Query cost is bounded per request (§28) and per client only through
+  concurrency.* A client within its concurrency share can still issue expensive
+  queries back to back. A cost-weighted budget — charging a client for the
+  metrics a query computed rather than the requests it made — is the natural
+  next step, and needs a notion of cost the server does not have yet.
+- *The limits are fixed, not adaptive.* A client gets the same share whether it
+  is the only one connected or one of two hundred. Adaptive shares would use
+  the pool better and would need the server to track offered load per client
+  over time, which is a scheduler, not a limit.
+- *The overflow bucket is shared.* Past `maxClients`, honest newcomers land in
+  the same bucket as whoever filled the table. Their traffic is still bounded
+  and still served; they simply stop being isolated from each other.
 
 ## Testing
 

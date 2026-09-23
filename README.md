@@ -22,7 +22,7 @@ exits; a second `Ctrl-C` kills immediately.
 
 | Method | Path      | Description                                             |
 | ------ | --------- | ------------------------------------------------------ |
-| GET    | `/health` | Liveness check. Returns `ok`.                          |
+| GET    | `/health` | Liveness check. Returns `ok`. Never shed, never needs a client ID. |
 | POST   | `/ingest` | Submit one metric event as a JSON body.                |
 | POST   | `/ingest/batch` | Submit many events as newline-delimited JSON.    |
 | GET    | `/stats`  | Per-metric count/avg/min/max and p50/p90/p99 over a time window (JSON, default 60s). Bounded — see below. |
@@ -70,6 +70,34 @@ events per request — past that you are buying very little and paying for it in
 latency and in how much one dropped connection costs. See [DESIGN.md](DESIGN.md)
 §25 for the measurements and for what the batch path deliberately does *not*
 optimise.
+
+## Clients and fairness
+
+A caller identifies itself with `X-Client-ID`. The server then budgets it
+separately: at most 32 concurrent requests, and at most 64 *new* metric names
+per 10 s. Both are shares of the global limits rather than replacements for
+them — a client over its own share gets `429` while the server is still well
+short of the `503` it returns when genuinely saturated.
+
+This exists so one broken service cannot cost every other service its
+monitoring. With a noisy client flooding metric names and a quiet client
+starting mid-flood:
+
+| | requests | events accepted |
+| --- | --- | --- |
+| noisy | 99.9% `429` | 1,920 |
+| quiet | 100% `200` | 2,290,350, `verify: OK` |
+
+The store went from empty to 132 metrics against a 32,768 ceiling. The same
+flood previously filled that ceiling in seconds, after which the quiet
+client's new names would all have been refused.
+
+**It is not authentication.** The header is self-asserted, the same contract
+Cortex and Mimir give `X-Scope-OrgID`: it isolates clients that are honest
+about who they are, which is every client that is merely broken. An attacker
+rotating the header falls back to the global limits, which still hold. A
+deployment facing untrusted callers should set the header at a trusted proxy
+and strip whatever the caller sent. See [DESIGN.md](DESIGN.md) §29.
 
 ## Querying
 
@@ -292,7 +320,8 @@ stats with a configurable query window, percentiles from a bounded histogram,
 an alerting layer with flap suppression, graceful shutdown, a fully
 timed-out HTTP server that sheds load rather than queueing it, panic
 recovery on both the request path and the background loops, a bounded and
-pageable query path, a bounded
+pageable query path, per-client concurrency and name-rate budgets so one
+noisy client cannot starve the rest, a bounded
 metric cardinality with a sweeper to reclaim idle names, a store whose lock
 is sharded by metric name (14.9x on concurrent writes to distinct metrics,
 measured before and after), a batch endpoint that turns that into 50x end to
@@ -309,9 +338,10 @@ instant across all metrics, though no individual metric is ever internally
 torn (§24); and many goroutines writing the *same* metric still serialize,
 because they contend for the same aggregate rather than for the locking
 scheme — 159 ns/op against 10 ns/op for writes to distinct metrics (§24); and
-the concurrency limit is global rather than per-client, so one noisy client can
-consume every slot and shed everyone else (§26) — and for the same reason
-(no notion of client identity) one client's metric names can fill a shard that
-another client's legitimate new metric then cannot enter (§27); and listing
+client identity is self-asserted, so the per-client budgets isolate accidents
+rather than attackers, and a caller rotating the header falls back to the
+global limits (§29); query cost is bounded per request but per client only
+through concurrency, so a client within its share can still issue expensive
+queries back to back (§29); and listing
 metrics is still O(cardinality) even when the answer is bounded, because
 "which metrics exist" has no index behind it (§28).
