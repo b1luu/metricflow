@@ -112,7 +112,15 @@ const (
 // handleIngest validates ev.TS is in [now-window, now+bucketWidth] before
 // calling here; a direct caller that skips that just gets its out-of-range
 // bucket evicted on the spot. See DESIGN.md §16.
+// record folds an event in without charging any client's budget. Internal
+// callers and tests use it; the global cardinality cap (§27) still applies,
+// so it is a call with no *client* quota rather than one with no quota.
 func (s *Store) record(now time.Time, ev Event) error {
+	return s.recordFor(now, nil, ev)
+}
+
+// recordFor is record, charging c for any metric name it creates.
+func (s *Store) recordFor(now time.Time, c *client, ev Event) error {
 	bucket := time.UnixMilli(ev.TS).Truncate(bucketWidth).Unix()
 
 	// One metric lives in exactly one shard, so an ingest takes one lock and
@@ -134,6 +142,16 @@ func (s *Store) record(now time.Time, ev Event) error {
 		if len(sh.aggs) >= maxMetricsPerShard {
 			return errCardinality
 		}
+
+		// The caller's own budget, checked after the global cap rather than
+		// before it. A client must not be charged for a name it could not
+		// have created anyway, and when the store is genuinely full that is
+		// the reason worth reporting - it is the one the client cannot fix
+		// by slowing down (§29).
+		if !c.allowNewName(now) {
+			return errClientNames
+		}
+
 		series = make(map[int64]*Agg)
 		sh.aggs[ev.Name] = series
 	}
@@ -177,10 +195,31 @@ func (s *Store) record(now time.Time, ev Event) error {
 // can consume a cardinality slot, so a client sending garbage cannot fill
 // the store with names that were never going to be valid.
 func (s *Store) admit(now time.Time, ev Event) error {
+	return s.admitFor(now, nil, ev)
+}
+
+// admitFor is admit on behalf of a specific caller, so the name budget lands
+// on the client that actually introduced the name.
+//
+// Validation still comes first, which now protects two budgets rather than
+// one: a malformed event consumes neither a cardinality slot nor any of the
+// caller's name allowance, so a client sending garbage cannot spend its own
+// quota on names that were never going to be valid either.
+func (s *Store) admitFor(now time.Time, c *client, ev Event) error {
 	if err := validateEvent(now, ev); err != nil {
 		return err
 	}
-	return s.record(now, ev)
+	return s.recordFor(now, c, ev)
+}
+
+// retryableIngestError reports whether a refusal may succeed later.
+//
+// The two capacity limits are retryable and every contract violation is not,
+// which is the distinction a client actually needs: resending a malformed
+// event wastes both sides' time forever, while resending a refused name
+// works as soon as there is room or the epoch rolls.
+func retryableIngestError(err error) bool {
+	return errors.Is(err, errCardinality) || errors.Is(err, errClientNames)
 }
 
 // writeIngestError renders a refusal from admit as an HTTP response.
@@ -197,7 +236,9 @@ func (s *Store) admit(now time.Time, ev Event) error {
 // Retry-After is the window rather than the sweep interval: a slot frees
 // when some other metric ages out entirely, not merely when a sweep runs.
 func writeIngestError(w http.ResponseWriter, err error) {
-	if errors.Is(err, errCardinality) {
+	if retryableIngestError(err) {
+		// The store's own window, which is the longer of the two waits and
+		// therefore the safe one to quote for either limit.
 		w.Header().Set("Retry-After", strconv.Itoa(int(window.Seconds())))
 		http.Error(w, err.Error(), http.StatusTooManyRequests)
 		return
@@ -358,7 +399,8 @@ func (s *Store) handleIngest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now()
-	if err := s.admit(now, ev); err != nil {
+	c, _ := clientFrom(r.Context())
+	if err := s.admitFor(now, c, ev); err != nil {
 		writeIngestError(w, err)
 		return
 	}

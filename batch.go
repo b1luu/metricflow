@@ -103,6 +103,7 @@ func (s *Store) handleIngestBatch(w http.ResponseWriter, r *http.Request) {
 	// edge is. A full batch takes on the order of a millisecond, which is
 	// nothing against a 60 s window.
 	now := time.Now()
+	c, _ := clientFrom(r.Context())
 
 	// Non-nil so an all-rejected batch encodes "errors":[] rather than
 	// "errors":null - same reasoning as the alerts endpoint.
@@ -133,9 +134,9 @@ func (s *Store) handleIngestBatch(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 
-		if err := s.admit(now, ev); err != nil {
+		if err := s.admitFor(now, c, ev); err != nil {
 			resp.Rejected++
-			mayRetry := errors.Is(err, errCardinality)
+			mayRetry := retryableIngestError(err)
 			if mayRetry {
 				retryable++
 			}

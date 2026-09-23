@@ -65,6 +65,18 @@ var errCardinality = fmt.Errorf(
 	"cardinality limit reached: this shard already holds %d distinct metric "+
 		"names and this one is new", maxMetricsPerShard)
 
+// errClientNames is returned when a caller has introduced metric names
+// faster than maxNewNamesPerEpoch allows.
+//
+// Distinct from errCardinality because the two mean different things to the
+// client that hit them. errCardinality says the *store* is full and nobody
+// can add a name; this says the store has room but *you* have had your share
+// of it for now. Both are retryable, and this one always succeeds eventually
+// - the epoch rolls over on its own (§29).
+var errClientNames = fmt.Errorf(
+	"new metric names are limited to %d per %s per client; this name is new",
+	maxNewNamesPerEpoch, nameEpoch)
+
 // sweep reclaims memory across every shard: buckets that have aged out of
 // the window, and then any metric left holding none.
 //

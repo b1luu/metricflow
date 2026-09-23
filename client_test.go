@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -458,4 +460,199 @@ func TestEnoughClientsStillHitTheGlobalLimit(t *testing.T) {
 
 	close(release)
 	wg.Wait()
+}
+
+// --- per-client name budget ---
+
+// The gap §27 left open: its cap is global, so one client's names could fill
+// a shard a different client's legitimate metric then could not enter. A rate
+// per client is what stops that, without needing an owner recorded on every
+// metric so the sweeper could give the budget back.
+func TestAClientIsThrottledAfterItsNameAllowance(t *testing.T) {
+	s := newStore()
+	c := &client{}
+	now := time.Now()
+	ts := now.UnixMilli()
+
+	for i := 0; i < maxNewNamesPerEpoch; i++ {
+		ev := Event{Name: fmt.Sprintf("flood.%04d", i), Value: 1, TS: ts}
+		if err := s.recordFor(now, c, ev); err != nil {
+			t.Fatalf("name %d of its allowance was refused: %v", i+1, err)
+		}
+	}
+
+	ev := Event{Name: "flood.one-too-many", Value: 1, TS: ts}
+	if err := s.recordFor(now, c, ev); !errors.Is(err, errClientNames) {
+		t.Fatalf("the name past the allowance returned %v, want errClientNames", err)
+	}
+	if got := metricCount(s); got != maxNewNamesPerEpoch {
+		t.Errorf("store holds %d metrics, want exactly the allowance %d", got, maxNewNamesPerEpoch)
+	}
+}
+
+// The limit is on *new* names. A client that has run out of allowance must
+// still be able to write to metrics it already has, or a brief flood would
+// silence a service's real metrics too.
+func TestAThrottledClientStillWritesToItsExistingMetrics(t *testing.T) {
+	s := newStore()
+	c := &client{}
+	now := time.Now()
+	ts := now.UnixMilli()
+
+	for i := 0; i < maxNewNamesPerEpoch; i++ {
+		if err := s.recordFor(now, c, Event{Name: fmt.Sprintf("svc.%04d", i), Value: 1, TS: ts}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.recordFor(now, c, Event{Name: "svc.new", Value: 1, TS: ts}); err == nil {
+		t.Fatal("setup: the client is not actually out of allowance")
+	}
+
+	for i := 0; i < maxNewNamesPerEpoch; i++ {
+		name := fmt.Sprintf("svc.%04d", i)
+		if err := s.recordFor(now, c, Event{Name: name, Value: 3, TS: ts}); err != nil {
+			t.Fatalf("%s: an existing metric was refused: %v", name, err)
+		}
+	}
+	got, ok := mergeAll(s, "svc.0000")
+	if !ok || got.Count != 2 || got.Sum != 4 {
+		t.Errorf("svc.0000 = %+v (ok=%v), want Count=2 Sum=4", got, ok)
+	}
+}
+
+// The allowance is a rate, so it comes back. A stock limit would need the
+// sweeper to know who created each name; this just needs the clock to move.
+func TestTheNameAllowanceRefillsNextEpoch(t *testing.T) {
+	s := newStore()
+	c := &client{}
+	now := time.Now().Truncate(nameEpoch)
+
+	for i := 0; i < maxNewNamesPerEpoch; i++ {
+		ev := Event{Name: fmt.Sprintf("a.%04d", i), Value: 1, TS: now.UnixMilli()}
+		if err := s.recordFor(now, c, ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.recordFor(now, c, Event{Name: "a.extra", Value: 1, TS: now.UnixMilli()}); err == nil {
+		t.Fatal("setup: the allowance was not exhausted")
+	}
+
+	later := now.Add(nameEpoch)
+	if err := s.recordFor(later, c, Event{Name: "a.extra", Value: 1, TS: later.UnixMilli()}); err != nil {
+		t.Errorf("the allowance did not refill in the next epoch: %v", err)
+	}
+}
+
+// One client's flood must not spend another client's allowance - that is the
+// entire point, and it is what §27 could not offer.
+func TestOneClientsFloodDoesNotSpendAnothersAllowance(t *testing.T) {
+	s := newStore()
+	noisy, quiet := &client{}, &client{}
+	now := time.Now()
+	ts := now.UnixMilli()
+
+	for i := 0; i < maxNewNamesPerEpoch*4; i++ {
+		_ = s.recordFor(now, noisy, Event{Name: fmt.Sprintf("noisy.%05d", i), Value: 1, TS: ts})
+	}
+
+	// The quiet client introduces its whole allowance, untouched.
+	for i := 0; i < maxNewNamesPerEpoch; i++ {
+		ev := Event{Name: fmt.Sprintf("quiet.%04d", i), Value: 1, TS: ts}
+		if err := s.recordFor(now, quiet, ev); err != nil {
+			t.Fatalf("the quiet client's name %d was refused while another client flooded: %v", i+1, err)
+		}
+	}
+}
+
+// A malformed event must consume neither budget. Otherwise a client could
+// spend its own allowance - and the store's - on names that were never going
+// to be valid, which is the cheapest denial of service available.
+func TestInvalidEventsSpendNoClientAllowance(t *testing.T) {
+	s := newStore()
+	c := &client{}
+	now := time.Now()
+
+	for i := 0; i < maxNewNamesPerEpoch*2; i++ {
+		ev := Event{Name: fmt.Sprintf("never.%04d", i), Value: 1,
+			TS: now.Add(-window - time.Hour).UnixMilli()}
+		if err := s.admitFor(now, c, ev); err == nil {
+			t.Fatalf("event %d was admitted despite an expired ts", i)
+		}
+	}
+
+	// The whole allowance is still there.
+	for i := 0; i < maxNewNamesPerEpoch; i++ {
+		ev := Event{Name: fmt.Sprintf("valid.%04d", i), Value: 1, TS: now.UnixMilli()}
+		if err := s.admitFor(now, c, ev); err != nil {
+			t.Fatalf("valid name %d was refused: %v", i+1, err)
+		}
+	}
+}
+
+// Over HTTP it reads as 429 with Retry-After, like the cardinality cap - and
+// in a batch it is a per-event rejection marked retryable, because unlike a
+// contract violation it will succeed on its own once the epoch rolls.
+func TestTheNameAllowanceOverHTTP(t *testing.T) {
+	s := newStore()
+	a, err := newAlerter(time.Now(), s, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := routes(s, a, newLimiter(maxInFlight), newClients())
+
+	post := func(path, body string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+		req.Header.Set(clientHeader, "flooder")
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	now := time.Now()
+	for i := 0; i < maxNewNamesPerEpoch; i++ {
+		body := fmt.Sprintf(`{"name":"http.%04d","value":1,"ts":%d}`, i, now.UnixMilli())
+		if rec := post("/ingest", body); rec.Code != http.StatusOK {
+			t.Fatalf("name %d: status %d, want 200 (%s)", i, rec.Code, rec.Body.String())
+		}
+	}
+
+	rec := post("/ingest", fmt.Sprintf(`{"name":"http.extra","value":1,"ts":%d}`, now.UnixMilli()))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Errorf("status = %d, want 429", rec.Code)
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Error("no Retry-After on a throttled name")
+	}
+
+	// And in a batch, marked retryable rather than looking like a contract
+	// violation the client should give up on.
+	batch := fmt.Sprintf(`{"name":"http.batch","value":1,"ts":%d}`, now.UnixMilli()) + "\n"
+	rec = post("/ingest/batch", batch)
+
+	var resp BatchResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("batch reply is not JSON: %v (%s)", err, rec.Body.String())
+	}
+	if resp.Rejected != 1 || len(resp.Errors) != 1 {
+		t.Fatalf("accepted/rejected = %d/%d with %d errors, want 0/1 and 1",
+			resp.Accepted, resp.Rejected, len(resp.Errors))
+	}
+	if !resp.Errors[0].Retryable {
+		t.Errorf("a name-allowance rejection is not marked retryable: %+v", resp.Errors[0])
+	}
+}
+
+// Requests that never passed through identify are unmetered by the client
+// budget - they are subject to the global cap and nothing else, which is the
+// behaviour every existing test and internal caller relies on.
+func TestAnUnidentifiedCallerHasNoNameAllowance(t *testing.T) {
+	s := newStore()
+	now := time.Now()
+
+	for i := 0; i < maxNewNamesPerEpoch*3; i++ {
+		ev := Event{Name: fmt.Sprintf("internal.%05d", i), Value: 1, TS: now.UnixMilli()}
+		if err := s.record(now, ev); err != nil {
+			t.Fatalf("internal caller was throttled at name %d: %v", i+1, err)
+		}
+	}
 }
