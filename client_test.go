@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -654,5 +655,235 @@ func TestAnUnidentifiedCallerHasNoNameAllowance(t *testing.T) {
 		if err := s.record(now, ev); err != nil {
 			t.Fatalf("internal caller was throttled at name %d: %v", i+1, err)
 		}
+	}
+}
+
+// --- per-client limits under concurrency ---
+
+// The allowance is a check followed by an increment, which is the same
+// check-then-act race §27's cap had: without one lock over both, N
+// goroutines could each see room for one more and each take it. The clock is
+// fixed so a real epoch boundary cannot roll mid-test and make the expected
+// count ambiguous.
+func TestTheNameAllowanceIsExactUnderConcurrentCreation(t *testing.T) {
+	const writers = 32
+
+	s := newStore()
+	c := &client{}
+	now := time.Now().Truncate(nameEpoch)
+	ts := now.UnixMilli()
+
+	var (
+		created   atomic.Int64
+		throttled atomic.Int64
+		wg        sync.WaitGroup
+		failures  = make(chan string, 16)
+	)
+
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			// Far more attempts than the allowance, interleaved across
+			// writers so they contend for the last few slots.
+			for i := w; i < maxNewNamesPerEpoch*8; i += writers {
+				err := s.recordFor(now, c, Event{
+					Name: fmt.Sprintf("race.%05d", i), Value: 1, TS: ts})
+				switch {
+				case err == nil:
+					created.Add(1)
+				case errors.Is(err, errClientNames):
+					throttled.Add(1)
+				default:
+					select {
+					case failures <- fmt.Sprintf("unexpected error: %v", err):
+					default:
+					}
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	close(failures)
+
+	for msg := range failures {
+		t.Error(msg)
+	}
+	if got := created.Load(); got != maxNewNamesPerEpoch {
+		t.Errorf("created %d names, want exactly the allowance %d - the check and "+
+			"the increment are not atomic", got, maxNewNamesPerEpoch)
+	}
+	if got := metricCount(s); int64(got) != created.Load() {
+		t.Errorf("recordFor reported %d creations but the store holds %d metrics",
+			created.Load(), got)
+	}
+	if throttled.Load() == 0 {
+		t.Fatal("nothing was throttled; the test never reached the allowance")
+	}
+}
+
+// Each client's allowance is its own, under contention as much as in
+// isolation - the property the whole slice exists for, with the race added.
+func TestEveryClientGetsItsOwnAllowanceConcurrently(t *testing.T) {
+	const (
+		clientCount = 8
+		writers     = 4
+	)
+
+	s := newStore()
+	now := time.Now().Truncate(nameEpoch)
+	ts := now.UnixMilli()
+
+	cs := make([]*client, clientCount)
+	created := make([]atomic.Int64, clientCount)
+	for i := range cs {
+		cs[i] = &client{}
+	}
+
+	var wg sync.WaitGroup
+	for ci := range cs {
+		for w := 0; w < writers; w++ {
+			wg.Add(1)
+			go func(ci, w int) {
+				defer wg.Done()
+				for i := w; i < maxNewNamesPerEpoch*4; i += writers {
+					ev := Event{Name: fmt.Sprintf("c%02d.name.%05d", ci, i), Value: 1, TS: ts}
+					if err := s.recordFor(now, cs[ci], ev); err == nil {
+						created[ci].Add(1)
+					}
+				}
+			}(ci, w)
+		}
+	}
+	wg.Wait()
+
+	for i := range cs {
+		if got := created[i].Load(); got != maxNewNamesPerEpoch {
+			t.Errorf("client %d created %d names, want its full allowance %d",
+				i, got, maxNewNamesPerEpoch)
+		}
+	}
+}
+
+// The per-client in-flight counter is incremented optimistically and backed
+// out, so this is where that would show: the count must never exceed the cap
+// and must come back to zero.
+func TestPerClientInFlightNeverExceedsItsCap(t *testing.T) {
+	const goroutines = 128
+
+	c := &client{}
+	var (
+		peak    atomic.Int64
+		held    atomic.Int64
+		refused atomic.Int64
+		wg      sync.WaitGroup
+	)
+
+	// Hold all but two slots before the churn starts. Without this the
+	// goroutines acquire and release too fast to ever collide, and the test
+	// would pass while proving nothing about contention at the cap.
+	const parked = perClientInFlight - 2
+	for i := 0; i < parked; i++ {
+		if !c.acquire() {
+			t.Fatalf("setup: slot %d of %d was refused", i+1, parked)
+		}
+	}
+	held.Store(parked)
+	peak.Store(parked)
+
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				if !c.acquire() {
+					refused.Add(1)
+					continue
+				}
+				n := held.Add(1)
+				for {
+					old := peak.Load()
+					if n <= old || peak.CompareAndSwap(old, n) {
+						break
+					}
+				}
+				held.Add(-1)
+				c.release()
+			}
+		}()
+	}
+	wg.Wait()
+
+	for i := 0; i < parked; i++ {
+		held.Add(-1)
+		c.release()
+	}
+
+	if got := peak.Load(); got > perClientInFlight {
+		t.Errorf("peak concurrent holders = %d, past the cap of %d", got, perClientInFlight)
+	}
+	if got := c.inFlight.Load(); got != 0 {
+		t.Errorf("client holds %d slots after everything finished, want 0", got)
+	}
+	if refused.Load() == 0 {
+		t.Fatal("nothing was refused; the test never reached the cap")
+	}
+}
+
+// The standing invariant, with the per-client limits firing throughout: the
+// events the server says it took are exactly the events it holds.
+func TestExactnessHoldsWhileClientsAreThrottled(t *testing.T) {
+	const (
+		clientCount = 4
+		writers     = 8
+		perWriter   = 300
+	)
+
+	s := newStore()
+	now := time.Now().Truncate(nameEpoch)
+	ts := now.UnixMilli()
+
+	cs := make([]*client, clientCount)
+	for i := range cs {
+		cs[i] = &client{}
+	}
+
+	var (
+		accepted atomic.Int64
+		wg       sync.WaitGroup
+	)
+	for ci := range cs {
+		for w := 0; w < writers; w++ {
+			wg.Add(1)
+			go func(ci, w int) {
+				defer wg.Done()
+				for i := 0; i < perWriter; i++ {
+					// Half the traffic re-uses an early name, half invents
+					// one, so the allowance fires partway through.
+					var name string
+					if i%2 == 0 {
+						name = fmt.Sprintf("c%02d.stable.%02d", ci, i%16)
+					} else {
+						name = fmt.Sprintf("c%02d.fresh.%05d", ci, w*perWriter+i)
+					}
+					if err := s.recordFor(now, cs[ci], Event{Name: name, Value: 1, TS: ts}); err == nil {
+						accepted.Add(1)
+					}
+				}
+			}(ci, w)
+		}
+	}
+	wg.Wait()
+
+	recorded := 0
+	for _, series := range storeDump(s) {
+		agg, ok := mergeBuckets(series, 0)
+		if !ok {
+			continue
+		}
+		recorded += agg.Count
+	}
+	if int64(recorded) != accepted.Load() {
+		t.Errorf("recordFor accepted %d events, store holds %d", accepted.Load(), recorded)
 	}
 }

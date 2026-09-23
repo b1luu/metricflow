@@ -590,3 +590,80 @@ func BenchmarkSelectNames(b *testing.B) {
 		}
 	}
 }
+
+// --- per-client limits ---
+
+// The client budget is only consulted when a metric name is created, so an
+// event for a metric that already exists must cost exactly what it did
+// before per-client limits existed. BenchmarkRecord is the comparison.
+func BenchmarkRecordForExistingMetric(b *testing.B) {
+	s := newStore()
+	c := &client{}
+	now := time.Now()
+	ev := Event{Name: "cpu.load", Value: 1, TS: now.UnixMilli()}
+
+	if err := s.recordFor(now, c, ev); err != nil {
+		b.Fatal(err)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := s.recordFor(now, c, ev); err != nil {
+			b.Fatalf("iteration %d: %v", i, err)
+		}
+	}
+}
+
+// The identity is resolved once per request, so its cost is per request
+// rather than per event - which at a batch of 10000 is a rounding error, but
+// at one event per request it is not, and is worth knowing either way.
+func BenchmarkIdentify(b *testing.B) {
+	cs := newClients()
+	h := cs.identify(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+
+	w := &discardWriter{}
+	req := httptest.NewRequest(http.MethodGet, "/stats", nil)
+	req.Header.Set(clientHeader, "svc.api-01_west")
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		h.ServeHTTP(w, req)
+	}
+}
+
+// Acquiring and releasing a client's share sits in front of every request,
+// including the ones the global limiter then sheds, so it has to be trivial.
+func BenchmarkClientAcquireRelease(b *testing.B) {
+	c := &client{}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if c.acquire() {
+				c.release()
+			}
+		}
+	})
+}
+
+// And the refusal path: a client hammering past its share should cost the
+// server almost nothing, for the same reason §26's shed had to be cheap.
+func BenchmarkClientRefusedByItsShare(b *testing.B) {
+	c := &client{}
+	for i := 0; i < perClientInFlight; i++ {
+		if !c.acquire() {
+			b.Fatalf("setup: slot %d was refused", i+1)
+		}
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if c.acquire() {
+			b.Fatalf("iteration %d was admitted past the share", i)
+		}
+	}
+}
