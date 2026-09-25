@@ -317,7 +317,13 @@ func (p *parser) intField(dst *int64) error {
 
 // parseInt reads a plain JSON integer without allocating. Anything with a
 // fraction or exponent is rejected, as encoding/json rejects it for an int64
-// field.
+// field - that is how "ts":1e3 and "ts":1.0 stay errors.
+//
+// Its only caller hands it a span numberSpan has already validated, so the
+// empty and sign-only checks below cannot fire today and do not show up as
+// covered. They stay because this parses untrusted input and the cost of
+// being wrong about an invariant here is an index out of range on the
+// request path, against a couple of nanoseconds to be sure.
 func parseInt(b []byte) (int64, error) {
 	if len(b) == 0 {
 		return 0, errors.New("empty")

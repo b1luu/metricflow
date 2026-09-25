@@ -202,6 +202,45 @@ func TestParseEventAgreesWithEncodingJSON(t *testing.T) {
 			`{"a":[1,]}`,
 			`{"a":[}`,
 		},
+		"the corners of skipping and keys": {
+			// A key with escapes is legal and takes the slow path.
+			`{"na\u006de":"x"}`,
+			`{"\u0076alue":2.5}`,
+			// A key that is itself malformed.
+			"{\"name\":\"x\"}",
+			`{"unterminated`,
+			`{"a" 1}`,
+			// Skipped strings are parsed, so their escapes must be valid.
+			`{"u":"\q"}`,
+			`{"u":"\u0041"}`,
+			`{"u":"\uZZZZ"}`,
+			`{"u":"\u12"}`,
+			"{\"u\":\"ab\"}",
+			// Skipped structures must be well formed all the way down.
+			`{"a":{1:2}}`,
+			`{"a":{"b" 2}}`,
+			`{"a":{"b":1 2}}`,
+			`{"a":[1 2]}`,
+			`{"a":[1,2}`,
+			`{"a":{"b":1]}`,
+			// Literals, whole and partial.
+			`{"a":tru}`,
+			`{"a":nul}`,
+			`{"a":fals}`,
+			`{"value":nul}`,
+			`{"name":nullx}`,
+			// Numbers at the edges of what fits.
+			`{"value":1e999}`,
+			`{"value":-1e999}`,
+			`{"value":1.7976931348623157e308}`,
+			`{"value":0.00000000000000000000000000000000000000000000000000001234567890123}`,
+			`{"ts":92233720368547758070}`,
+			// Valid multi-byte UTF-8 next to an invalid byte.
+			"{\"name\":\"cafÃ©ÿ\"}",
+			"{\"name\":\"ð\"}",
+			"{\"name\":\"a\nbÿ\"}",
+			"{\"name\":\"\u0041Ã\"}",
+		},
 		"trailing content is the caller's business, not the parser's": {
 			`{"name":"a"} `,
 			`{"name":"a"}` + "\n",
@@ -298,19 +337,44 @@ func TestParseEventReportsWhatItConsumed(t *testing.T) {
 
 // A prefix of a valid value must read as "not yet" rather than "never", or a
 // streaming caller would reject an event that merely straddled a read.
+//
+// Run over documents chosen to reach every corner of the parser - escapes,
+// surrogate pairs, nested objects and arrays, skipped strings containing
+// braces - because "every prefix is incomplete" is a property that has to
+// hold on all of them, and truncating each at every byte is what actually
+// exercises the error paths a table of whole inputs never reaches.
 func TestParseEventDistinguishesIncompleteFromInvalid(t *testing.T) {
-	full := `{"name":"cpu.load","value":-1.5e3,"ts":1758000000000}`
+	docs := []string{
+		`{"name":"cpu.load","value":-1.5e3,"ts":1758000000000}`,
+		`{"name":"a\"b\\c\n","ts":-1}`,
+		`{"name":"\ud83d\ude00 \u00e9"}`,
+		`{"tags":{"env":"prod","n":[1,2.5,-3e-4,true,false,null]},"name":"x"}`,
+		`{"note":"} { braces \" inside","name":"x","value":0}`,
+		`{"deep":{"a":{"b":{"c":[[[1]]]}}},"ts":0}`,
+		`{"NAME":null,"Value":null,"TS":null}`,
+		`{}`,
+		`   {  "name"  :  "x"  }   `,
+		`null`,
+	}
 
-	// Every proper prefix is incomplete, never a syntax error.
-	for i := 0; i < len(full); i++ {
-		var ev Event
-		_, err := parseEvent([]byte(full[:i]), &ev)
-		if err == nil {
-			t.Errorf("prefix %q parsed as a complete event", full[:i])
-			continue
-		}
-		if err != errIncomplete {
-			t.Errorf("prefix %q gave %v, want errIncomplete", full[:i], err)
+	for _, full := range docs {
+		// Every proper prefix is incomplete, never a syntax error.
+		for i := 0; i < len(full); i++ {
+			var ev Event
+			n, err := parseEvent([]byte(full[:i]), &ev)
+
+			// A prefix may legitimately be a *complete* value followed by
+			// nothing, once the trailing whitespace is cut off.
+			if err == nil {
+				if strings.TrimSpace(full[:i][n:]) != "" {
+					t.Errorf("%q: prefix %q parsed but left %q behind",
+						full, full[:i], full[:i][n:])
+				}
+				continue
+			}
+			if err != errIncomplete {
+				t.Errorf("%q: prefix %q gave %v, want errIncomplete", full, full[:i], err)
+			}
 		}
 	}
 
