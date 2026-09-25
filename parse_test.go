@@ -2,6 +2,9 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"math"
 	"strings"
 	"testing"
@@ -438,4 +441,280 @@ func TestParseEventAllocatesOnlyTheName(t *testing.T) {
 			}
 		})
 	}
+}
+
+// --- streaming ---
+
+// drain reads every event from a stream, returning them and how it ended.
+func drain(r io.Reader) ([]Event, error) {
+	er := newEventReader(r)
+	defer er.release()
+
+	var out []Event
+	for {
+		var ev Event
+		if err := er.next(&ev); err != nil {
+			return out, err
+		}
+		out = append(out, ev)
+	}
+}
+
+// oneByteReader hands over a single byte per Read, so every value in the
+// stream is split across a refill at every possible position. This is the
+// test that matters for a buffered reader: a parser that resumed from the
+// wrong offset, or a refill that lost the bytes it already had, passes every
+// other test here and fails this one.
+type oneByteReader struct {
+	s string
+	i int
+}
+
+func (r *oneByteReader) Read(p []byte) (int, error) {
+	if r.i >= len(r.s) {
+		return 0, io.EOF
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	p[0] = r.s[r.i]
+	r.i++
+	return 1, nil
+}
+
+func TestEventReaderSurvivesAByteAtATime(t *testing.T) {
+	body := `{"name":"cpu.load","value":1,"ts":100}` + "\n" +
+		`{"name":"aéb","value":-1.5e-3,"ts":-1,"tags":{"env":"prod"}}` + "\n" +
+		`  {"name":"third","value":0,"ts":3}  `
+
+	whole, err := drain(strings.NewReader(body))
+	if err != io.EOF {
+		t.Fatalf("reading it whole: %v", err)
+	}
+
+	split, err := drain(&oneByteReader{s: body})
+	if err != io.EOF {
+		t.Fatalf("reading it a byte at a time: %v", err)
+	}
+
+	if len(split) != len(whole) {
+		t.Fatalf("got %d events a byte at a time, %d in one read", len(split), len(whole))
+	}
+	for i := range whole {
+		if split[i] != whole[i] {
+			t.Errorf("event %d differs: %+v a byte at a time, %+v in one read",
+				i, split[i], whole[i])
+		}
+	}
+	if len(whole) != 3 {
+		t.Errorf("read %d events, want 3", len(whole))
+	}
+}
+
+// The same property against every split point of a single value, which is
+// cheaper to diagnose when it fails than the byte-at-a-time version.
+func TestEventReaderHandlesEverySplitPoint(t *testing.T) {
+	body := `{"name":"svc.api","value":12.5,"ts":1758000000000,"tags":{"a":"b"}}`
+
+	for cut := 0; cut <= len(body); cut++ {
+		r := io.MultiReader(
+			strings.NewReader(body[:cut]),
+			strings.NewReader(body[cut:]),
+		)
+		got, err := drain(r)
+		if err != io.EOF {
+			t.Errorf("split at %d: %v", cut, err)
+			continue
+		}
+		if len(got) != 1 {
+			t.Errorf("split at %d: got %d events, want 1", cut, len(got))
+			continue
+		}
+		if got[0].Name != "svc.api" || got[0].Value != 12.5 || got[0].TS != 1758000000000 {
+			t.Errorf("split at %d: got %+v", cut, got[0])
+		}
+	}
+}
+
+func TestEventReaderEndings(t *testing.T) {
+	one := `{"name":"a","value":1,"ts":2}`
+
+	cases := []struct {
+		name    string
+		body    string
+		want    int
+		wantErr error
+	}{
+		{"empty", "", 0, io.EOF},
+		{"whitespace only", "  \n\t ", 0, io.EOF},
+		{"one event", one, 1, io.EOF},
+		{"trailing newline", one + "\n", 1, io.EOF},
+		{"trailing whitespace", one + "  \n\t", 1, io.EOF},
+		{"several, newline separated", one + "\n" + one + "\n" + one, 3, io.EOF},
+		{"several on one line", one + " " + one, 2, io.EOF},
+		{"no separator at all", one + one, 2, io.EOF},
+
+		// A body cut off mid-value is not a clean end, and must not be
+		// reported as one - that is the difference between "the client
+		// finished" and "the connection died".
+		{"truncated mid-object", one + "\n" + `{"name":"b`, 1, io.ErrUnexpectedEOF},
+		{"truncated after a comma", one + "\n" + `{"name":"b",`, 1, io.ErrUnexpectedEOF},
+		{"just an opening brace", "{", 0, io.ErrUnexpectedEOF},
+
+		// Malformed is malformed, whatever follows it.
+		{"syntax error", one + "\n" + `{"name":]}`, 1, nil},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := drain(strings.NewReader(c.body))
+			if len(got) != c.want {
+				t.Errorf("read %d events, want %d", len(got), c.want)
+			}
+			if c.wantErr != nil && err != c.wantErr {
+				t.Errorf("ended with %v, want %v", err, c.wantErr)
+			}
+			if c.wantErr == nil && (err == nil || err == io.EOF) {
+				t.Errorf("ended with %v, want a syntax error", err)
+			}
+		})
+	}
+}
+
+// An event bigger than the buffer must grow it rather than fail, because
+// unknown fields are allowed to be large and §7 says a producer adding one
+// must not start failing.
+func TestEventReaderGrowsForAnOversizedEvent(t *testing.T) {
+	padding := strings.Repeat("x", readBufSize*3)
+	body := `{"name":"big","value":1,"ts":2,"pad":"` + padding + `"}` + "\n" +
+		`{"name":"after","value":2,"ts":3}`
+
+	got, err := drain(strings.NewReader(body))
+	if err != io.EOF {
+		t.Fatalf("%v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("read %d events, want 2", len(got))
+	}
+	if got[0].Name != "big" || got[1].Name != "after" {
+		t.Errorf("got %+v", got)
+	}
+}
+
+// Growth is bounded. Past the body cap the reader gives up rather than
+// buffering whatever a client feels like sending.
+func TestEventReaderRefusesAnEventPastTheBodyCap(t *testing.T) {
+	// The reader is handed more than maxBatchBody directly, standing in for
+	// a MaxBytesReader that was not there - the point is that the buffer
+	// itself stops growing.
+	body := `{"name":"huge","pad":"` + strings.Repeat("x", maxBatchBody+1024) + `"}`
+
+	got, err := drain(strings.NewReader(body))
+	if err == nil || err == io.EOF {
+		t.Fatalf("read %d events and ended with %v, want a refusal", len(got), err)
+	}
+	if !strings.Contains(err.Error(), "exceeds the body limit") {
+		t.Errorf("error = %q, want it to name the limit", err)
+	}
+}
+
+// A read error that is not EOF has to surface, but only after the events
+// already in hand have been handed over - §25's accounting contract says a
+// batch cut short still reports what it applied.
+func TestEventReaderAppliesWhatItHasBeforeReportingAReadError(t *testing.T) {
+	one := `{"name":"a","value":1,"ts":2}`
+	boom := errors.New("connection reset")
+
+	r := io.MultiReader(
+		strings.NewReader(one+"\n"+one+"\n"),
+		errReader{boom},
+	)
+
+	er := newEventReader(r)
+	defer er.release()
+
+	read := 0
+	var err error
+	for {
+		var ev Event
+		if err = er.next(&ev); err != nil {
+			break
+		}
+		read++
+	}
+
+	if read != 2 {
+		t.Errorf("handed over %d events before the error, want 2", read)
+	}
+	if !errors.Is(err, boom) {
+		t.Errorf("ended with %v, want the read error", err)
+	}
+}
+
+type errReader struct{ err error }
+
+func (e errReader) Read([]byte) (int, error) { return 0, e.err }
+
+// The buffer is pooled, so a reader must not keep using one it gave back -
+// that is the classic pool bug, and it corrupts a different request rather
+// than failing its own.
+func TestEventReaderReleaseIsSafeAndRepeatable(t *testing.T) {
+	er := newEventReader(strings.NewReader(`{"name":"a","value":1,"ts":2}`))
+
+	var ev Event
+	if err := er.next(&ev); err != nil {
+		t.Fatal(err)
+	}
+	er.release()
+	er.release() // must not double-put the same buffer into the pool
+
+	if er.buf != nil || er.src != nil {
+		t.Error("release left the reader usable; a later call would touch a pooled buffer")
+	}
+}
+
+// Pooling must not let one request see another's bytes.
+func TestPooledBuffersDoNotLeakBetweenReaders(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		body := fmt.Sprintf(`{"name":"metric.%03d","value":%d,"ts":%d}`, i, i, i)
+
+		got, err := drain(strings.NewReader(body))
+		if err != io.EOF {
+			t.Fatalf("iteration %d: %v", i, err)
+		}
+		if len(got) != 1 {
+			t.Fatalf("iteration %d: read %d events", i, len(got))
+		}
+		want := fmt.Sprintf("metric.%03d", i)
+		if got[0].Name != want || got[0].TS != int64(i) {
+			t.Fatalf("iteration %d: got %+v, want name %q ts %d", i, got[0], want, i)
+		}
+	}
+}
+
+func BenchmarkEventReader(b *testing.B) {
+	var sb strings.Builder
+	for i := 0; i < 1000; i++ {
+		fmt.Fprintf(&sb, "{\"name\":\"svc.metric.%d\",\"value\":%d.5,\"ts\":1758000000000}\n", i%16, i%10)
+	}
+	body := sb.String()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		er := newEventReader(strings.NewReader(body))
+		n := 0
+		for {
+			var ev Event
+			if err := er.next(&ev); err != nil {
+				break
+			}
+			n++
+		}
+		er.release()
+		if n != 1000 {
+			b.Fatalf("read %d events, want 1000", n)
+		}
+	}
+	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*1000), "ns/event")
 }

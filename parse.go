@@ -21,8 +21,10 @@ package main
 
 import (
 	"errors"
+	"io"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode/utf16"
 	"unicode/utf8"
 )
@@ -777,4 +779,156 @@ func (p *parser) skipArray(depth int) error {
 			return errors.New("expected ',' or ']'")
 		}
 	}
+}
+
+// --- streaming ---
+
+// readBufSize is where an event stream's buffer starts. Events are a few
+// hundred bytes, so this holds dozens of them per read syscall; it grows only
+// if one event does not fit.
+const readBufSize = 16 << 10
+
+// eventReader pulls events one at a time out of a stream of them.
+//
+// It exists because §25 chose a stream deliberately: a batch body is decoded
+// in constant memory however long it runs, rather than being buffered whole
+// so its length could be read from the client. Replacing json.Decoder meant
+// replacing that too.
+//
+// It is not line-based, and that is a contract decision rather than an
+// oversight. §25 documented and tested that events may be separated by any
+// whitespace - pretty-printed, or several to a line - because json.Decoder
+// reads a stream of values rather than lines. Going line-based would have
+// been simpler and would have silently narrowed what the server accepts.
+type eventReader struct {
+	src io.Reader
+	buf []byte
+	pos int   // start of the unconsumed bytes
+	end int   // end of the valid bytes
+	err error // sticky: the read that ended the stream, EOF or otherwise
+
+	// The pooled array buf started as. Kept separately because growth
+	// replaces buf, and it is the original that goes back in the pool.
+	pooled *[]byte
+}
+
+// readBufPool keeps the read buffers alive between requests.
+//
+// Without it every request allocated 16 KiB, which a batch of a thousand
+// events never notices and a batch of one is dominated by: the first
+// measurement of this reader showed size-1 batches getting *slower* than the
+// decoder they replaced, at 21 kB per request. The buffer is the same for
+// every request and lives exactly as long as one, which is what a pool is
+// for.
+var readBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, readBufSize)
+		return &b
+	},
+}
+
+func newEventReader(r io.Reader) *eventReader {
+	p := readBufPool.Get().(*[]byte)
+	return &eventReader{src: r, buf: *p, pooled: p}
+}
+
+// release returns the buffer to the pool. Callers defer it.
+//
+// Only the original is returned, never one that grew to hold an oversized
+// event: pooling those would let a single hostile request leave a megabyte
+// of buffer resident for the life of the process.
+func (er *eventReader) release() {
+	if er.pooled != nil {
+		readBufPool.Put(er.pooled)
+		er.pooled = nil
+	}
+	er.buf, er.src = nil, nil
+}
+
+// next decodes the event after the last one, returning io.EOF at a clean end
+// of stream.
+//
+// A value split across two reads is the case this is all for: parseEvent says
+// errIncomplete, more bytes arrive, and the same value is parsed again from
+// its start. Re-parsing a prefix is cheap and happens at most once per refill,
+// where the alternative - a resumable parser - would complicate every
+// function in this file to save nothing measurable.
+func (er *eventReader) next(ev *Event) error {
+	for {
+		n, err := parseEvent(er.buf[er.pos:er.end], ev)
+		if err == nil {
+			er.pos += n
+			return nil
+		}
+		if err != errIncomplete {
+			return err
+		}
+
+		// Incomplete, so either more bytes are coming or the stream ended
+		// mid-value - or it ended cleanly and what is left is whitespace.
+		if er.err != nil {
+			if er.err == io.EOF {
+				if er.onlySpaceLeft() {
+					return io.EOF // the client finished
+				}
+				// A prefix of a value with nothing following: the batch
+				// really was cut short, so not a clean end.
+				return io.ErrUnexpectedEOF
+			}
+
+			// Any other read failure is reported even when the bytes left
+			// over are only whitespace. The events already handed over
+			// stand, but the stream did not end - it broke - and the server
+			// cannot know whether more events were in flight. Calling that
+			// a clean end would tell a client its whole batch was seen.
+			return er.err
+		}
+		if err := er.fill(); err != nil {
+			return err
+		}
+	}
+}
+
+func (er *eventReader) onlySpaceLeft() bool {
+	for _, c := range er.buf[er.pos:er.end] {
+		switch c {
+		case ' ', '\t', '\n', '\r':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// fill makes room and reads more.
+func (er *eventReader) fill() error {
+	// Slide the unconsumed bytes to the front before growing: usually the
+	// buffer is mostly consumed and no growth is needed at all.
+	if er.pos > 0 {
+		copy(er.buf, er.buf[er.pos:er.end])
+		er.end -= er.pos
+		er.pos = 0
+	}
+
+	if er.end == len(er.buf) {
+		// One event is bigger than the whole buffer. Growing is bounded by
+		// the body cap, which MaxBytesReader is enforcing on the reader
+		// anyway - so this can only ever double a few times.
+		if len(er.buf) >= maxBatchBody {
+			return errors.New("single event exceeds the body limit")
+		}
+		grown := make([]byte, min(len(er.buf)*2, maxBatchBody))
+		copy(grown, er.buf[:er.end])
+		er.buf = grown
+	}
+
+	n, err := er.src.Read(er.buf[er.end:])
+	er.end += n
+	if err != nil {
+		// Recorded rather than returned: the bytes just read may still hold
+		// whole events, and they must be applied before the stream's end is
+		// reported (§25's accounting contract).
+		er.err = err
+	}
+	return nil
 }

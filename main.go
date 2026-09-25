@@ -1,8 +1,8 @@
 package main
 
 import (
+	"bytes"
 	"context"       // shutdown deadline + signal-cancelled context
-	"encoding/json" // decode JSON request bodies into Go values
 	"errors"        // errors.As, to classify a read failure
 	"fmt"           // formatted printing (stdout + http responses)
 	"io"            // io.ReadAll, to slurp the request body
@@ -20,9 +20,13 @@ import (
 )
 
 // Event is the in-memory form of one metric observation.
-// The `json:"..."` struct tags map lowercase wire keys to these
-// capitalized (exported) fields, which is what json.Unmarshal needs
-// to be able to write into them.
+//
+// The `json:"..."` struct tags no longer drive decoding - parseEvent reads
+// the three wire keys directly (§30) - but they are not decoration. They
+// still describe the contract, they are what encoding/json uses when a test
+// or the load generator writes an event out, and they are what the
+// differential test compares this parser against. Changing one changes the
+// wire format, exactly as it did before.
 type Event struct {
 	Name  string  `json:"name"`  // metric name, e.g. "cpu.load"
 	Value float64 `json:"value"` // measured value; float so decimals work
@@ -388,12 +392,20 @@ func (s *Store) handleIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse the raw bytes into a structured Event.
-	// &ev passes the address so Unmarshal fills in *our* ev, not a copy.
+	// Parse the raw bytes into a structured Event (§30). Only malformed
+	// JSON fails here; missing fields are NOT an error, they stay at their
+	// zero values and validateEvent judges them (§12).
 	var ev Event
-	if err := json.Unmarshal(body, &ev); err != nil {
-		// Only fires on malformed JSON. Missing fields are NOT an
-		// error - they stay at their zero values (0, "").
+	n, err := parseEvent(body, &ev)
+	if err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	// parseEvent reads one value and stops. This endpoint takes exactly one
+	// event, so anything after it but whitespace is a malformed request -
+	// which is what json.Unmarshal used to enforce by requiring the whole
+	// body to be a single value.
+	if len(bytes.TrimSpace(body[n:])) != 0 {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
 		return
 	}

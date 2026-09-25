@@ -95,7 +95,8 @@ type BatchResponse struct {
 // beats quietly wrong data).
 func (s *Store) handleIngestBatch(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBatchBody)
-	dec := json.NewDecoder(r.Body)
+	events := newEventReader(r.Body)
+	defer events.release()
 
 	// One clock read for the whole batch, matching /ingest's single read
 	// per request. Every event is judged against the same now, so a batch
@@ -113,7 +114,7 @@ func (s *Store) handleIngestBatch(w http.ResponseWriter, r *http.Request) {
 	retryable := 0 // rejects that may succeed later, i.e. cardinality
 	for index := 0; ; index++ {
 		var ev Event
-		err := dec.Decode(&ev)
+		err := events.next(&ev)
 		if errors.Is(err, io.EOF) {
 			break // clean end of the batch
 		}
