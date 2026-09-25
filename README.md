@@ -71,6 +71,31 @@ latency and in how much one dropped connection costs. See [DESIGN.md](DESIGN.md)
 §25 for the measurements and for what the batch path deliberately does *not*
 optimise.
 
+## Parsing
+
+Events are decoded by a hand-written parser for this one three-field schema
+rather than by `encoding/json`. Reflection was 73% of the per-event ingest
+cost; the parser is about 4x faster and allocates a third as much, which
+roughly doubles end-to-end throughput at realistic batch sizes.
+
+Writing a JSON parser is an easy way to be subtly wrong, and being wrong here
+would change the wire format under existing clients. So it is not justified by
+reading the spec carefully — it is held to `encoding/json` by differential
+testing: a table of ~150 inputs plus a fuzz target requiring the two to agree
+on every input, both on the decoded event and on whether it was valid at all.
+
+That caught real bugs. The table found that a bare `null` is valid and that
+skipping unknown fields by counting brackets accepts `{"a":{"b":}}`. The
+fuzzer found the one no hand-written case would have: `encoding/json` does not
+reject invalid UTF-8 in a string, it silently replaces each bad byte with
+U+FFFD. Run it yourself:
+
+```
+go test -run=XXX -fuzz=FuzzParseEventAgreesWithEncodingJSON -fuzztime=60s
+```
+
+See [DESIGN.md](DESIGN.md) §30.
+
 ## Clients and fairness
 
 A caller identifies itself with `X-Client-ID`. The server then budgets it
@@ -321,7 +346,8 @@ an alerting layer with flap suppression, graceful shutdown, a fully
 timed-out HTTP server that sheds load rather than queueing it, panic
 recovery on both the request path and the background loops, a bounded and
 pageable query path, per-client concurrency and name-rate budgets so one
-noisy client cannot starve the rest, a bounded
+noisy client cannot starve the rest, a fuzz-verified hand-written JSON parser
+on the ingest path, a bounded
 metric cardinality with a sweeper to reclaim idle names, a store whose lock
 is sharded by metric name (14.9x on concurrent writes to distinct metrics,
 measured before and after), a batch endpoint that turns that into 50x end to

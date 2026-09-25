@@ -945,7 +945,9 @@ overhead, and that is all it needs to do.
 
 The next bottleneck is therefore named where it actually is: JSON decoding,
 at roughly one allocation and 56 bytes per event, most of it the metric name
-string.
+string. **Taken up in §30**, which replaces it with a parser for this one
+schema and roughly doubles end-to-end throughput - the difference between
+optimising the dominant term and optimising the 14% this section declined to.
 
 **What batching costs, stated plainly.**
 
@@ -1568,6 +1570,137 @@ difference: the budget is now spent by whoever is spending it.
 - *The overflow bucket is shared.* Past `maxClients`, honest newcomers land in
   the same bucket as whoever filled the table. Their traffic is still bounded
   and still served; they simply stop being isolated from each other.
+
+### 30. Parsing the one shape this server ingests
+
+§25 measured the batch path at ~730 ns per event and found decoding was 536 of
+it — 73%, against about 100 ns for everything the store does. It named JSON
+decoding as the next bottleneck and left it there. A probe split the number
+further:
+
+| | ns/op | allocs |
+| --- | --- | --- |
+| `json.Unmarshal`, one event | 372 | 1 (48 B) |
+| `validateEvent` | 15 | 0 |
+
+So the cost is reflection, not validation, and the allocation is the metric
+name. Reflection is the right default for arbitrary structures and the wrong
+one for a fixed schema of three fields, which is what this server ingests and
+all it will ever ingest.
+
+| | before | after |
+| --- | --- | --- |
+| plain event | 372 ns / 48 B / 1 alloc | **96 ns / 16 B / 1 alloc** |
+| with unknown fields | 748 ns / 48 B / 1 alloc | **185 ns / 16 B / 1 alloc** |
+
+**The safety argument, which matters more than the number.** Writing a JSON
+parser is an excellent way to be subtly wrong, and being subtly wrong here
+changes the wire format under existing clients — a worse bug than a slow
+server. So the parser is not justified by reading the spec carefully. It is
+held to `encoding/json` by differential testing: for any input, the two must
+agree both on the decoded event and on whether the input was valid at all.
+
+A table of ~150 inputs encodes the standard library's quirks, each of which
+had to be taught rather than guessed:
+
+- field names match exactly, then case-insensitively (`{"NAME":"x"}` sets
+  `Name`);
+- the later of two duplicate keys wins;
+- `null` leaves a field at its zero value rather than erroring, for every
+  type, including a bare top-level `null`;
+- an integer field is parsed from the literal text, so `"ts":1e3` and
+  `"ts":1.0` are errors though both name whole numbers;
+- the number grammar rejects `01`, `1.`, `.5` and `+1`.
+
+**The table found three divergences before the fuzzer ran.** A bare `null`
+decodes to the zero value; my first version demanded an object. And skipping
+unknown fields by counting brackets accepted `{"a":{"b":}}` and `{"a":[1,]}` —
+both balance perfectly and neither is JSON. Skipping now parses properly, with
+a depth limit matching `encoding/json`'s, because without one a body of open
+brackets recurses once per byte and `maxBatchBody` allows a million of them.
+
+**The fuzzer found the one no hand-written table here would have.**
+`encoding/json` does not *reject* invalid UTF-8 inside a string — it silently
+replaces each bad byte with U+FFFD. Passing the raw bytes through would have
+stored metric names the old decoder could never produce. It surfaced on the
+eighth seed within a tenth of a second, and ~24 M executions since have found
+nothing else.
+
+**Allocation took two passes after the first correct version.** Field names
+were being turned into strings purely to be compared and thrown away — three
+an event — and nested keys and strings inside *skipped* fields were too. Both
+now work on bytes, and the float literal reaches `ParseFloat` through a stack
+buffer. What remains is one allocation for the metric name, which has to
+become a string because the store keeps it as a map key.
+
+**Streaming had to be rebuilt, not swapped.** §25 chose a stream deliberately
+so a batch decodes in constant memory however long it runs, and `json.Decoder`
+was providing that. `eventReader` replaces it: a buffer, a parse, and a refill
+when `parseEvent` reports the value is only a prefix so far. A value split
+across two reads is re-parsed from its start, which is cheap and happens at
+most once per refill, where a resumable parser would complicate every function
+in the file to save nothing measurable.
+
+It is **not line-based**, which was the tempting simplification. §25 documented
+and tested that events may be separated by any whitespace — pretty-printed, or
+several to a line — because a stream of JSON values is not a stream of lines.
+Going line-based would have been easier and would have silently narrowed what
+the server accepts. Every §25 batch test passing unchanged is the proof it
+did not.
+
+**Pooling the read buffers was not optional.** The first measurement showed
+size-1 batches getting *slower* than the decoder they replaced — 3618 ns
+against 2843 — because every request allocated 16 kB that a batch of one is
+entirely dominated by. Pooled, the same case is 1845 ns. Only the original
+buffer goes back; one that grew to hold an oversized event is dropped, or a
+single hostile request would leave a megabyte resident for the life of the
+process.
+
+| batch size | before | after |
+| --- | --- | --- |
+| 1 | 2843 ns/event | 1845 |
+| 10 | 868 | 604 |
+| 100 | 766 | **243** |
+| 1000 | 777 | **243** |
+| 10000 | 713 | 229 |
+
+Live, 8 workers over a real socket:
+
+| | before | after |
+| --- | --- | --- |
+| `-batch 1` | 56 100 events/sec | 74 655 |
+| `-batch 100` | 1 544 644 | **2 916 426** |
+| `-batch 1000` | 2 851 755 | **5 822 152** |
+
+Roughly double at realistic batch sizes, with `verify` exact at every size.
+This is the difference §25 predicted between optimising the dominant term and
+optimising a measurable but invisible one: decoding was 73% of per-event cost,
+so halving it moves a number clients see. The shard-grouping idea §25 cancelled
+was 14%, and would not have.
+
+**One behaviour changed on purpose**, found by a test rather than planned. A
+read error that is *not* EOF is now reported even when the leftover bytes are
+whitespace. The events already handed over stand, but the stream broke rather
+than ended, and the server cannot know whether more was in flight — calling
+that a clean end would tell a client its whole batch had been seen.
+
+**What this deliberately does not do.**
+
+- *`encoding/json` is still here*, and should be: it encodes every response,
+  it is what the load generator and the tests use to write events, and it is
+  the oracle the parser is tested against. Replacing it on the output path
+  would be optimising something nobody is waiting on.
+- *The struct tags stay.* They no longer drive decoding, but they still
+  describe the contract, they are what `encoding/json` uses when a test writes
+  an event out, and changing one still changes the wire format.
+- *The metric name is still allocated.* Interning it against the store's
+  existing keys would remove that for established metrics, but it adds a map
+  lookup to the hot path in exchange for an allocation — plausibly a wash.
+  Not attempted, and explicitly not measured; it would need the measurement
+  before the code.
+- *The parser reads `Event` and nothing else.* It is not a general JSON
+  library and must not become one: its correctness argument is that it agrees
+  with `encoding/json` on this one shape, and that argument does not extend.
 
 ## Testing
 

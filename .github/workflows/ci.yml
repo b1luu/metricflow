@@ -56,6 +56,25 @@ jobs:
       - name: benchmarks compile and run
         run: go test ./... -run='^$' -bench=. -benchtime=10x
 
+      # §30: the hand-written parser is only defensible while it agrees with
+      # encoding/json, and the seed corpus that runs with the ordinary tests
+      # only covers the cases somebody thought of. A short fuzz run on every
+      # push looks for the ones nobody did - it found the invalid-UTF-8
+      # divergence in under a second. A failure writes the offending input
+      # into testdata, so it becomes a permanent regression test rather than
+      # a one-off red build; the upload keeps it when the runner is thrown
+      # away.
+      - name: the parser must keep agreeing with encoding/json
+        run: go test -run='^$' -fuzz=FuzzParseEventAgreesWithEncodingJSON -fuzztime=45s .
+
+      - name: keep whatever the fuzzer found
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus
+          path: testdata/fuzz/
+          if-no-files-found: ignore
+
   # The end-to-end claim from DESIGN §21: over a real socket, the server
   # records exactly as many events as it accepted. loadgen exits non-zero on
   # a mismatch, which is what makes it usable as a gate rather than a demo.
