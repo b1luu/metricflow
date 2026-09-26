@@ -117,6 +117,26 @@ func (s *Store) sweep(now time.Time) (metrics, buckets int) {
 	return metrics, buckets
 }
 
+// size reports how many metrics and how many buckets the store holds.
+//
+// One shard lock at a time, like every other walk (§24). The answer is a
+// gauge rather than a snapshot and does not need to be consistent across
+// shards - it is read once a second to record §31's own metrics, where being
+// a few writes out of date is not a defect.
+func (s *Store) size() (metrics, buckets int) {
+	for i := range s.shards {
+		sh := &s.shards[i]
+
+		sh.mu.Lock()
+		metrics += len(sh.aggs)
+		for _, series := range sh.aggs {
+			buckets += len(series)
+		}
+		sh.mu.Unlock()
+	}
+	return metrics, buckets
+}
+
 // Sweep reclaims idle metrics every `every` until ctx is cancelled.
 //
 // The interval is a parameter rather than the constant so tests can run it
@@ -135,6 +155,7 @@ func (s *Store) Sweep(ctx context.Context, every time.Duration) {
 			// process was descheduled the tick is the honest answer for
 			// when this sweep was due.
 			if metrics, buckets := s.sweep(tick); metrics > 0 {
+				s.counts.addSwept(metrics)
 				log.Printf("swept %d idle metrics (%d buckets)", metrics, buckets)
 			}
 		}

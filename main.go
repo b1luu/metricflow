@@ -79,6 +79,12 @@ type shard struct {
 // each other - which is the ceiling §5 measured.
 type Store struct {
 	shards [shardCount]shard
+
+	// counts is the server's own telemetry (§31). It lives on the Store
+	// because the ingest and sweep paths are where the numbers happen, and
+	// threading a separate object through both would be the same coupling
+	// with more parameters.
+	counts counters
 }
 
 // newStore returns a ready-to-use Store with every shard's map initialized.
@@ -143,7 +149,12 @@ func (s *Store) recordFor(now time.Time, c *client, ev Event) error {
 		// Existing metrics keep working however full the shard is. That is
 		// the property the whole limit is for: a client inventing names
 		// must not be able to degrade the metrics that were already there.
-		if len(sh.aggs) >= maxMetricsPerShard {
+		// The reserved namespace is exempt (§31). Self-metrics must not be
+		// the first thing to fail when the store fills, because a full
+		// store is exactly when somebody needs to see that it is full. The
+		// set is fixed by self.go rather than by any client, so exempting
+		// it cannot let anything grow without bound.
+		if !reserved(ev.Name) && len(sh.aggs) >= maxMetricsPerShard {
 			return errCardinality
 		}
 
@@ -356,6 +367,13 @@ func validateEvent(now time.Time, ev Event) error {
 		return fmt.Errorf("name is %d bytes, over the %d-byte limit",
 			len(ev.Name), maxMetricNameLen)
 	}
+	// The reserved namespace belongs to the server (§31). A client that
+	// could write into it could forge the one signal an operator reaches
+	// for during an incident - filling metricflow.requests.shed with zeroes
+	// would make a shedding server look calm.
+	if reserved(ev.Name) {
+		return fmt.Errorf("%q is reserved for the server's own metrics", selfPrefix)
+	}
 	if ev.TS == 0 {
 		return errors.New("ts is required (unix milliseconds)")
 	}
@@ -413,9 +431,11 @@ func (s *Store) handleIngest(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	c, _ := clientFrom(r.Context())
 	if err := s.admitFor(now, c, ev); err != nil {
+		s.counts.addRejected(1)
 		writeIngestError(w, err)
 		return
 	}
+	s.counts.addAccepted(1)
 
 	fmt.Fprintln(w, "got it")
 }
@@ -624,7 +644,20 @@ func run(ctx context.Context, ln net.Listener) error {
 	}
 	log.Printf("serving at most %d requests at once", limit)
 
-	srv := newServer(routes(store, alerter, newLimiter(limit), newClients()))
+	lim, cls := newLimiter(limit), newClients()
+
+	// The server records its own telemetry into its own store (§31), so
+	// /stats, the alerting rules and retention all apply to it unchanged.
+	reporter := newSelfReporter(store, lim, cls, &store.counts)
+	selfDone := make(chan struct{})
+	go func() {
+		defer close(selfDone)
+		supervise(ctx, "self-reporter", panicBackoff, func(ctx context.Context) {
+			reporter.Run(ctx, selfInterval)
+		})
+	}()
+
+	srv := newServer(routes(store, alerter, lim, cls))
 
 	errc := make(chan error, 1)
 	go func() {
@@ -644,10 +677,11 @@ func run(ctx context.Context, ln net.Listener) error {
 	defer cancel()
 	shutdownErr := srv.Shutdown(shutdownCtx)
 
-	// Both background loops watch ctx, which is already cancelled, so these
-	// return promptly.
+	// Every background loop watches ctx, which is already cancelled, so
+	// these return promptly.
 	<-alertDone
 	<-sweepDone
+	<-selfDone
 	return shutdownErr
 }
 

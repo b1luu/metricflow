@@ -176,6 +176,12 @@ func (s *Store) handleIngestBatch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Once per request with the batch's totals, rather than once per event
+	// inside the loop: same numbers, one atomic instead of ten thousand
+	// (§31).
+	s.counts.addAccepted(resp.Accepted)
+	s.counts.addRejected(resp.Rejected)
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	// Nothing useful to do if this fails: the client hung up mid-read, and
