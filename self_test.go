@@ -359,3 +359,112 @@ func TestSelfMetricsAreQueryableLikeAnyOther(t *testing.T) {
 		t.Error("an ordinary metric came back from a reserved-prefix query")
 	}
 }
+
+// --- alerting on the server itself ---
+
+// A cumulative counter cannot be alerted on with max: it only rises, so a
+// rule on it fires once and stays firing for the life of the process. That
+// is the gap §31 created by choosing cumulative counters, and StatIncrease
+// is what closes it.
+func TestStatIncreaseReadsACounterAsItsRise(t *testing.T) {
+	a := Agg{Count: 3, Sum: 60, Min: 10, Max: 30}
+
+	cases := []struct {
+		stat Stat
+		want float64
+	}{
+		{StatIncrease, 20},
+		{StatMax, 30},
+		{StatMin, 10},
+	}
+	for _, c := range cases {
+		if got := (Rule{Stat: c.stat}).statValue(a); got != c.want {
+			t.Errorf("%s = %v, want %v", c.stat, got, c.want)
+		}
+	}
+
+	// A counter that has not moved must read as zero rather than as its
+	// height, or every rule fires the moment the process has done anything.
+	flat := Agg{Count: 5, Sum: 5000, Min: 1000, Max: 1000}
+	if got := (Rule{Stat: StatIncrease}).statValue(flat); got != 0 {
+		t.Errorf("a flat counter read as an increase of %v, want 0", got)
+	}
+}
+
+func TestStatIncreaseIsAValidStat(t *testing.T) {
+	r := Rule{Name: "r", Metric: "m", Stat: StatIncrease, Op: OpGT, Value: 1}
+	if err := r.Validate(); err != nil {
+		t.Errorf("a rule using %s was rejected: %v", StatIncrease, err)
+	}
+}
+
+// The argument for recording self-telemetry as metrics is that everything
+// else reaches it unchanged. The alerting layer is the strongest case: these
+// are ordinary rules over the ordinary store, and they had to work with no
+// changes to the alerter at all.
+func TestTheServerCanAlertOnItself(t *testing.T) {
+	s := newStore()
+	r, l, _ := newTestReporter(s)
+
+	rules := []Rule{
+		{Name: "server-shedding", Metric: selfShed, Stat: StatIncrease, Op: OpGT, Value: 0},
+	}
+	now := time.Now()
+	a, err := newAlerter(now, s, rules)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Quiet: a baseline sample, and nothing shed.
+	r.sample(now)
+	_ = captureLog(t, func() { a.evaluateAll(now) })
+	if got := a.Snapshot()[0].State; got != StateOK {
+		t.Errorf("state = %s with nothing shed, want %s", got, StateOK)
+	}
+
+	// Now the server starts shedding, and says so about itself.
+	l.shed.Add(42)
+	r.sample(now)
+	_ = captureLog(t, func() { a.evaluateAll(now) })
+
+	got := a.Snapshot()[0]
+	if got.State != StateFiring {
+		t.Errorf("state = %s after 42 shed requests, want %s", got.State, StateFiring)
+	}
+	if got.Value != 42 {
+		t.Errorf("value = %v, want 42 - the increase across the window", got.Value)
+	}
+}
+
+// The rules the server ships with have to be valid, or it refuses to start
+// (§18) - and these are the ones nobody would notice were broken, because
+// they only matter during an incident.
+func TestTheSelfHealthRulesAreValidAndWired(t *testing.T) {
+	rules := defaultRules()
+
+	byName := map[string]Rule{}
+	for _, r := range rules {
+		if err := r.Validate(); err != nil {
+			t.Errorf("default rule %q is invalid: %v", r.Name, err)
+		}
+		byName[r.Name] = r
+	}
+
+	for _, name := range []string{"server-shedding", "cardinality-pressure"} {
+		r, ok := byName[name]
+		if !ok {
+			t.Errorf("default rules do not include %q", name)
+			continue
+		}
+		if !reserved(r.Metric) {
+			t.Errorf("%q watches %q, which is not a self-metric", name, r.Metric)
+		}
+	}
+
+	// The cardinality alert has to arrive before the store is full, not
+	// when it already is: by then legitimate new metrics are being refused.
+	if r := byName["cardinality-pressure"]; r.Value >= shardCount*maxMetricsPerShard {
+		t.Errorf("cardinality-pressure fires at %v, which is at or past the ceiling of %d",
+			r.Value, shardCount*maxMetricsPerShard)
+	}
+}

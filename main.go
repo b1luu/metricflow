@@ -538,6 +538,25 @@ func defaultRules() []Rule {
 		// affected, which is the thing worth waking someone for (§23).
 		{Name: "slow-requests", Metric: "http.latency_ms", Stat: StatP99, Op: OpGT, Value: 500,
 			For: 20 * time.Second},
+
+		// The server watching itself (§31). These are the same Rule type
+		// over the same store as everything above, which is the argument
+		// for recording self-telemetry as metrics rather than as a special
+		// response field: the alerting layer needed no changes to reach it.
+		//
+		// Shedding is measured as an increase because the counter is
+		// cumulative. For 30s so a brief burst - which shedding is designed
+		// to absorb - does not page anyone; sustained shedding means the
+		// fleet has outgrown this server and somebody should know.
+		{Name: "server-shedding", Metric: selfShed, Stat: StatIncrease, Op: OpGT, Value: 0,
+			For: 30 * time.Second},
+
+		// Cardinality is a gauge, so max is the right stat. Fires at 80% of
+		// the ceiling rather than at it: by the time the store is full,
+		// legitimate new metrics are already being refused, and the point
+		// of the alert is to arrive before that.
+		{Name: "cardinality-pressure", Metric: selfStoreMetrics, Stat: StatMax, Op: OpGT,
+			Value: 0.8 * shardCount * maxMetricsPerShard, For: 30 * time.Second},
 	}
 }
 

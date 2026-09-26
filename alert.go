@@ -34,6 +34,17 @@ const (
 	StatP50 Stat = "p50"
 	StatP90 Stat = "p90"
 	StatP99 Stat = "p99"
+
+	// StatIncrease is max - min across the window, which is what a
+	// cumulative counter means (§31). The server's own telemetry is
+	// recorded that way, and without this stat none of it could be alerted
+	// on: max of a counter only ever rises, so a rule on it fires once and
+	// stays firing for the life of the process.
+	//
+	// It is meaningless on a gauge, where max and min are just the extremes
+	// of a fluctuating value - but so is p99 on a counter. Which stat suits
+	// which metric is the rule author's business, as it already was.
+	StatIncrease Stat = "increase"
 )
 
 // Op is the comparison a rule applies to its stat.
@@ -96,7 +107,7 @@ func (r Rule) Validate() error {
 	}
 
 	switch r.Stat {
-	case StatAvg, StatMax, StatMin, StatCount, StatP50, StatP90, StatP99:
+	case StatAvg, StatMax, StatMin, StatCount, StatP50, StatP90, StatP99, StatIncrease:
 	default:
 		return fmt.Errorf("rule %q: unknown stat %q", r.Name, r.Stat)
 	}
@@ -129,6 +140,12 @@ func (r Rule) statValue(a Agg) float64 {
 		return a.Sum / float64(a.Count)
 	case StatMax:
 		return a.Max
+	case StatIncrease:
+		// A counter only rises, so the span of values seen inside the
+		// window is the amount it rose by. A missed sample costs accuracy
+		// here but never correctness, which is why the counters are
+		// recorded cumulatively rather than as deltas (§31).
+		return a.Max - a.Min
 	case StatMin:
 		return a.Min
 	case StatCount:
