@@ -41,6 +41,12 @@ memory as one.
 
 ### 2. In-memory state, no persistence
 
+*Revisited by §32. The store is still in memory and still the only copy that
+serves a request - but it is now snapshotted to disk periodically and
+restored at startup, so a restart is no longer a reset. The reasoning below
+stands; what changed is that "no persistence" turned out to cost more than it
+saved once the server had anything worth keeping.*
+
 `aggs` is a plain map that lives only in the process.
 
 - **Why:** simplest thing that works; the goal is to learn the aggregation
@@ -1810,6 +1816,124 @@ one-second sampling interval costs.
   the evidence with it. That is the honest limit of self-monitoring, and the
   reason it complements an external check rather than replacing one — which is
   what `/health` has always been for.
+
+### 32. Surviving a restart
+
+§2 chose in-memory state with no persistence, and every section since has been
+written on top of it: a restart loses the last minute of every metric. §31
+sharpened that into a sentence — the server cannot observe its own death,
+because the evidence dies with it.
+
+**What to persist follows from §1, not from taste.** That section chose to
+store the conclusion rather than the events, and persistence inherits the
+choice. A write-ahead log of events would contradict it outright, and the
+arithmetic settles it: at the 5.8 M events/sec §30 measured, a WAL is
+megabytes a second of disk written to reconstruct numbers the server already
+has. The aggregates *are* the conclusion, they are small, and they are what a
+restart needs back.
+
+So: **a periodic snapshot of the aggregates**, loaded at startup. The cost is
+bounded and stated rather than hidden — a crash loses at most one snapshot
+interval, and a graceful shutdown loses nothing, because it takes a final one
+on the way out.
+
+**The histogram goes in the file too.** Dropping it would leave a restore that
+looks right on count and average and is wrong on exactly the percentiles §23
+exists for. A test asserts the p99 of a 990-fast, 10-slow distribution
+survives, because that is the number a lossy round trip would quietly flatten.
+
+**Three properties, all about a file that might be damaged**, none about
+speed. Snapshots are written once an interval, so nothing here is on a hot
+path.
+
+*A half-written file is never loaded.* Temp file, sync, rename. Without the
+sync a crash can land the rename before the contents and leave an empty file
+where a good snapshot was; without the rename a crash mid-write leaves a
+partial file that the next start would refuse — throwing away a perfectly good
+older snapshot to no purpose.
+
+*A corrupt file is refused, not misread.* Magic bytes, a version and a
+checksum, all verified before a single aggregate is decoded. Every single-bit
+flip and every truncation of a real snapshot is rejected — about a thousand
+cases, asserted exhaustively rather than sampled.
+
+*A damaged file cannot crash or exhaust the process.* Every length prefix is
+checked against the bytes actually remaining, so a flipped byte claiming four
+billion buckets is an error rather than an allocation. That is **not**
+redundant with the checksum: a file can be internally consistent and still be
+nonsense, so the test re-checksums after corrupting a length, to test the
+bounds rather than the CRC. Removing those checks does not produce a wrong
+answer — it panics the process on allocation.
+
+**The reserved namespace is excluded** (§31). Self-metrics describe one
+process, and the process loading the file is a different one: carrying a
+predecessor's counters forward would make a counter appear to fall the moment
+the new process starts its own at zero, which is the one thing a counter must
+never do. A file that *does* contain them was not written by this server, so
+loading refuses them too.
+
+**Restoring respects what is already true of the store.** Buckets that aged out
+while the server was down are dropped — retention (§10), not data loss. The
+cardinality cap still applies (§27), so a snapshot taken under a larger cap
+cannot exceed a smaller one just because the data used to fit. Both counts are
+logged, because a restart that silently restored a third of its metrics would
+look exactly like one that restored all of them.
+
+**Two failures, treated oppositely**, and the asymmetry is deliberate. A path
+the operator got wrong, or a corrupt file, is **fatal at startup**: it is
+certainly wrong and nothing is lost by refusing, the same call §18 makes for a
+bad alert rule and §26 for a bad in-flight limit. A write that fails **later**
+is logged and the loop carries on, because killing a working server to protest
+a full disk would throw away the very data persistence exists to protect.
+
+`METRICFLOW_SNAPSHOT` names the file; empty means off, which is the default, so
+a server never configured for persistence behaves exactly as it did before —
+including writing no files at all.
+
+**The cost:**
+
+| | |
+| --- | --- |
+| encoded size | 289 bytes per metric |
+| a full store (32 582 metrics) | 9.00 MB |
+| snapshot, 2 000 metrics | 1.14 ms |
+| decode, 2 000 metrics | 0.89 ms |
+
+So a full store is roughly 18 ms of encoding every ten seconds — under 0.2% of
+one core — and 9 MB written. The allocation is the output buffer growing by
+doubling; sizing it from the previous snapshot's length is the obvious
+improvement if that ever matters, and it does not yet.
+
+**Live, as a real crash rather than a clean one** — hard kill, no graceful
+shutdown, no final snapshot:
+
+```
+before:   4 metrics, 2212100 / 2200100 / 2213300 / 2206000 events, p99 10.075
+restart:  restored 4 metrics (4 buckets), 0 dropped as stale
+after:    identical counts, identical p99
+```
+
+Identical because the last periodic snapshot caught everything. A crash
+*between* snapshots loses up to one interval — that is the bound, not a
+promise of zero.
+
+**What this deliberately does not do.**
+
+- *It is not a write-ahead log, and bounded loss is the design rather than a
+  shortcoming.* Zero-loss durability means persisting every event before
+  acknowledging it, which is a different system with a different throughput
+  story — and one that contradicts §1.
+- *One file, no history.* There is no rotation and no previous generation to
+  fall back on: a snapshot that is corrupt on disk means starting empty, after
+  being told so. Keeping the last good one would be cheap and is the first
+  thing to add if this is ever operated seriously.
+- *No format migration.* The version is part of the magic, so a future format
+  is refused rather than misread — an upgraded server starts empty and says
+  why. That is the right failure, but it is a failure.
+- *No compression.* 9 MB at full cardinality is not worth a dependency or a
+  hand-rolled encoder, and the file is written once every ten seconds.
+- *It does not make the store durable, only the process restartable.* The disk
+  is the same machine's; this survives a process dying, not the machine.
 
 ## Testing
 

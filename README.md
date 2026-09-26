@@ -71,6 +71,34 @@ latency and in how much one dropped connection costs. See [DESIGN.md](DESIGN.md)
 §25 for the measurements and for what the batch path deliberately does *not*
 optimise.
 
+## Surviving a restart
+
+Set `METRICFLOW_SNAPSHOT` to a file path and the store is written there every
+10s and restored at startup. Empty means off, which is the default.
+
+```
+METRICFLOW_SNAPSHOT=/var/lib/metricflow/snap.bin ./metricflow
+```
+
+What gets persisted is the *aggregates*, not the events — which follows from
+the same choice §1 made. A write-ahead log at 5.8M events/sec would be
+megabytes a second of disk to rebuild numbers the server already has; the
+aggregates are the conclusion, and they are 289 bytes per metric (9 MB at full
+cardinality). Histograms go in the file too, so percentiles survive rather than
+being silently flattened to averages.
+
+A graceful shutdown loses nothing — it takes a final snapshot on the way out.
+A crash loses at most one interval. That bound is the design, not a
+shortcoming: zero-loss durability means persisting every event before
+acknowledging it, which is a different system.
+
+The file is written temp-sync-rename so a reader never sees a partial one, and
+carries a magic, a version and a checksum so a damaged one is refused rather
+than misread — every single-bit flip and every truncation of a real snapshot
+is rejected by a test. A bad path or a corrupt file stops startup; a write that
+fails later is logged and the server keeps serving. See [DESIGN.md](DESIGN.md)
+§32.
+
 ## The server watching itself
 
 MetricFlow records its own telemetry into its own store, under a reserved
@@ -383,8 +411,10 @@ end (§25), and a load harness
 (benchmarks, concurrency invariants, and an HTTP load generator that verifies
 the server recorded exactly what it accepted).
 
-Known limits, all deliberate and argued in [DESIGN.md](DESIGN.md): state is
-in-memory and resets on restart (§2); only the aggregates decided up front are
+Known limits, all deliberate and argued in [DESIGN.md](DESIGN.md): the store
+is in memory, and persistence (§32) bounds what a crash costs rather than
+eliminating it — up to one snapshot interval, and nothing at all on a graceful
+shutdown; only the aggregates decided up front are
 kept, so a statistic nobody planned for can't be back-filled (§1); percentiles
 are accurate to 1% rather than exact, which is the price of not keeping events
 (§23); `/stats` reads one shard at a time, so a response is not a single

@@ -310,3 +310,89 @@ jobs:
             sleep 0.2
           done
           echo "server did not exit within 5s of SIGTERM"; cat server.log; exit 1
+
+  # §32: a graceful restart must lose nothing. Its own job because it needs a
+  # server that is stopped and started again, which the e2e job's single
+  # long-lived server cannot provide.
+  #
+  # This is also the one claim that cannot be made on the development machine:
+  # taskkill does not deliver a signal a Go console process can catch on
+  # Windows, so the graceful path - and the final snapshot it triggers - only
+  # ever runs for real here.
+  persistence:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - run: go build -o metricflow .
+      - run: go build -o loadgen ./cmd/loadgen
+
+      - name: fill a server and stop it gracefully
+        env:
+          METRICFLOW_SNAPSHOT: snap.bin
+        run: |
+          ./metricflow > first.log 2>&1 &
+          echo $! > server.pid
+          for i in $(seq 1 50); do
+            curl -sf localhost:8080/health > /dev/null && break
+            sleep 0.2
+          done
+
+          ./loadgen -duration 3s -workers 8 -batch 50 -client persist
+          curl -sf "localhost:8080/stats?prefix=metric." > before.json
+
+          kill -TERM "$(cat server.pid)"
+          for i in $(seq 1 25); do
+            kill -0 "$(cat server.pid)" 2>/dev/null || break
+            sleep 0.2
+          done
+          if kill -0 "$(cat server.pid)" 2>/dev/null; then
+            echo "the server did not exit"; cat first.log; exit 1
+          fi
+          cat first.log
+
+      - name: a restart must bring the data back
+        env:
+          METRICFLOW_SNAPSHOT: snap.bin
+        run: |
+          ls -l snap.bin
+
+          ./metricflow > second.log 2>&1 &
+          echo $! > server.pid
+          for i in $(seq 1 50); do
+            curl -sf localhost:8080/health > /dev/null && break
+            sleep 0.2
+          done
+          curl -sf "localhost:8080/stats?prefix=metric." > after.json
+
+          grep -E "restored" second.log || { echo "no restore line"; cat second.log; exit 1; }
+
+          python3 - <<'PY'
+          import json, sys
+
+          def load(path):
+              with open(path) as f:
+                  return json.load(f)["metrics"]
+
+          before, after = load("before.json"), load("after.json")
+
+          if not before:
+              sys.exit("the first server recorded nothing; this proves nothing")
+
+          for name, b in sorted(before.items()):
+              a = after.get(name)
+              if a is None:
+                  sys.exit("%s did not survive the restart" % name)
+              for field in ("count", "avg", "min", "max", "p50", "p90", "p99"):
+                  if a[field] != b[field]:
+                      sys.exit("%s %s = %r after the restart, %r before"
+                               % (name, field, a[field], b[field]))
+              print("%-30s count=%-10d p99=%-10g survived intact" % (name, a["count"], a["p99"]))
+
+          print("%d metrics restored with every number identical" % len(before))
+          PY
+
+          kill -TERM "$(cat server.pid)" || true
