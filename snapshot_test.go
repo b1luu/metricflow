@@ -14,6 +14,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -760,5 +762,231 @@ func TestACorruptSnapshotStopsStartup(t *testing.T) {
 		}
 	case <-time.After(20 * time.Second):
 		t.Fatal("the server neither started nor failed")
+	}
+}
+
+// --- under concurrency ---
+
+// A snapshot is taken from a live server, so it is read while ingest writes,
+// the sweeper deletes and /stats walks. It takes the same per-shard locks as
+// everything else (§24), and this says so rather than assuming it.
+//
+// Two things are checked. Every snapshot must decode - a torn write would
+// produce a file that fails its own checksum or its own bounds - and every
+// metric inside one must be internally consistent, because each metric's
+// buckets are read under a single lock hold.
+//
+// Consistency is checkable because every event for a metric carries that
+// metric's own constant value, so min, max and sum/count must all equal it.
+// A metric captured half-updated would not satisfy that.
+func TestSnapshottingWhileEverythingElseRuns(t *testing.T) {
+	const (
+		writers   = 8
+		perWriter = 3000
+		snappers  = 2
+	)
+
+	s := newStore()
+
+	// Stable metrics, each with its own constant value.
+	value := map[string]float64{}
+	for i := 0; i < 24; i++ {
+		value[fmt.Sprintf("stable.%02d", i)] = float64(i + 1)
+	}
+
+	var (
+		wgWork   sync.WaitGroup
+		wgBg     sync.WaitGroup
+		done     atomic.Bool
+		taken    atomic.Int64
+		failures = make(chan string, 32)
+	)
+	fail := func(msg string) {
+		select {
+		case failures <- msg:
+		default:
+		}
+	}
+
+	// Writers: half to the stable set, half creating names the sweeper will
+	// reclaim, so the shards' own maps are under constant write. Reusing a
+	// handful of names would leave the snapshot walk with nothing to race
+	// against - the lesson §31's concurrency test had to learn.
+	stale := time.Now().Add(-window - time.Minute)
+	names := make([]string, 0, len(value))
+	for n := range value {
+		names = append(names, n)
+	}
+
+	for w := 0; w < writers; w++ {
+		wgWork.Add(1)
+		go func(w int) {
+			defer wgWork.Done()
+			for i := 0; i < perWriter; i++ {
+				now := time.Now()
+				if i%2 == 0 {
+					n := names[i%len(names)]
+					_ = s.record(now, Event{Name: n, Value: value[n], TS: now.UnixMilli()})
+				} else {
+					_ = s.record(stale, Event{
+						Name:  fmt.Sprintf("churn.%d.%d", w, i),
+						Value: 1, TS: stale.UnixMilli()})
+				}
+			}
+		}(w)
+	}
+
+	for sn := 0; sn < snappers; sn++ {
+		wgBg.Add(1)
+		go func() {
+			defer wgBg.Done()
+			for !done.Load() {
+				data := s.snapshot(time.Now())
+
+				metrics, _, err := decodeSnapshot(data)
+				if err != nil {
+					fail(fmt.Sprintf("a snapshot taken under load did not decode: %v", err))
+					return
+				}
+				taken.Add(1)
+
+				for _, m := range metrics {
+					v, ok := value[m.name]
+					if !ok {
+						continue // one of the churn metrics
+					}
+					for key, a := range m.buckets {
+						if a.Count <= 0 {
+							fail(fmt.Sprintf("%s bucket %d has Count=%d", m.name, key, a.Count))
+							continue
+						}
+						if a.Min != v || a.Max != v || a.Sum != v*float64(a.Count) {
+							fail(fmt.Sprintf(
+								"%s bucket %d is torn: count=%d sum=%v min=%v max=%v, every value is %v",
+								m.name, key, a.Count, a.Sum, a.Min, a.Max, v))
+						}
+					}
+				}
+			}
+		}()
+	}
+
+	wgBg.Add(1)
+	go func() {
+		defer wgBg.Done()
+		for !done.Load() {
+			s.sweep(time.Now())
+		}
+	}()
+
+	wgWork.Wait()
+	done.Store(true)
+	wgBg.Wait()
+	close(failures)
+
+	for msg := range failures {
+		t.Error(msg)
+	}
+	if taken.Load() == 0 {
+		t.Fatal("no snapshot completed; nothing here overlapped")
+	}
+}
+
+// Writing to disk under load has the same requirement, plus one more: the
+// file left behind must be a whole snapshot rather than whichever bytes the
+// last writer happened to flush.
+func TestWritingSnapshotsToDiskUnderLoad(t *testing.T) {
+	const (
+		writers   = 8
+		perWriter = 2000
+	)
+
+	path := filepath.Join(t.TempDir(), "snap.bin")
+	s := newStore()
+
+	var (
+		wgWork sync.WaitGroup
+		wgBg   sync.WaitGroup
+		done   atomic.Bool
+		wrote  atomic.Int64
+		errs   = make(chan error, 8)
+	)
+
+	stale := time.Now().Add(-window - time.Minute)
+	for w := 0; w < writers; w++ {
+		wgWork.Add(1)
+		go func(w int) {
+			defer wgWork.Done()
+			for i := 0; i < perWriter; i++ {
+				now := time.Now()
+				if i%2 == 0 {
+					_ = s.record(now, Event{
+						Name: fmt.Sprintf("live.%02d", i%16), Value: 2, TS: now.UnixMilli()})
+				} else {
+					_ = s.record(stale, Event{
+						Name:  fmt.Sprintf("churn.%d.%d", w, i),
+						Value: 1, TS: stale.UnixMilli()})
+				}
+			}
+		}(w)
+	}
+
+	// Writer and reader of the same file at once, which is what a restart
+	// racing a snapshot would look like.
+	wgBg.Add(1)
+	go func() {
+		defer wgBg.Done()
+		for !done.Load() {
+			if err := s.writeSnapshot(path, time.Now()); err != nil {
+				select {
+				case errs <- err:
+				default:
+				}
+				return
+			}
+			wrote.Add(1)
+
+			// Read it straight back: the rename is what guarantees this
+			// sees a whole file rather than a partial one.
+			restored := newStore()
+			if _, _, _, err := restored.readSnapshot(path, time.Now()); err != nil {
+				select {
+				case errs <- fmt.Errorf("reading back a snapshot written under load: %w", err):
+				default:
+				}
+				return
+			}
+		}
+	}()
+
+	wgWork.Wait()
+	done.Store(true)
+	wgBg.Wait()
+	close(errs)
+
+	for err := range errs {
+		t.Error(err)
+	}
+	if wrote.Load() == 0 {
+		t.Fatal("no snapshot was written")
+	}
+
+	// One more now that everything has stopped, and assert on that rather
+	// than on whatever the loop last managed. The writers finish in a
+	// couple of milliseconds while a write-and-read-back takes longer, so
+	// the loop can legitimately get exactly one snapshot in - the empty one
+	// it took before any writer had recorded anything. Asserting on that
+	// was a flake, and it failed on the second run rather than the first.
+	if err := s.writeSnapshot(path, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	restored := newStore()
+	loaded, _, _, err := restored.readSnapshot(path, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded == 0 {
+		t.Error("a snapshot of the final state held nothing")
 	}
 }
