@@ -1,10 +1,16 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/crc32"
+	"io"
 	"math"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -523,5 +529,236 @@ func BenchmarkDecodeSnapshot(b *testing.B) {
 		if _, _, err := decodeSnapshot(data); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// --- the whole lifecycle ---
+
+// runUntil starts a server on its own listener and returns a stop function.
+func runUntil(t *testing.T, snapPath string) (addr string, stop func() error) {
+	t.Helper()
+	t.Setenv("METRICFLOW_SNAPSHOT", snapPath)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errc := make(chan error, 1)
+	go func() { errc <- run(ctx, ln) }()
+
+	return ln.Addr().String(), func() error {
+		cancel()
+		select {
+		case err := <-errc:
+			return err
+		case <-time.After(20 * time.Second):
+			return errors.New("the server did not shut down")
+		}
+	}
+}
+
+func postEvent(t *testing.T, addr, name string, value float64) {
+	t.Helper()
+	body := fmt.Sprintf(`{"name":%q,"value":%v,"ts":%d}`, name, value, time.Now().UnixMilli())
+
+	resp, err := http.Post("http://"+addr+"/ingest", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("ingest returned %d", resp.StatusCode)
+	}
+}
+
+func fetchStats(t *testing.T, addr, query string) StatsResponse {
+	t.Helper()
+	resp, err := http.Get("http://" + addr + "/stats" + query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	var out StatsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// The claim §32 exists to make: a planned restart loses nothing. Driven
+// through the real lifecycle - a real listener, real HTTP, a real shutdown -
+// because every part of this is in run() rather than in the store.
+func TestDataSurvivesAGracefulRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "snap.bin")
+
+	addr, stop := runUntil(t, path)
+	for i := 0; i < 100; i++ {
+		postEvent(t, addr, "svc.api.latency", float64(10+i%5))
+	}
+	postEvent(t, addr, "svc.api.errors", 3)
+
+	before := fetchStats(t, addr, "")
+	if err := stop(); err != nil {
+		t.Fatalf("shutting down: %v", err)
+	}
+
+	// A different process, as far as the store is concerned.
+	addr2, stop2 := runUntil(t, path)
+	defer stop2()
+
+	after := fetchStats(t, addr2, "")
+
+	for _, name := range []string{"svc.api.latency", "svc.api.errors"} {
+		b, ok := before.Metrics[name]
+		if !ok {
+			t.Fatalf("%s was missing before the restart", name)
+		}
+		a, ok := after.Metrics[name]
+		if !ok {
+			t.Errorf("%s did not survive the restart", name)
+			continue
+		}
+		if a.Count != b.Count || a.Avg != b.Avg || a.Min != b.Min || a.Max != b.Max {
+			t.Errorf("%s: count/avg = %d/%v after, %d/%v before",
+				name, a.Count, a.Avg, b.Count, b.Avg)
+		}
+		// The percentiles are the part a lossy format would flatten.
+		if a.P99 != b.P99 {
+			t.Errorf("%s: p99 = %v after, %v before", name, a.P99, b.P99)
+		}
+	}
+}
+
+// Self-metrics are the exception, and must be: they describe a process, and
+// this is a new one (§31).
+func TestSelfMetricsDoNotSurviveARestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "snap.bin")
+
+	addr, stop := runUntil(t, path)
+	postEvent(t, addr, "svc.real", 1)
+
+	// Wait for the reporter's first sample to be visible.
+	deadline := time.After(10 * time.Second)
+	for len(fetchStats(t, addr, "?prefix="+selfPrefix).Metrics) == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("no self-metrics before the restart")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if err := stop(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The file must not contain them at all.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics, _, err := decodeSnapshot(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range metrics {
+		if reserved(m.name) {
+			t.Errorf("%s was persisted", m.name)
+		}
+	}
+
+	// And the real metric did survive, or this test proves nothing about
+	// the exclusion being selective.
+	addr2, stop2 := runUntil(t, path)
+	defer stop2()
+	if _, ok := fetchStats(t, addr2, "").Metrics["svc.real"]; !ok {
+		t.Error("svc.real did not survive; the snapshot carried nothing")
+	}
+}
+
+// Persistence is off unless asked for, so a server that was never configured
+// for it behaves exactly as it did before §32 - including leaving no files
+// behind.
+func TestPersistenceIsOffByDefault(t *testing.T) {
+	dir := t.TempDir()
+
+	addr, stop := runUntil(t, "")
+	postEvent(t, addr, "svc.api", 1)
+	if err := stop(); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("an unconfigured server wrote %d files", len(entries))
+	}
+}
+
+// A path the operator got wrong is found at startup rather than at the first
+// tick, and is fatal: it is certainly wrong, and nothing is lost by
+// refusing to start.
+func TestAnUnwritableSnapshotPathStopsStartup(t *testing.T) {
+	t.Setenv("METRICFLOW_SNAPSHOT", filepath.Join(t.TempDir(), "no-such-dir", "snap.bin"))
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errc := make(chan error, 1)
+	go func() { errc <- run(ctx, ln) }()
+
+	select {
+	case err := <-errc:
+		if err == nil {
+			t.Fatal("the server started with an unwritable snapshot path")
+		}
+		if !strings.Contains(err.Error(), "snap.bin") {
+			t.Errorf("error = %q, want it to name the path", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("the server neither started nor failed")
+	}
+}
+
+// A corrupt file is fatal too, for the same reason: an operator who
+// configured persistence should be told it failed, not left to wonder where
+// the data went.
+func TestACorruptSnapshotStopsStartup(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "snap.bin")
+	if err := os.WriteFile(path, []byte("definitely not a snapshot"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("METRICFLOW_SNAPSHOT", path)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errc := make(chan error, 1)
+	go func() { errc <- run(ctx, ln) }()
+
+	select {
+	case err := <-errc:
+		if err == nil {
+			t.Fatal("the server started from a corrupt snapshot")
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("the server neither started nor failed")
 	}
 }

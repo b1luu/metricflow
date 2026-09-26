@@ -627,6 +627,29 @@ func ranAndPanicked(ctx context.Context, name string, backoff time.Duration, fn 
 func run(ctx context.Context, ln net.Listener) error {
 	store := newStore()
 
+	// Persistence (§32), before anything else touches the store: whatever
+	// survived the last shutdown should be there before the first request
+	// is served, so a restart is invisible to a dashboard rather than a gap
+	// followed by a recovery.
+	snapPath := snapshotPath()
+	if snapPath != "" {
+		now := time.Now()
+		loaded, dropped, buckets, err := store.readSnapshot(snapPath, now)
+		if err != nil {
+			return fmt.Errorf("restoring %s: %w", snapPath, err)
+		}
+		log.Printf("restored %d metrics (%d buckets) from %s, %d dropped as stale",
+			loaded, buckets, snapPath, dropped)
+
+		// One write immediately, so a path the operator got wrong is found
+		// now rather than at the first tick. Fatal for the same reason a
+		// bad alert rule or a bad in-flight limit is: it is certainly
+		// wrong, and nothing is lost by refusing to start.
+		if err := store.writeSnapshot(snapPath, now); err != nil {
+			return fmt.Errorf("writing %s: %w", snapPath, err)
+		}
+	}
+
 	// Bad rules are a programming error, so fail before serving a single
 	// request rather than discovering it on the first tick.
 	alerter, err := newAlerter(time.Now(), store, defaultRules())
@@ -676,6 +699,19 @@ func run(ctx context.Context, ln net.Listener) error {
 		})
 	}()
 
+	// The periodic snapshot, once the store has something worth writing.
+	// Nothing runs it when persistence is off, so the loop is not started.
+	snapDone := make(chan struct{})
+	go func() {
+		defer close(snapDone)
+		if snapPath == "" {
+			return
+		}
+		supervise(ctx, "snapshotter", panicBackoff, func(ctx context.Context) {
+			store.Snapshot(ctx, snapPath, snapshotInterval)
+		})
+	}()
+
 	srv := newServer(routes(store, alerter, lim, cls))
 
 	errc := make(chan error, 1)
@@ -701,6 +737,20 @@ func run(ctx context.Context, ln net.Listener) error {
 	<-alertDone
 	<-sweepDone
 	<-selfDone
+	<-snapDone
+
+	// A final snapshot once everything has stopped writing, so a planned
+	// restart loses nothing at all rather than up to one interval. Taken
+	// after the loops have joined, so nothing is mutating the store while
+	// it is being read.
+	if snapPath != "" {
+		if err := store.writeSnapshot(snapPath, time.Now()); err != nil {
+			log.Printf("final snapshot failed: %v", err)
+		} else {
+			log.Printf("wrote a final snapshot to %s", snapPath)
+		}
+	}
+
 	return shutdownErr
 }
 

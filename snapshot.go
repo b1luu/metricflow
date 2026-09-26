@@ -35,10 +35,12 @@ package main
 //     allocation.
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"log"
 	"math"
 	"os"
 	"path/filepath"
@@ -59,6 +61,46 @@ const (
 )
 
 var crcTable = crc32.MakeTable(crc32.Castagnoli)
+
+// snapshotInterval is how often the store is written out, and therefore how
+// much a crash costs: at most one interval of aggregates.
+//
+// Tied to bucketWidth because that is already the granularity everything
+// else moves at, and because it puts the loss below the resolution of a
+// single /stats bucket - a crash cannot lose a whole bucket's worth of an
+// answer without also losing the bucket.
+const snapshotInterval = bucketWidth
+
+// snapshotPath is the file to persist to, from METRICFLOW_SNAPSHOT.
+//
+// Empty means off, which is the default and keeps a server that was never
+// configured for persistence behaving exactly as it did before.
+func snapshotPath() string { return os.Getenv("METRICFLOW_SNAPSHOT") }
+
+// Snapshot writes the store every `every` until ctx is cancelled.
+//
+// A write failure here is logged and the loop carries on, which is the
+// opposite of how a bad path is treated at startup, and the asymmetry is
+// deliberate. A configuration that is wrong before the server has served
+// anything is certainly wrong and costs nothing to refuse. A disk that
+// fills at three in the morning is a different thing: killing a working
+// server to protest it would throw away the very data persistence exists to
+// protect, so it stays up and stays loud.
+func (s *Store) Snapshot(ctx context.Context, path string, every time.Duration) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case tick := <-t.C:
+			if err := s.writeSnapshot(path, tick); err != nil {
+				log.Printf("snapshot failed: %v", err)
+			}
+		}
+	}
+}
 
 // snapshot serialises every live bucket in the store.
 //
