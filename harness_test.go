@@ -1014,10 +1014,13 @@ func TestShedIngestRequestsAreNeverRecorded(t *testing.T) {
 			strings.NewReader(ingestJSON("cpu.load", 1)))
 	})
 
-	if shed == 0 {
-		t.Fatalf("nothing was shed at capacity %d with %d concurrent clients; "+
-			"the test is not exercising the path it claims to", capacity, clients)
-	}
+	// Deliberately not asserting that anything *was* shed. Whether 32
+	// clients at capacity 2 actually collide depends on how much
+	// parallelism the machine offers, and CI caught this failing on a
+	// two-core runner where they simply did not. The claim that shedding
+	// refuses before the handler is made deterministically by
+	// TestEverythingShedIsRecordedNowhere below; what a race can prove is
+	// only that the accounting holds however the scheduler behaves.
 	if served+shed != int64(clients*perClient) {
 		t.Errorf("served %d + shed %d != %d requests sent", served, shed, clients*perClient)
 	}
@@ -1029,6 +1032,77 @@ func TestShedIngestRequestsAreNeverRecorded(t *testing.T) {
 	if int64(got.Count) != served {
 		t.Errorf("recorded %d events but only %d requests were served - "+
 			"a shed request reached the store", got.Count, served)
+	}
+}
+
+// The claim the two tests above cannot make on their own, made without any
+// dependence on timing: a limiter of capacity zero sheds *everything*, so
+// nothing may reach the store and every request must say so.
+//
+// This is the third time a shed- or contention-dependent assertion has turned
+// out to rest on how many cores the machine has - §29's in-flight cap test and
+// §31's self-reporting test were the others. The pattern is the same each
+// time, and so is the fix: assert the property where it holds by construction,
+// and let the concurrent test assert only what a race can actually prove.
+func TestEverythingShedIsRecordedNowhere(t *testing.T) {
+	const requests = 200
+
+	s := newStore()
+	a, err := newAlerter(time.Now(), s, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := routes(s, a, newLimiter(0), newClients())
+
+	for i := 0; i < requests; i++ {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/ingest",
+			strings.NewReader(ingestJSON("cpu.load", 1))))
+
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("request %d: status = %d, want 503 from a limiter of capacity 0",
+				i, rec.Code)
+		}
+	}
+
+	if got := metricCount(s); got != 0 {
+		t.Errorf("store holds %d metrics after %d shed requests", got, requests)
+	}
+	if _, ok := mergeAll(s, "cpu.load"); ok {
+		t.Error("a shed request reached the store")
+	}
+}
+
+// The same, for the batch path: a shed batch must contribute nothing and must
+// not come back carrying a reply that claims otherwise.
+func TestEveryShedBatchContributesNothing(t *testing.T) {
+	const requests = 100
+
+	s := newStore()
+	a, err := newAlerter(time.Now(), s, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := routes(s, a, newLimiter(0), newClients())
+
+	body := ndjson(validEvents("cpu.load", 25)...)
+	for i := 0; i < requests; i++ {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/ingest/batch",
+			strings.NewReader(body)))
+
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("request %d: status = %d, want 503", i, rec.Code)
+		}
+
+		var resp BatchResponse
+		if json.Unmarshal(rec.Body.Bytes(), &resp) == nil && resp.Accepted > 0 {
+			t.Fatalf("request %d: a 503 reported %d accepted", i, resp.Accepted)
+		}
+	}
+
+	if got := metricCount(s); got != 0 {
+		t.Errorf("store holds %d metrics after %d shed batches", got, requests)
 	}
 }
 
@@ -1102,9 +1176,8 @@ func TestShedBatchesContributeNothing(t *testing.T) {
 	for msg := range failures {
 		t.Error(msg)
 	}
-	if shed.Load() == 0 {
-		t.Fatalf("nothing was shed at capacity %d; the test proves nothing", capacity)
-	}
+	// As above: whether this races hard enough to shed is the scheduler's
+	// business, and the deterministic claim lives in its own test.
 
 	got, ok := mergeAll(s, "cpu.load")
 	if !ok {
