@@ -1048,6 +1048,11 @@ It also means the capacity check runs *before* the method check, so `GET
 under overload the server should not spend cycles classifying requests it is
 not going to serve.
 
+*(The counters named here were exposed in §31, which reversed the "keep them
+to tests" half of that call while keeping the reason behind it: they are
+published as metrics under a reserved prefix, not as extra fields bolted onto
+the stats response.)*
+
 **`/health` is exempt, and it is the exemption that matters.** A health check
 that gets shed makes an overloaded server look like a dead one, so whatever
 is watching — an orchestrator, a load balancer — kills or depools the
@@ -1701,6 +1706,110 @@ that a clean end would tell a client its whole batch had been seen.
 - *The parser reads `Event` and nothing else.* It is not a general JSON
   library and must not become one: its correctness argument is that it agrees
   with `encoding/json` on this one shape, and that argument does not extend.
+
+### 31. The server watching itself
+
+§26, §27 and §29 each added a counter and each stopped short of exposing it.
+`shedded()`, `throttledCount()` and `tracked()` had exactly **zero callers
+outside tests**: the server counted how often it refused a request for
+capacity, how often it throttled a client, and how many clients it was
+tracking, and an operator running it could see none of that.
+
+§26 argued for leaving them there — *"a property of the server, not of the
+metrics, and putting it in /stats would mix the two."* Half of that was right,
+and it is worth separating the halves.
+
+Bolting server counters onto the *shape* of the stats response — extra fields
+beside the per-metric numbers — really would have mixed two unrelated things,
+and would have made every client parse a response whose structure depended on
+what the server felt like reporting. But the conclusion did not follow. A
+metrics server's own telemetry **is** metrics. The right way to expose it is as
+metrics: a reserved name prefix, queried with the same `?prefix=`, alerted on
+with the same rules, aged out by the same retention. Prometheus does exactly
+this with its own series, for the same reason.
+
+**Two properties make that safe**, and both matter more than the exposure.
+
+*A client cannot write into the reserved namespace.* Without it, the one signal
+an operator reaches for during an incident is the one an incident can forge: a
+service filling `metricflow.requests.shed` with zeroes makes a shedding server
+look calm. It is a **permanent** rejection rather than a retryable one (§27,
+§29), because no amount of waiting makes the name acceptable.
+
+*The reserved namespace ignores the cardinality cap.* Self-metrics must not be
+the first thing to fail when the store fills, because a full store is exactly
+when somebody needs to see that it is full. That exemption is only safe
+because the set is fixed by `self.go` rather than by any client — it cannot
+grow without bound, which is the whole reason §27's cap exists.
+
+**Counters are cumulative, not per-interval deltas.** The store is windowed, so
+a cumulative counter reads back as `max - min` over the window: the increase
+across it. That is how Prometheus treats counters, and it survives a missed
+sample where a delta would lose one permanently.
+
+That choice left a gap in the alerting layer, which is the sort of consequence
+worth following rather than shrugging at. None of §18's stats can read a
+counter: `max` only ever rises, so a rule on it fires once and stays firing for
+the life of the process, and an alert that is always on is an alert nobody
+reads. **`StatIncrease`** is `max - min`, and closes it. It is meaningless on a
+gauge — but so is `p99` on a counter, and which stat suits which metric was
+already the rule author's business.
+
+**Two default rules, which are the point rather than a garnish.** They are
+ordinary `Rule`s over the ordinary store, and the alerter needed *no changes at
+all* to reach them. That is the argument for recording self-telemetry as
+metrics instead of as a special response field, made concrete:
+
+- `server-shedding` on the increase, `For: 30s`, so a brief burst — which
+  shedding exists to absorb (§26) — does not page anyone, while sustained
+  shedding means the fleet has outgrown this server.
+- `cardinality-pressure` on the gauge's max, firing at **80%** of the ceiling
+  rather than at it. By the time the store is full, legitimate new metrics are
+  already being refused; the point of an alert is to arrive before that. A test
+  pins that it fires below the ceiling, because a threshold quietly set at 100%
+  would look right and be useless.
+
+Both are validated at startup or the server refuses to run (§18), which matters
+most for exactly these: they are the rules nobody would notice were broken,
+because they only fire during an incident.
+
+**The counters are incremented once per request**, with a batch's totals, not
+once per event. A batch of ten thousand would otherwise take ten thousand
+atomic increments on a counter every core is touching — contended, and
+measurable against a 96 ns parse (§30). Adding the totals once gives the same
+number for the price of one.
+
+**Live**, with the in-flight limit at 4 and 64 workers hammering it, the
+server's account and the load generator's independent one agree:
+
+| | |
+| --- | --- |
+| loadgen | 245 718 requests shed, 324 099 served |
+| `metricflow.requests.shed` | increase **243 692** |
+| `metricflow.events.accepted` | increase 6 429 840 |
+| `metricflow.runtime.goroutines` | 6 → 108 |
+
+The remaining gap is the tail after the final sample, which is what a
+one-second sampling interval costs.
+
+**What this deliberately does not do.**
+
+- *No heap or GC statistics.* `runtime.ReadMemStats` stops the world, and doing
+  that once a second to report on memory would be a real cost to justify a
+  number nobody asked for yet. `runtime/metrics` reads most of the same figures
+  without the pause and is the right way in if this is ever wanted.
+- *Self-metrics consume store capacity.* Nine metrics and their buckets, out of
+  a 32 768 ceiling. The gauges also report a store that includes themselves —
+  a fixed offset, and cheaper to explain than to correct for, since the size is
+  read before each sample writes itself.
+- *Sampling bounds the resolution.* Anything shorter than a second is invisible
+  except through its effect on a counter, and the last fraction of a second
+  before a crash is never recorded at all.
+- *The server cannot observe its own death.* Everything here lives in the same
+  process and the same memory as the thing it measures (§2), so a crash takes
+  the evidence with it. That is the honest limit of self-monitoring, and the
+  reason it complements an external check rather than replacing one — which is
+  what `/health` has always been for.
 
 ## Testing
 

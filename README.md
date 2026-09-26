@@ -71,6 +71,33 @@ latency and in how much one dropped connection costs. See [DESIGN.md](DESIGN.md)
 §25 for the measurements and for what the batch path deliberately does *not*
 optimise.
 
+## The server watching itself
+
+MetricFlow records its own telemetry into its own store, under a reserved
+`metricflow.` prefix — shedding, throttling, events accepted and rejected,
+metrics swept, clients tracked, store size, goroutines. They are ordinary
+metrics, so `/stats`, `?prefix=`, the retention window and the alerting rules
+all reach them with no special casing:
+
+```
+curl -s "localhost:8080/stats?prefix=metricflow.&window=30s"
+```
+
+Counters are cumulative, so the increase across the window is `max - min` —
+the same treatment Prometheus gives them, and what the `increase` alert stat
+reads. The server ships with two rules watching itself: sustained shedding,
+and cardinality passing 80% of its ceiling.
+
+Two things make this safe rather than decorative. **Clients cannot write the
+reserved prefix**, or a service could forge the one signal an operator trusts
+during an incident. And **the reserved prefix ignores the cardinality cap**,
+because self-metrics must not be the first thing to fail when the store fills
+— which is exactly when someone needs to see that it is full.
+
+It does not replace an external check: everything here lives in the same
+process as the thing it measures, so a crash takes the evidence with it. That
+is what `/health` is for. See [DESIGN.md](DESIGN.md) §31.
+
 ## Parsing
 
 Events are decoded by a hand-written parser for this one three-field schema
@@ -347,7 +374,8 @@ timed-out HTTP server that sheds load rather than queueing it, panic
 recovery on both the request path and the background loops, a bounded and
 pageable query path, per-client concurrency and name-rate budgets so one
 noisy client cannot starve the rest, a fuzz-verified hand-written JSON parser
-on the ingest path, a bounded
+on the ingest path, telemetry the server records about itself and alerts on,
+a bounded
 metric cardinality with a sweeper to reclaim idle names, a store whose lock
 is sharded by metric name (14.9x on concurrent writes to distinct metrics,
 measured before and after), a batch endpoint that turns that into 50x end to

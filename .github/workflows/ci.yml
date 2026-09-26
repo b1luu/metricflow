@@ -245,6 +245,45 @@ jobs:
       - name: overload must shed, and stay exact while shedding
         run: ./loadgen -duration 5s -workers 64 -batch 20 -expect-shed
 
+      # §31: the server must be able to account for the incident it just
+      # had. This is the end-to-end claim that self-telemetry is wired to the
+      # real counters rather than to zeroes - the run above shed hundreds of
+      # thousands of requests, so the increase must be positive.
+      #
+      # Written in python rather than jq, unlike the gate in the e2e job,
+      # because jq is not installed on the machine this was developed on and
+      # an assertion nobody can dry-run is an assertion nobody has checked.
+      - name: the server must report its own shedding
+        run: |
+          curl -sf --max-time 10 "localhost:8080/stats?prefix=metricflow." > self.json
+          python3 - <<'PY'
+          import json, sys
+
+          with open("self.json") as f:
+              metrics = json.load(f)["metrics"]
+
+          for name in sorted(metrics):
+              m = metrics[name]
+              print("%-38s min=%-14g max=%-14g increase=%g"
+                    % (name, m["min"], m["max"], m["max"] - m["min"]))
+
+          def increase(name):
+              if name not in metrics:
+                  sys.exit("the server published no %s at all" % name)
+              m = metrics[name]
+              return m["max"] - m["min"]
+
+          shed = increase("metricflow.requests.shed")
+          accepted = increase("metricflow.events.accepted")
+
+          if shed <= 0:
+              sys.exit("the server shed requests but reports an increase of %g" % shed)
+          if accepted <= 0:
+              sys.exit("the server served requests but reports %g accepted" % accepted)
+          print("self-telemetry agrees with the incident: shed +%g, accepted +%g"
+                % (shed, accepted))
+          PY
+
       - name: /health must answer even while the server is shedding
         run: |
           ./loadgen -duration 5s -workers 64 -batch 20 -expect-shed -verify=false &
