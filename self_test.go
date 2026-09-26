@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -466,5 +468,152 @@ func TestTheSelfHealthRulesAreValidAndWired(t *testing.T) {
 	if r := byName["cardinality-pressure"]; r.Value >= shardCount*maxMetricsPerShard {
 		t.Errorf("cardinality-pressure fires at %v, which is at or past the ceiling of %d",
 			r.Value, shardCount*maxMetricsPerShard)
+	}
+}
+
+// --- under concurrency ---
+
+// The reporter writes into the store it is sampling, while ingest writes,
+// /stats reads and the sweeper deletes. It takes the same locks as everything
+// else, and this is the test that says so - Go panics on concurrent map
+// access even without -race, so a dropped lock anywhere here fails loudly.
+//
+// The invariant checked is the one a counter must never break: it may lag,
+// but it may never go backwards. A reader that saw a counter fall would
+// conclude the server had restarted.
+func TestSelfReportingUnderConcurrentEverything(t *testing.T) {
+	const (
+		writers   = 8
+		perWriter = 4000
+		readers   = 3
+	)
+
+	s := newStore()
+	r, l, cs := newTestReporter(s)
+
+	var (
+		wgWork   sync.WaitGroup
+		wgBg     sync.WaitGroup
+		done     atomic.Bool
+		failures = make(chan string, 16)
+	)
+	fail := func(msg string) {
+		select {
+		case failures <- msg:
+		default:
+		}
+	}
+
+	// Ingest, plus the counters an ingest path would move.
+	//
+	// Half the traffic goes to a stable set of names and half invents a new
+	// one each time, stamped old enough for the sweeper to reclaim it. That
+	// churn is the point: writing to an existing metric only touches its
+	// own series, so a test that reused a handful of names would never have
+	// two goroutines writing the shard's own map at once - which is exactly
+	// the race size() would lose. An earlier version did that and passed
+	// with size()'s lock removed.
+	old := time.Now().Add(-window - time.Minute)
+	for w := 0; w < writers; w++ {
+		wgWork.Add(1)
+		go func(w int) {
+			defer wgWork.Done()
+			for i := 0; i < perWriter; i++ {
+				now := time.Now()
+				if i%2 == 0 {
+					_ = s.record(now, Event{
+						Name: fmt.Sprintf("svc.stable.%d", i%32), Value: 1, TS: now.UnixMilli()})
+				} else {
+					_ = s.record(old, Event{
+						Name: fmt.Sprintf("svc.churn.%d.%d", w, i), Value: 1, TS: old.UnixMilli()})
+				}
+				s.counts.addAccepted(1)
+				l.shed.Add(1)
+				cs.get(fmt.Sprintf("client-%d", i%8))
+			}
+		}(w)
+	}
+
+	// The reporter, hammered far harder than once a second, and running
+	// until the writers are done rather than for a fixed count. A fixed
+	// count finishes before the writers get going and the two never
+	// overlap, which would leave this asserting nothing about concurrency -
+	// verified by removing size()'s lock and watching the test still pass.
+	var sampled atomic.Int64
+	wgBg.Add(1)
+	go func() {
+		defer wgBg.Done()
+		for !done.Load() {
+			r.sample(time.Now())
+			sampled.Add(1)
+		}
+	}()
+
+	// Readers, watching for a counter that goes backwards.
+	for i := 0; i < readers; i++ {
+		wgBg.Add(1)
+		go func() {
+			defer wgBg.Done()
+			var highest float64
+			for !done.Load() {
+				resp, err := statsVia(s, "?prefix="+selfPrefix)
+				if err != nil {
+					fail(err.Error())
+					return
+				}
+				m, ok := resp.Metrics[selfAccepted]
+				if !ok {
+					continue // not sampled yet
+				}
+				if m.Max < highest {
+					fail(fmt.Sprintf("%s fell from %v to %v; a counter must never go backwards",
+						selfAccepted, highest, m.Max))
+				}
+				highest = m.Max
+			}
+		}()
+	}
+
+	// And the sweeper, deleting whatever has gone idle underneath it all.
+	wgBg.Add(1)
+	go func() {
+		defer wgBg.Done()
+		for !done.Load() {
+			s.sweep(time.Now())
+		}
+	}()
+
+	wgWork.Wait()
+	done.Store(true)
+	wgBg.Wait()
+	close(failures)
+
+	for msg := range failures {
+		t.Error(msg)
+	}
+	if sampled.Load() == 0 {
+		t.Fatal("the reporter never sampled; nothing here overlapped")
+	}
+
+	// The self-metrics survived: they are written continuously, so no sweep
+	// can reclaim them.
+	for _, name := range []string{selfAccepted, selfShed, selfGoroutines} {
+		got, ok := mergeAll(s, name)
+		if !ok {
+			t.Errorf("%s was swept away despite being written throughout", name)
+			continue
+		}
+		if got.Count == 0 {
+			t.Errorf("%s holds no observations", name)
+		}
+	}
+
+	// And the final sample agrees with the counter it is reporting.
+	got, ok := mergeAll(s, selfAccepted)
+	if !ok {
+		t.Fatal("no accepted-events samples")
+	}
+	if total := float64(s.counts.accepted.Load()); got.Max > total {
+		t.Errorf("%s reported %v, past the counter's actual %v", selfAccepted, got.Max, total)
 	}
 }
