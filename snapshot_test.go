@@ -1259,3 +1259,74 @@ func TestACrashBetweenRenamesIsRecoverable(t *testing.T) {
 		t.Error("the previous generation did not carry the data")
 	}
 }
+
+// The wiring, end to end: a server that started with a damaged snapshot says
+// so in its own metrics.
+//
+// This is the assertion the previous commit deferred. Checking that the
+// counter increments when the increment method is called proves nothing -
+// what matters is that the startup path calls it, and that the number
+// reaches a client through the ordinary query path, because that is the only
+// form in which anybody will ever see it.
+func TestACorruptSnapshotIsVisibleInStats(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "snap.bin")
+	for _, p := range []string{path, path + ".prev"} {
+		if err := os.WriteFile(p, []byte("shredded"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	addr, stop := runUntil(t, path)
+	defer stop()
+
+	// The reporter samples once at startup, but on its own goroutine, so
+	// the first sample may not have landed yet.
+	if got := awaitSelfMetric(t, addr, selfSnapLoadFail); got.Max < 1 {
+		t.Errorf("%s = %v, want a failure reported", selfSnapLoadFail, got.Max)
+	}
+}
+
+// The other side of it: a server that restored cleanly must report no
+// failures, or the metric is just a constant and an alert on it would fire
+// on every healthy restart.
+func TestACleanRestartReportsNoLoadFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "snap.bin")
+
+	addr, stop := runUntil(t, path)
+	postEvent(t, addr, "svc.requests", 1)
+	if err := stop(); err != nil {
+		t.Fatalf("shutting down: %v", err)
+	}
+
+	addr, stop = runUntil(t, path)
+	defer stop()
+
+	if _, ok := fetchStats(t, addr, "").Metrics["svc.requests"]; !ok {
+		t.Fatal("setup: the restart did not restore the data")
+	}
+
+	// Waiting for the metric to be present first, because "absent" would
+	// satisfy a check for zero without proving anything at all.
+	got := awaitSelfMetric(t, addr, selfSnapLoadFail)
+	if got.Max != 0 {
+		t.Errorf("%s = %v after a clean restart, want 0", selfSnapLoadFail, got.Max)
+	}
+}
+
+// awaitSelfMetric waits for the reporter's first sample to land. It runs on
+// its own goroutine, so a metric may legitimately not be there yet.
+func awaitSelfMetric(t *testing.T, addr, name string) MetricStats {
+	t.Helper()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if got, ok := fetchStats(t, addr, "").Metrics[name]; ok {
+			return got
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s was never published", name)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}

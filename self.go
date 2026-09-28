@@ -65,6 +65,15 @@ const (
 	selfStoreMetrics = selfPrefix + "store.metrics"           // gauge
 	selfStoreBuckets = selfPrefix + "store.buckets"           // gauge
 	selfGoroutines   = selfPrefix + "runtime.goroutines"      // gauge
+
+	// Persistence (§33). Published only when a snapshot path is configured,
+	// because a server with persistence switched off has no snapshot age,
+	// and a zero there would read as "just snapshotted" - indistinguishable
+	// from the healthiest possible value. Absence is the honest answer.
+	selfSnapAge       = selfPrefix + "snapshot.age_seconds"    // gauge
+	selfSnapBytes     = selfPrefix + "snapshot.bytes"          // gauge
+	selfSnapWriteFail = selfPrefix + "snapshot.write_failures" // counter
+	selfSnapLoadFail  = selfPrefix + "snapshot.load_failures"  // counter
 )
 
 // reserved reports whether a metric name belongs to the server rather than
@@ -118,10 +127,14 @@ type selfReporter struct {
 	limiter *limiter
 	clients *clients
 	counts  *counters
+
+	// nil when persistence is switched off, which is a state the reporter
+	// has to represent rather than paper over.
+	snap *snapshotter
 }
 
-func newSelfReporter(s *Store, l *limiter, cs *clients, c *counters) *selfReporter {
-	return &selfReporter{store: s, limiter: l, clients: cs, counts: c}
+func newSelfReporter(s *Store, l *limiter, cs *clients, c *counters, sn *snapshotter) *selfReporter {
+	return &selfReporter{store: s, limiter: l, clients: cs, counts: c, snap: sn}
 }
 
 // sample records one observation of every self-metric.
@@ -154,12 +167,31 @@ func (r *selfReporter) sample(now time.Time) {
 	}
 
 	ms := now.UnixMilli()
+	// An error from record here would mean the reserved namespace stopped
+	// being exempt from the cardinality cap, which is a bug in this file
+	// rather than a condition to handle. Ignored rather than logged,
+	// because logging once a second about it would be worse.
+	rec := func(name string, value float64) {
+		_ = r.store.record(now, Event{Name: name, Value: value, TS: ms})
+	}
+
 	for _, o := range observations {
-		// An error here would mean the reserved namespace stopped being
-		// exempt from the cardinality cap, which is a bug in this file
-		// rather than a condition to handle. Ignored rather than logged,
-		// because logging once a second about it would be worse.
-		_ = r.store.record(now, Event{Name: o.name, Value: o.value, TS: ms})
+		rec(o.name, o.value)
+	}
+
+	if r.snap != nil {
+		age, bytes, writeFailures, fresh := r.snap.stats(now)
+
+		// Failures are published even before a first write has succeeded,
+		// because "every write so far has failed" is precisely the state
+		// worth seeing, and gating it on a success would hide it.
+		rec(selfSnapWriteFail, float64(writeFailures))
+		rec(selfSnapLoadFail, float64(r.counts.snapLoadFail.Load()))
+
+		if fresh {
+			rec(selfSnapAge, age.Seconds())
+			rec(selfSnapBytes, float64(bytes))
+		}
 	}
 }
 

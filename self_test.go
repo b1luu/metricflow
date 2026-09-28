@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -118,7 +119,7 @@ func TestSelfMetricsAreRecordedEvenWhenTheStoreIsFull(t *testing.T) {
 func newTestReporter(s *Store) (*selfReporter, *limiter, *clients) {
 	l := newLimiter(maxInFlight)
 	cs := newClients()
-	return newSelfReporter(s, l, cs, &s.counts), l, cs
+	return newSelfReporter(s, l, cs, &s.counts, nil), l, cs
 }
 
 // Every metric the server claims to publish must actually appear, or an
@@ -615,5 +616,116 @@ func TestSelfReportingUnderConcurrentEverything(t *testing.T) {
 	}
 	if total := float64(s.counts.accepted.Load()); got.Max > total {
 		t.Errorf("%s reported %v, past the counter's actual %v", selfAccepted, got.Max, total)
+	}
+}
+
+// --- persistence (§33) ---
+
+// snapshotters for the tests below: one that has written successfully, and
+// one that cannot write at all.
+func writtenSnapshotter(t *testing.T, at time.Time) *snapshotter {
+	t.Helper()
+	sn := newSnapshotter(newStore(), filepath.Join(t.TempDir(), "snap.bin"))
+	if err := sn.write(at); err != nil {
+		t.Fatal(err)
+	}
+	return sn
+}
+
+func brokenSnapshotter(t *testing.T) *snapshotter {
+	t.Helper()
+	return newSnapshotter(newStore(), filepath.Join(t.TempDir(), "no-such-dir", "snap.bin"))
+}
+
+// With persistence off, the snapshot metrics must be absent rather than
+// zero. A zero age reads as "just snapshotted", which is the healthiest
+// value there is - an alert on staleness would be permanently satisfied by
+// a server that has never written a snapshot in its life.
+func TestPersistenceMetricsAreAbsentWhenPersistenceIsOff(t *testing.T) {
+	s := newStore()
+	r, _, _ := newTestReporter(s) // built with a nil snapshotter
+
+	r.sample(time.Now())
+
+	for _, name := range []string{selfSnapAge, selfSnapBytes, selfSnapWriteFail, selfSnapLoadFail} {
+		if _, ok := mergeAll(s, name); ok {
+			t.Errorf("%s was published by a server with persistence off", name)
+		}
+	}
+}
+
+// And with it on, all four appear.
+func TestPersistenceMetricsAppearWhenPersistenceIsOn(t *testing.T) {
+	now := time.Now()
+	s := newStore()
+	r, _, _ := newTestReporter(s)
+	r.snap = writtenSnapshotter(t, now)
+
+	r.sample(now)
+
+	for _, name := range []string{selfSnapAge, selfSnapBytes, selfSnapWriteFail, selfSnapLoadFail} {
+		if _, ok := mergeAll(s, name); !ok {
+			t.Errorf("%s was not published", name)
+		}
+	}
+
+	// The size has to be the real one, not a placeholder.
+	if got, _ := mergeAll(s, selfSnapBytes); got.Max <= 0 {
+		t.Errorf("%s = %v, want the size of the file just written", selfSnapBytes, got.Max)
+	}
+}
+
+// Age is the signal write failures cannot give. A snapshotter whose loop has
+// stopped produces no failures and no snapshots, so the failure counter sits
+// at zero looking healthy; only a growing age notices that nothing is
+// happening. This proves age measures time since the last write rather than
+// being a constant.
+func TestSnapshotAgeGrowsWhileNothingIsWritten(t *testing.T) {
+	wrote := time.Now()
+	s := newStore()
+	r, _, _ := newTestReporter(s)
+	r.snap = writtenSnapshotter(t, wrote)
+
+	r.sample(wrote.Add(5 * time.Second))
+	r.sample(wrote.Add(30 * time.Second))
+
+	got, ok := mergeAll(s, selfSnapAge)
+	if !ok {
+		t.Fatalf("%s was not published", selfSnapAge)
+	}
+	if got.Min < 4 || got.Min > 6 {
+		t.Errorf("earliest age = %v, want about 5s", got.Min)
+	}
+	if got.Max < 29 || got.Max > 31 {
+		t.Errorf("latest age = %v, want about 30s", got.Max)
+	}
+}
+
+// A snapshotter that has never managed a write publishes its failures and no
+// age. Gating the failure count on a first success would hide the single
+// worst state persistence can be in: every write so far has failed.
+func TestSnapshotWriteFailuresArePublishedBeforeAnySuccess(t *testing.T) {
+	now := time.Now()
+	s := newStore()
+	r, _, _ := newTestReporter(s)
+	r.snap = brokenSnapshotter(t)
+
+	if err := r.snap.write(now); err == nil {
+		t.Fatal("setup: the unwritable path accepted a write")
+	}
+
+	r.sample(now)
+
+	got, ok := mergeAll(s, selfSnapWriteFail)
+	if !ok {
+		t.Fatalf("%s was not published", selfSnapWriteFail)
+	}
+	if got.Max != 1 {
+		t.Errorf("%s = %v, want 1", selfSnapWriteFail, got.Max)
+	}
+
+	// No age, because there is no last successful write to be an age since.
+	if _, ok := mergeAll(s, selfSnapAge); ok {
+		t.Errorf("%s was published by a snapshotter that has never written one", selfSnapAge)
 	}
 }

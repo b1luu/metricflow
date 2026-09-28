@@ -722,7 +722,7 @@ func run(ctx context.Context, ln net.Listener) error {
 
 	// The server records its own telemetry into its own store (§31), so
 	// /stats, the alerting rules and retention all apply to it unchanged.
-	reporter := newSelfReporter(store, lim, cls, &store.counts)
+	reporter := newSelfReporter(store, lim, cls, &store.counts, snap)
 	selfDone := make(chan struct{})
 	go func() {
 		defer close(selfDone)

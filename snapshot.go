@@ -450,10 +450,17 @@ type snapshotter struct {
 	path  string
 
 	mu        sync.Mutex
-	wroteOnce bool      // this process has replaced the current file at least once
-	lastOK    time.Time // when the last write succeeded
-	lastBytes int       // and how big it was
-	failures  atomic.Int64
+	wroteOnce bool // this process has replaced the current file at least once
+
+	// Read by the self-reporter (§31) and therefore deliberately outside
+	// mu. The lock is held across a rename and a directory sync, so a
+	// reporter that took it would block on the very disk it is trying to
+	// report about - and a disk stalling is exactly when somebody needs
+	// the snapshot age. A health signal must not wait on the thing whose
+	// health it describes.
+	lastOKNanos atomic.Int64 // when the last write succeeded, 0 for never
+	lastBytes   atomic.Int64 // and how big it was
+	failures    atomic.Int64
 }
 
 func newSnapshotter(s *Store, path string) *snapshotter {
@@ -526,8 +533,30 @@ func (sn *snapshotter) write(now time.Time) error {
 
 	committed = true
 	sn.wroteOnce = true
-	sn.lastOK, sn.lastBytes = now, len(data)
+	sn.lastOKNanos.Store(now.UnixNano())
+	sn.lastBytes.Store(int64(len(data)))
 	return nil
+}
+
+// stats is what the self-reporter publishes about persistence.
+//
+// fresh is false until a write has succeeded, so a server that has not
+// managed one yet publishes no age at all rather than an age of zero - which
+// would read as "just snapshotted", the opposite of the truth.
+//
+// Age is the signal that write failures cannot give on their own. A
+// snapshotter goroutine that is wedged, or one whose ticker never fires,
+// produces no failures and no snapshots; the failure counter stays at zero
+// and looks healthy. Age is the only number that notices nothing is
+// happening.
+func (sn *snapshotter) stats(now time.Time) (age time.Duration, bytes, failures int64, fresh bool) {
+	failures = sn.failures.Load()
+
+	nanos := sn.lastOKNanos.Load()
+	if nanos == 0 {
+		return 0, 0, failures, false
+	}
+	return now.Sub(time.Unix(0, nanos)), sn.lastBytes.Load(), failures, true
 }
 
 // syncDir flushes a directory so the renames above survive a crash.
