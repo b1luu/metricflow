@@ -648,7 +648,24 @@ func run(ctx context.Context, ln net.Listener) error {
 		}
 		switch {
 		case res.from == "" && len(res.problems) > 0:
-			return fmt.Errorf("no usable snapshot at %s", snapPath)
+			// Loud, but not fatal (§33). §32 refused to start here, which
+			// conflated two different failures. A path the operator got
+			// wrong is a configuration error: it is found before anything
+			// has been served, nothing is lost by refusing, and refusing is
+			// the only way to make it visible. A file that will not decode
+			// is a data problem at runtime - the configuration is fine and
+			// the disk had a bad day.
+			//
+			// Refusing to start on that turns a damaged cache into an
+			// outage, and a permanent one: the server cannot come back
+			// until somebody deletes the file by hand, which under an
+			// orchestrator is a crash loop. Serving is the job. Losing a
+			// minute of aggregates is a far smaller failure than not
+			// booting, so it starts empty, says so at the top of its voice,
+			// and counts it where an alert can reach it.
+			log.Printf("WARNING: no usable snapshot at %s; starting with an empty store. "+
+				"The last %s of aggregates is gone.", snapPath, window)
+			store.counts.addSnapshotLoadFailure()
 		case res.from == "":
 			log.Printf("no snapshot at %s yet; starting empty", snapPath)
 		default:

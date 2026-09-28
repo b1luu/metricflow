@@ -82,6 +82,13 @@ type counters struct {
 	accepted atomic.Int64
 	rejected atomic.Int64
 	swept    atomic.Int64
+
+	// snapLoadFail counts startups that found a snapshot and could not use
+	// it. Starting empty is no longer fatal (§33), so this is what stops it
+	// being silent: it is the difference between "this server has no
+	// history because it is new" and "this server has no history because
+	// its snapshot was damaged".
+	snapLoadFail atomic.Int64
 }
 
 func (c *counters) addAccepted(n int) {
@@ -101,6 +108,8 @@ func (c *counters) addSwept(n int) {
 		c.swept.Add(int64(n))
 	}
 }
+
+func (c *counters) addSnapshotLoadFailure() { c.snapLoadFail.Add(1) }
 
 // selfReporter samples the server and records the result into the store it
 // is sampling.

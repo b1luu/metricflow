@@ -744,8 +744,13 @@ func TestPersistenceIsOffByDefault(t *testing.T) {
 }
 
 // A path the operator got wrong is found at startup rather than at the first
-// tick, and is fatal: it is certainly wrong, and nothing is lost by
-// refusing to start.
+// tick, and is fatal: it is certainly wrong, and nothing is lost by refusing
+// to start.
+//
+// This is the contrast with TestACorruptSnapshotDoesNotStopStartup, and the
+// distinction §33 turns on: a bad path is a configuration error that only
+// refusing can make visible, while a file that will not decode is a data
+// problem the server can survive. Both used to be fatal.
 func TestAnUnwritableSnapshotPathStopsStartup(t *testing.T) {
 	t.Setenv("METRICFLOW_SNAPSHOT", filepath.Join(t.TempDir(), "no-such-dir", "snap.bin"))
 
@@ -774,35 +779,43 @@ func TestAnUnwritableSnapshotPathStopsStartup(t *testing.T) {
 	}
 }
 
-// A corrupt file is fatal too, for the same reason: an operator who
-// configured persistence should be told it failed, not left to wonder where
-// the data went.
-func TestACorruptSnapshotStopsStartup(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "snap.bin")
-	if err := os.WriteFile(path, []byte("definitely not a snapshot"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("METRICFLOW_SNAPSHOT", path)
+// A corrupt snapshot must NOT stop the server from starting, which reverses
+// what §32 did here.
+//
+// The two failures are different. A path the operator got wrong is a
+// configuration error, found before anything has been served, and refusing to
+// start is the only way to make it visible. A file that will not decode is a
+// data problem: the configuration is fine. Refusing to start on that turns a
+// damaged cache into a permanent outage, because the server cannot come back
+// until somebody deletes the file by hand.
+func TestACorruptSnapshotDoesNotStopStartup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "snap.bin")
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	errc := make(chan error, 1)
-	go func() { errc <- run(ctx, ln) }()
-
-	select {
-	case err := <-errc:
-		if err == nil {
-			t.Fatal("the server started from a corrupt snapshot")
+	// Both generations damaged, so there is nothing to fall back to.
+	for _, p := range []string{path, path + ".prev"} {
+		if err := os.WriteFile(p, []byte("definitely not a snapshot"), 0o600); err != nil {
+			t.Fatal(err)
 		}
-	case <-time.After(20 * time.Second):
-		t.Fatal("the server neither started nor failed")
+	}
+
+	addr, stop := runUntil(t, path)
+
+	// It is serving, which is the whole claim.
+	postEvent(t, addr, "svc.after.corruption", 1)
+	if _, ok := fetchStats(t, addr, "").Metrics["svc.after.corruption"]; !ok {
+		t.Error("the server started but is not recording")
+	}
+
+	if err := stop(); err != nil {
+		t.Fatalf("shutting down: %v", err)
+	}
+
+	// And it replaced the damaged file rather than leaving it to fail again
+	// on every future start.
+	restored := newStore()
+	if res := newSnapshotter(restored, path).restore(time.Now()); res.from == "" {
+		t.Errorf("the damaged snapshot is still there: %v", res.problems)
 	}
 }
 
