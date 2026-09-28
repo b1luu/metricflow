@@ -419,14 +419,15 @@ func TestWriteAndReadSnapshotFile(t *testing.T) {
 		recordNow(s, fmt.Sprintf("svc.metric.%d", i), float64(i))
 	}
 
-	if err := s.writeSnapshot(path, now); err != nil {
+	if err := newSnapshotter(s, path).write(now); err != nil {
 		t.Fatal(err)
 	}
 
 	restored := newStore()
-	loaded, dropped, buckets, err := restored.readSnapshot(path, now)
-	if err != nil {
-		t.Fatal(err)
+	res := newSnapshotter(restored, path).restore(now)
+	loaded, dropped, buckets := res.loaded, res.dropped, res.buckets
+	if len(res.problems) != 0 {
+		t.Fatalf("problems restoring: %v", res.problems)
 	}
 	if loaded != 50 || dropped != 0 || buckets != 50 {
 		t.Errorf("loaded %d / dropped %d / %d buckets, want 50 / 0 / 50", loaded, dropped, buckets)
@@ -442,12 +443,12 @@ func TestReadingAMissingSnapshotIsNotAnError(t *testing.T) {
 	s := newStore()
 	path := filepath.Join(t.TempDir(), "does-not-exist.bin")
 
-	loaded, dropped, buckets, err := s.readSnapshot(path, time.Now())
-	if err != nil {
-		t.Fatalf("a missing snapshot was an error: %v", err)
+	res := newSnapshotter(s, path).restore(time.Now())
+	if len(res.problems) != 0 {
+		t.Errorf("a missing snapshot produced problems: %v", res.problems)
 	}
-	if loaded != 0 || dropped != 0 || buckets != 0 {
-		t.Errorf("got %d / %d / %d from a missing file", loaded, dropped, buckets)
+	if res.loaded != 0 || res.dropped != 0 || res.buckets != 0 {
+		t.Errorf("got %d / %d / %d from a missing file", res.loaded, res.dropped, res.buckets)
 	}
 }
 
@@ -461,8 +462,12 @@ func TestReadingACorruptSnapshotIsAnError(t *testing.T) {
 	}
 
 	s := newStore()
-	if _, _, _, err := s.readSnapshot(path, time.Now()); err == nil {
+	res := newSnapshotter(s, path).restore(time.Now())
+	if len(res.problems) == 0 {
 		t.Error("a corrupt snapshot file loaded without complaint")
+	}
+	if res.from != "" {
+		t.Errorf("a corrupt snapshot was loaded from %q", res.from)
 	}
 }
 
@@ -475,19 +480,19 @@ func TestWritingReplacesThePreviousSnapshot(t *testing.T) {
 
 	first := newStore()
 	recordNow(first, "first.metric", 1)
-	if err := first.writeSnapshot(path, now); err != nil {
+	if err := newSnapshotter(first, path).write(now); err != nil {
 		t.Fatal(err)
 	}
 
 	second := newStore()
 	recordNow(second, "second.metric", 2)
-	if err := second.writeSnapshot(path, now); err != nil {
+	if err := newSnapshotter(second, path).write(now); err != nil {
 		t.Fatal(err)
 	}
 
 	restored := newStore()
-	if _, _, _, err := restored.readSnapshot(path, now); err != nil {
-		t.Fatal(err)
+	if res := newSnapshotter(restored, path).restore(now); res.from == "" {
+		t.Fatalf("nothing restored: %v", res.problems)
 	}
 	if _, ok := mergeAll(restored, "second.metric"); !ok {
 		t.Error("the second snapshot was not the one on disk")
@@ -502,7 +507,8 @@ func TestWritingReplacesThePreviousSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, e := range entries {
-		if e.Name() != "snap.bin" {
+		// snap.bin.prev is expected once a second write has rotated one.
+		if e.Name() != "snap.bin" && e.Name() != "snap.bin.prev" {
 			t.Errorf("left %q behind in the snapshot directory", e.Name())
 		}
 	}
@@ -903,6 +909,7 @@ func TestWritingSnapshotsToDiskUnderLoad(t *testing.T) {
 
 	path := filepath.Join(t.TempDir(), "snap.bin")
 	s := newStore()
+	sn := newSnapshotter(s, path)
 
 	var (
 		wgWork sync.WaitGroup
@@ -937,7 +944,7 @@ func TestWritingSnapshotsToDiskUnderLoad(t *testing.T) {
 	go func() {
 		defer wgBg.Done()
 		for !done.Load() {
-			if err := s.writeSnapshot(path, time.Now()); err != nil {
+			if err := sn.write(time.Now()); err != nil {
 				select {
 				case errs <- err:
 				default:
@@ -949,9 +956,9 @@ func TestWritingSnapshotsToDiskUnderLoad(t *testing.T) {
 			// Read it straight back: the rename is what guarantees this
 			// sees a whole file rather than a partial one.
 			restored := newStore()
-			if _, _, _, err := restored.readSnapshot(path, time.Now()); err != nil {
+			if res := newSnapshotter(restored, path).restore(time.Now()); len(res.problems) > 0 {
 				select {
-				case errs <- fmt.Errorf("reading back a snapshot written under load: %w", err):
+				case errs <- fmt.Errorf("reading back a snapshot written under load: %v", res.problems):
 				default:
 				}
 				return
@@ -977,16 +984,230 @@ func TestWritingSnapshotsToDiskUnderLoad(t *testing.T) {
 	// the loop can legitimately get exactly one snapshot in - the empty one
 	// it took before any writer had recorded anything. Asserting on that
 	// was a flake, and it failed on the second run rather than the first.
-	if err := s.writeSnapshot(path, time.Now()); err != nil {
+	if err := sn.write(time.Now()); err != nil {
 		t.Fatal(err)
 	}
 
 	restored := newStore()
-	loaded, _, _, err := restored.readSnapshot(path, time.Now())
-	if err != nil {
+	res := newSnapshotter(restored, path).restore(time.Now())
+	if len(res.problems) > 0 {
+		t.Fatalf("problems: %v", res.problems)
+	}
+	if res.loaded == 0 {
+		t.Error("a snapshot of the final state held nothing")
+	}
+}
+
+// --- keeping the previous generation ---
+
+func snapshotOf(t *testing.T, names ...string) *Store {
+	t.Helper()
+	s := newStore()
+	for _, n := range names {
+		recordNow(s, n, 1)
+	}
+	return s
+}
+
+// The second write keeps the first, which is the whole point: a snapshot that
+// turns out to be unreadable must not be the only copy.
+func TestWritingRotatesThePreviousGeneration(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "snap.bin")
+	now := time.Now()
+
+	sn := newSnapshotter(snapshotOf(t, "first.metric"), path)
+	if err := sn.write(now); err != nil {
 		t.Fatal(err)
 	}
-	if loaded == 0 {
-		t.Error("a snapshot of the final state held nothing")
+	if _, err := os.Stat(sn.prev()); !errors.Is(err, os.ErrNotExist) {
+		t.Error("the first write created a previous generation out of nothing")
+	}
+
+	// A second write through the same snapshotter promotes the first file.
+	sn.store = snapshotOf(t, "second.metric")
+	if err := sn.write(now); err != nil {
+		t.Fatal(err)
+	}
+
+	current := newStore()
+	if res := newSnapshotter(current, path).restore(now); res.from != path {
+		t.Fatalf("restored from %q, want the current file", res.from)
+	}
+	if _, ok := mergeAll(current, "second.metric"); !ok {
+		t.Error("the current file does not hold the newest data")
+	}
+
+	// And the previous generation holds what the current one replaced.
+	prev := newStore()
+	prevSnap := newSnapshotter(prev, sn.prev())
+	if res := prevSnap.restore(now); res.from == "" {
+		t.Fatalf("the previous generation is not loadable: %v", res.problems)
+	}
+	if _, ok := mergeAll(prev, "first.metric"); !ok {
+		t.Error("the previous generation does not hold the older data")
+	}
+}
+
+// The fallback §32 asked for: a corrupt current file must not cost the data,
+// because there is a copy behind it.
+func TestRestoreFallsBackToThePreviousGeneration(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "snap.bin")
+	now := time.Now()
+
+	sn := newSnapshotter(snapshotOf(t, "older.metric"), path)
+	if err := sn.write(now); err != nil {
+		t.Fatal(err)
+	}
+	sn.store = snapshotOf(t, "newer.metric")
+	if err := sn.write(now); err != nil {
+		t.Fatal(err)
+	}
+
+	// Damage the current file, leaving the previous one intact.
+	if err := os.WriteFile(path, []byte("shredded"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	restored := newStore()
+	res := newSnapshotter(restored, path).restore(now)
+
+	if res.from != sn.prev() {
+		t.Fatalf("restored from %q, want the previous generation", res.from)
+	}
+	if len(res.problems) != 1 {
+		t.Errorf("problems = %v, want exactly one - the corrupt current file", res.problems)
+	}
+	if _, ok := mergeAll(restored, "older.metric"); !ok {
+		t.Error("the fallback did not bring the older data back")
+	}
+	// The data that was lost is the newest, which is the cost of the
+	// fallback and worth being explicit about.
+	if _, ok := mergeAll(restored, "newer.metric"); ok {
+		t.Error("the corrupt current file was loaded after all")
+	}
+}
+
+// The subtle one. On startup the file on disk may be the corrupt one that
+// just failed to load; rotating it would overwrite a good previous
+// generation with a known-bad file, turning one damaged copy into two. Only
+// a file this process wrote is ever promoted.
+func TestAKnownBadCurrentFileIsNeverPromoted(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "snap.bin")
+	now := time.Now()
+
+	// Build a good previous generation the way a running server would.
+	sn := newSnapshotter(snapshotOf(t, "precious.metric"), path)
+	if err := sn.write(now); err != nil {
+		t.Fatal(err)
+	}
+	sn.store = snapshotOf(t, "newer.metric")
+	if err := sn.write(now); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := mergeAll(mustRestore(t, sn.prev(), now), "precious.metric"); !ok {
+		t.Fatal("setup: the previous generation is not what was expected")
+	}
+
+	// Now a restart: the current file is corrupt, and a fresh snapshotter
+	// has no memory of having written anything.
+	if err := os.WriteFile(path, []byte("shredded"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted := newStore()
+	fresh := newSnapshotter(restarted, path)
+	if res := fresh.restore(now); res.from != fresh.prev() {
+		t.Fatalf("restored from %q, want the previous generation", res.from)
+	}
+
+	// The startup write must replace the corrupt file without promoting it.
+	if err := fresh.write(now); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok := mergeAll(mustRestore(t, fresh.prev(), now), "precious.metric"); !ok {
+		t.Error("the corrupt current file was rotated over the good previous one")
+	}
+	if _, ok := mergeAll(mustRestore(t, path, now), "precious.metric"); !ok {
+		t.Error("the new current file does not hold what was restored")
+	}
+}
+
+func mustRestore(t *testing.T, path string, now time.Time) *Store {
+	t.Helper()
+	s := newStore()
+	res := newSnapshotter(s, path).restore(now)
+	if res.from == "" {
+		t.Fatalf("%s is not loadable: %v", path, res.problems)
+	}
+	return s
+}
+
+// Both copies gone is the only case with nothing to fall back to, and it has
+// to be reported rather than looking like a clean first start.
+func TestBothGenerationsUnusableIsReported(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "snap.bin")
+
+	for _, p := range []string{path, path + ".prev"} {
+		if err := os.WriteFile(p, []byte("shredded"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	res := newSnapshotter(newStore(), path).restore(time.Now())
+	if res.from != "" {
+		t.Errorf("restored from %q, want nothing", res.from)
+	}
+	if len(res.problems) != 2 {
+		t.Errorf("problems = %v, want one per unusable file", res.problems)
+	}
+}
+
+// A first start has neither file, which is not a problem and must not be
+// reported as one.
+func TestNeitherGenerationPresentIsSilent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "snap.bin")
+
+	res := newSnapshotter(newStore(), path).restore(time.Now())
+	if res.from != "" || len(res.problems) != 0 {
+		t.Errorf("from = %q, problems = %v; want a silent empty start", res.from, res.problems)
+	}
+}
+
+// A crash between the two renames leaves no current file and a good previous
+// one. That window is real, so the fallback has to cover it.
+func TestACrashBetweenRenamesIsRecoverable(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "snap.bin")
+	now := time.Now()
+
+	sn := newSnapshotter(snapshotOf(t, "survivor.metric"), path)
+	if err := sn.write(now); err != nil {
+		t.Fatal(err)
+	}
+	sn.store = snapshotOf(t, "newer.metric")
+	if err := sn.write(now); err != nil {
+		t.Fatal(err)
+	}
+
+	// The state a crash between the renames leaves behind.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+
+	restored := newStore()
+	res := newSnapshotter(restored, path).restore(now)
+	if res.from != sn.prev() {
+		t.Fatalf("restored from %q, want the previous generation", res.from)
+	}
+	if len(res.problems) != 0 {
+		t.Errorf("problems = %v; a missing current file is not an error", res.problems)
+	}
+	if _, ok := mergeAll(restored, "survivor.metric"); !ok {
+		t.Error("the previous generation did not carry the data")
 	}
 }

@@ -632,20 +632,35 @@ func run(ctx context.Context, ln net.Listener) error {
 	// is served, so a restart is invisible to a dashboard rather than a gap
 	// followed by a recovery.
 	snapPath := snapshotPath()
+	var snap *snapshotter
 	if snapPath != "" {
 		now := time.Now()
-		loaded, dropped, buckets, err := store.readSnapshot(snapPath, now)
-		if err != nil {
-			return fmt.Errorf("restoring %s: %w", snapPath, err)
+		snap = newSnapshotter(store, snapPath)
+
+		res := snap.restore(now)
+
+		// Anything that went wrong is said out loud even when the restore
+		// then succeeded from the older copy - a server that quietly fell
+		// back would hide the fact that its newest snapshot is broken until
+		// the older one broke too (§33).
+		for _, problem := range res.problems {
+			log.Printf("snapshot: %s", problem)
 		}
-		log.Printf("restored %d metrics (%d buckets) from %s, %d dropped as stale",
-			loaded, buckets, snapPath, dropped)
+		switch {
+		case res.from == "" && len(res.problems) > 0:
+			return fmt.Errorf("no usable snapshot at %s", snapPath)
+		case res.from == "":
+			log.Printf("no snapshot at %s yet; starting empty", snapPath)
+		default:
+			log.Printf("restored %d metrics (%d buckets) from %s, %d dropped as stale",
+				res.loaded, res.buckets, res.from, res.dropped)
+		}
 
 		// One write immediately, so a path the operator got wrong is found
 		// now rather than at the first tick. Fatal for the same reason a
 		// bad alert rule or a bad in-flight limit is: it is certainly
 		// wrong, and nothing is lost by refusing to start.
-		if err := store.writeSnapshot(snapPath, now); err != nil {
+		if err := snap.write(now); err != nil {
 			return fmt.Errorf("writing %s: %w", snapPath, err)
 		}
 	}
@@ -704,11 +719,11 @@ func run(ctx context.Context, ln net.Listener) error {
 	snapDone := make(chan struct{})
 	go func() {
 		defer close(snapDone)
-		if snapPath == "" {
+		if snap == nil {
 			return
 		}
 		supervise(ctx, "snapshotter", panicBackoff, func(ctx context.Context) {
-			store.Snapshot(ctx, snapPath, snapshotInterval)
+			snap.Run(ctx, snapshotInterval)
 		})
 	}()
 
@@ -743,8 +758,8 @@ func run(ctx context.Context, ln net.Listener) error {
 	// restart loses nothing at all rather than up to one interval. Taken
 	// after the loops have joined, so nothing is mutating the store while
 	// it is being read.
-	if snapPath != "" {
-		if err := store.writeSnapshot(snapPath, time.Now()); err != nil {
+	if snap != nil {
+		if err := snap.write(time.Now()); err != nil {
 			log.Printf("final snapshot failed: %v", err)
 		} else {
 			log.Printf("wrote a final snapshot to %s", snapPath)

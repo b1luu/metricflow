@@ -44,6 +44,8 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -76,31 +78,6 @@ const snapshotInterval = bucketWidth
 // Empty means off, which is the default and keeps a server that was never
 // configured for persistence behaving exactly as it did before.
 func snapshotPath() string { return os.Getenv("METRICFLOW_SNAPSHOT") }
-
-// Snapshot writes the store every `every` until ctx is cancelled.
-//
-// A write failure here is logged and the loop carries on, which is the
-// opposite of how a bad path is treated at startup, and the asymmetry is
-// deliberate. A configuration that is wrong before the server has served
-// anything is certainly wrong and costs nothing to refuse. A disk that
-// fills at three in the morning is a different thing: killing a working
-// server to protest it would throw away the very data persistence exists to
-// protect, so it stays up and stays loud.
-func (s *Store) Snapshot(ctx context.Context, path string, every time.Duration) {
-	t := time.NewTicker(every)
-	defer t.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case tick := <-t.C:
-			if err := s.writeSnapshot(path, tick); err != nil {
-				log.Printf("snapshot failed: %v", err)
-			}
-		}
-	}
-}
 
 // snapshot serialises every live bucket in the store.
 //
@@ -462,32 +439,64 @@ func (s *Store) load(metrics []snapshotMetric, now time.Time) (loaded, dropped, 
 	return loaded, dropped, buckets
 }
 
-// writeSnapshot writes the store to path, atomically.
+// snapshotter owns one snapshot file, the generation behind it, and the
+// numbers §33 publishes about both.
 //
-// Temp file, sync, rename. Without the sync the rename can land before the
-// contents do and a crash leaves an empty file where a good snapshot used to
-// be; without the rename a crash mid-write leaves a half-file that the next
-// start would refuse, throwing away a perfectly good older one.
-//
-// The rename is atomic on POSIX. On Windows os.Rename uses MoveFileEx with
-// MOVEFILE_REPLACE_EXISTING, which replaces atomically as far as any reader
-// is concerned - the guarantee this needs is that nobody sees a partial
-// file, not that the operation is a single disk write.
-func (s *Store) writeSnapshot(path string, now time.Time) error {
-	data := s.snapshot(now)
+// It exists because rotation needs memory. Whether the file currently on
+// disk is one this process wrote decides whether it is safe to rotate into
+// the previous slot, and nothing stateless can answer that.
+type snapshotter struct {
+	store *Store
+	path  string
 
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp*")
+	mu        sync.Mutex
+	wroteOnce bool      // this process has replaced the current file at least once
+	lastOK    time.Time // when the last write succeeded
+	lastBytes int       // and how big it was
+	failures  atomic.Int64
+}
+
+func newSnapshotter(s *Store, path string) *snapshotter {
+	return &snapshotter{store: s, path: path}
+}
+
+// prev is where the generation before the current one lives.
+func (sn *snapshotter) prev() string { return sn.path + ".prev" }
+
+// write writes the store out, keeping the file it replaces.
+//
+// Temp, sync, rotate, rename. The rotation is the addition §32 asked for:
+// the current file becomes the previous one before the new file takes its
+// place, so a snapshot that turns out to be unreadable is not the only copy.
+//
+// The first write of a process never rotates, and that is the subtle part.
+// On startup the file on disk may be the corrupt one that just failed to
+// load - rotating it would overwrite a perfectly good previous generation
+// with a known-bad file, turning one damaged copy into two. Only a file this
+// process wrote, and therefore knows to be good, is ever promoted.
+//
+// A crash between the two renames leaves no current file and a good previous
+// one, which restore treats as a fallback rather than as a failure.
+func (sn *snapshotter) write(now time.Time) error {
+	data := sn.store.snapshot(now)
+
+	dir := filepath.Dir(sn.path)
+	tmp, err := os.CreateTemp(dir, filepath.Base(sn.path)+".tmp*")
 	if err != nil {
+		sn.failures.Add(1)
 		return fmt.Errorf("creating a temporary snapshot: %w", err)
 	}
 	tmpName := tmp.Name()
 
-	// Any failure from here on leaves the temporary file behind, so it is
-	// removed on every path that does not rename it.
+	// Any failure from here leaves the temporary file behind, so it is
+	// removed on every path that does not rename it away.
+	committed := false
 	defer func() {
 		tmp.Close()
-		os.Remove(tmpName) // a no-op once the rename has succeeded
+		if !committed {
+			os.Remove(tmpName)
+			sn.failures.Add(1)
+		}
 	}()
 
 	if _, err := tmp.Write(data); err != nil {
@@ -499,31 +508,112 @@ func (s *Store) writeSnapshot(path string, now time.Time) error {
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("closing the snapshot: %w", err)
 	}
-	if err := os.Rename(tmpName, path); err != nil {
+
+	sn.mu.Lock()
+	defer sn.mu.Unlock()
+
+	if sn.wroteOnce {
+		if _, err := os.Stat(sn.path); err == nil {
+			if err := os.Rename(sn.path, sn.prev()); err != nil {
+				return fmt.Errorf("rotating the previous snapshot: %w", err)
+			}
+		}
+	}
+	if err := os.Rename(tmpName, sn.path); err != nil {
 		return fmt.Errorf("replacing the snapshot: %w", err)
 	}
+	syncDir(dir)
+
+	committed = true
+	sn.wroteOnce = true
+	sn.lastOK, sn.lastBytes = now, len(data)
 	return nil
 }
 
-// readSnapshot loads a snapshot from disk into the store.
+// syncDir flushes a directory so the renames above survive a crash.
 //
-// A missing file is not an error: the first start of a server has nothing to
+// Without it the file's contents are durable but the rename that installed
+// them need not be, and a crash can leave a name pointing at nothing. Windows
+// has no equivalent and rejects a Sync on a directory handle, so a failure is
+// ignored rather than propagated - the alternative is failing every snapshot
+// on a platform where the call simply does not apply.
+func syncDir(dir string) {
+	d, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	defer d.Close()
+	_ = d.Sync()
+}
+
+// restoreResult is what a startup restore did, and what it could not do.
+type restoreResult struct {
+	from     string // the file actually loaded; empty if none was usable
+	loaded   int
+	dropped  int
+	buckets  int
+	problems []string // why the newer candidates were passed over
+}
+
+// restore loads the newest usable snapshot, falling back to the generation
+// before it.
+//
+// A missing file is not a problem: the first start of a server has nothing to
 // restore, and treating that as a failure would make persistence something
-// you had to set up rather than something that just starts working.
-func (s *Store) readSnapshot(path string, now time.Time) (loaded, dropped, buckets int, err error) {
-	data, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return 0, 0, 0, nil
-	}
-	if err != nil {
-		return 0, 0, 0, fmt.Errorf("reading the snapshot: %w", err)
-	}
+// you set up rather than something that starts working.
+//
+// A file that is present and unusable *is* a problem, and it is reported
+// rather than swallowed - but it is not the end of the attempt, which is the
+// whole point of keeping a second copy.
+func (sn *snapshotter) restore(now time.Time) restoreResult {
+	var res restoreResult
 
-	metrics, _, err := decodeSnapshot(data)
-	if err != nil {
-		return 0, 0, 0, err
-	}
+	for _, candidate := range []string{sn.path, sn.prev()} {
+		data, err := os.ReadFile(candidate)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			res.problems = append(res.problems,
+				fmt.Sprintf("%s could not be read: %v", candidate, err))
+			continue
+		}
 
-	loaded, dropped, buckets = s.load(metrics, now)
-	return loaded, dropped, buckets, nil
+		metrics, _, err := decodeSnapshot(data)
+		if err != nil {
+			res.problems = append(res.problems,
+				fmt.Sprintf("%s is unusable: %v", candidate, err))
+			continue
+		}
+
+		res.from = candidate
+		res.loaded, res.dropped, res.buckets = sn.store.load(metrics, now)
+		return res
+	}
+	return res
+}
+
+// Run writes the store every `every` until ctx is cancelled.
+//
+// A write failure here is logged and the loop carries on, which is the
+// opposite of how a bad path is treated at startup, and the asymmetry is
+// deliberate. A configuration that is wrong before the server has served
+// anything is certainly wrong and costs nothing to refuse. A disk that fills
+// at three in the morning is a different thing: killing a working server to
+// protest it would throw away the very data persistence exists to protect, so
+// it stays up, stays loud, and counts the failures where §31 can see them.
+func (sn *snapshotter) Run(ctx context.Context, every time.Duration) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case tick := <-t.C:
+			if err := sn.write(tick); err != nil {
+				log.Printf("snapshot failed: %v", err)
+			}
+		}
+	}
 }
