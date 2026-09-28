@@ -556,6 +556,37 @@ func runUntil(t *testing.T, snapPath string) (addr string, stop func() error) {
 	errc := make(chan error, 1)
 	go func() { errc <- run(ctx, ln) }()
 
+	// A server that refuses to start returns before it ever calls Serve,
+	// which leaves the listener open with nobody accepting - so a request to
+	// it connects and then waits forever rather than being refused. Caught
+	// here, because otherwise every caller hangs until its client gives up,
+	// and a test that takes ten minutes to fail is a test nobody runs.
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case err := <-errc:
+		cancel()
+		ln.Close()
+		t.Fatalf("the server failed to start: %v", err)
+	default:
+	}
+
+	deadline := time.After(20 * time.Second)
+	for {
+		resp, err := testClient.Get("http://" + ln.Addr().String() + "/health")
+		if err == nil {
+			resp.Body.Close()
+			break
+		}
+		select {
+		case <-deadline:
+			cancel()
+			ln.Close()
+			t.Fatal("the server never became healthy")
+		default:
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+
 	return ln.Addr().String(), func() error {
 		cancel()
 		select {
@@ -567,11 +598,15 @@ func runUntil(t *testing.T, snapPath string) (addr string, stop func() error) {
 	}
 }
 
+// testClient has a timeout, so a server that stops answering fails a test in
+// seconds rather than hanging it. http.DefaultClient has none.
+var testClient = &http.Client{Timeout: 10 * time.Second}
+
 func postEvent(t *testing.T, addr, name string, value float64) {
 	t.Helper()
 	body := fmt.Sprintf(`{"name":%q,"value":%v,"ts":%d}`, name, value, time.Now().UnixMilli())
 
-	resp, err := http.Post("http://"+addr+"/ingest", "application/json", strings.NewReader(body))
+	resp, err := testClient.Post("http://"+addr+"/ingest", "application/json", strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -584,7 +619,7 @@ func postEvent(t *testing.T, addr, name string, value float64) {
 
 func fetchStats(t *testing.T, addr, query string) StatsResponse {
 	t.Helper()
-	resp, err := http.Get("http://" + addr + "/stats" + query)
+	resp, err := testClient.Get("http://" + addr + "/stats" + query)
 	if err != nil {
 		t.Fatal(err)
 	}

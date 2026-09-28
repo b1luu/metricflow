@@ -979,6 +979,64 @@ func TestRunServesThenStopsOnCancel(t *testing.T) {
 	}
 }
 
+// A connection that is opened and then says nothing must not consume the
+// shutdown budget.
+//
+// This is the bug the snapshot restart tests kept tripping over, and it took
+// a -count=15 run to see it: shutdown failed with a deadline error after
+// exactly readHeaderTimeout, with nothing in flight. Shutdown waits for every
+// connection to become idle, and a connection that has been accepted but has
+// sent no bytes is not idle - it is new, and Shutdown will not close it.
+// While the grace period equalled readHeaderTimeout the two raced.
+//
+// The socket below is the cheapest possible attack on a restart, and the
+// assertion is that a clean shutdown is still clean and still fast.
+func TestASilentConnectionDoesNotEatTheShutdownBudget(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- run(ctx, ln) }()
+
+	resp, err := http.Get("http://" + ln.Addr().String() + "/health")
+	if err != nil {
+		t.Fatalf("server not reachable: %v", err)
+	}
+	resp.Body.Close()
+
+	// Connect, send nothing, and leave it there. No request, no headers,
+	// not even a byte.
+	silent, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer silent.Close()
+
+	start := time.Now()
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("shutdown returned %v; a silent socket made a clean "+
+				"shutdown look like a failed drain", err)
+		}
+		// The socket still costs a restart something: Shutdown cannot let
+		// go of it until readHeaderTimeout does, so the honest claim is not
+		// "free" but "bounded, and nowhere near the whole budget". Anything
+		// approaching the full grace period means the drain budget is being
+		// spent on a connection with no request in it.
+		if elapsed := time.Since(start); elapsed >= shutdownGrace {
+			t.Errorf("shutdown took %s, the entire %s budget", elapsed, shutdownGrace)
+		}
+	case <-time.After(shutdownGrace + 5*time.Second):
+		t.Fatal("run did not return")
+	}
+}
+
 // storeDump renders every metric in the store for a failure message. The
 // store is sharded, so a plain %+v of one shard would show only part of it.
 func storeDump(s *Store) map[string]map[int64]*Agg {

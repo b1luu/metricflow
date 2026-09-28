@@ -58,6 +58,32 @@ const (
 	// maxHeaderBytes caps the headers, which MaxBytesReader does not cover
 	// - that only ever sees the body.
 	maxHeaderBytes = 1 << 16 // 64 KiB
+
+	// drainBudget is how long genuinely in-flight requests get to finish
+	// once shutdown starts. Handlers here run in well under a millisecond,
+	// so this is generous on purpose: the cost of waiting is a slower
+	// restart, the cost of not waiting is a client holding a request that
+	// was neither served nor refused.
+	drainBudget = 10 * time.Second
+
+	// shutdownGrace is the whole budget Shutdown gets, and it has to be
+	// strictly larger than readHeaderTimeout.
+	//
+	// Shutdown returns once every connection is idle, and a connection that
+	// has been accepted but has not yet sent a byte does not count as idle -
+	// Go calls it new, and Shutdown will not close it. Nothing frees it
+	// early; it lives until readHeaderTimeout gives up on it. So a single
+	// silent socket, which costs a port scanner or an abandoned load
+	// balancer probe nothing to open, holds shutdown for the full header
+	// timeout before any real draining can even be observed.
+	//
+	// This was 5s flat, exactly equal to readHeaderTimeout, which left the
+	// two racing: a clean shutdown with nothing in flight reported a
+	// deadline failure whenever a stray connection was open. Adding the
+	// budgets rather than sharing them means the time real requests get is
+	// what is left after the worst case silent connection, not a number
+	// they have to win from it.
+	shutdownGrace = readHeaderTimeout + drainBudget
 )
 
 // newServer builds the HTTP server with every timeout set.

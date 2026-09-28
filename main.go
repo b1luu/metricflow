@@ -742,8 +742,10 @@ func run(ctx context.Context, ln net.Listener) error {
 		log.Println("shutting down, draining in-flight requests...")
 	}
 
-	// Give open requests up to 5s to finish before dropping them.
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Give open requests a bounded window to finish before dropping them.
+	// The size of that window, and why it is not just the drain budget, is
+	// argued where the constant is defined.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 	defer cancel()
 	shutdownErr := srv.Shutdown(shutdownCtx)
 
