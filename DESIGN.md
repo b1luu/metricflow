@@ -8,19 +8,93 @@ survives even when the code changes.
 
 | Endpoint        | Method | Purpose                                          |
 | --------------- | ------ | ------------------------------------------------ |
-| `/health`       | GET    | Liveness check. Returns `ok`.                    |
-| `/ingest`       | POST   | Accept one metric event as a JSON body.          |
-| `/stats`        | GET    | Per-metric count/avg/min/max/p50/p90/p99 over a time window, as JSON. Optional `?window=`. |
+| `/health`       | GET    | Liveness check. Returns `ok`. Outside both shedding and client identification, so a saturated server still answers it (§26). |
+| `/ingest`       | POST   | One metric event as a JSON body.                 |
+| `/ingest/batch` | POST   | Many events as newline-delimited JSON, with per-event results and partial success (§25). |
+| `/stats`        | GET    | Per-metric count/avg/min/max/p50/p90/p99 over a time window, as JSON. |
 | `/alerts`       | GET    | Current state of every alert rule, as JSON.      |
 
-Wrong method on any route → `405` (§13). Details: JSON shape §14, `?window=`
-§11, alerting §18, percentiles §23.
+`/stats` accepts `?window=` (§11), and `?prefix=`, `?limit=` and `?after=` for
+bounded, paged queries (§28). A value outside its limit is an error rather
+than something silently clamped, because a caller who asks for 50 000 metrics
+and receives 1 000 under a `200` has been handed wrong data.
+
+Any request may carry an `X-Client-ID` header (§29). Absent means a shared
+default bucket; over 64 bytes, or anything outside letters, digits and `.-_:`,
+is a `400`. Wrong method on any route → `405` (§13). JSON shape §14, alerting
+§18, percentiles §23.
 
 Event shape (see `Event` in `main.go`):
 
 ```json
 { "name": "cpu.load", "value": 0.8, "type": "gauge", "ts": 1735000000123 }
 ```
+
+## Index
+
+**The shape of the store**
+
+- [1. Store the conclusion, not the events](#1-store-the-conclusion-not-the-events)
+- [2. In-memory state, no persistence](#2-in-memory-state-no-persistence)
+- [3. Bucket maps hold `*Agg` — pointer values](#3-bucket-maps-hold-agg--pointer-values)
+- [4. Seed Min/Max with the first value](#4-seed-minmax-with-the-first-value)
+- [5. One mutex around the whole map](#5-one-mutex-around-the-whole-map)
+- [5a. State lives on a `Store`, not in package globals](#5a-state-lives-on-a-store-not-in-package-globals)
+- [6. Route registration before `ListenAndServe`](#6-route-registration-before-listenandserve)
+- [7. Missing JSON fields are not an error (except `name` and `ts`)](#7-missing-json-fields-are-not-an-error-except-name-and-ts)
+
+**Time and the window**
+
+- [8. Time-windowed aggregates: 10-second buckets, 6 per window](#8-time-windowed-aggregates-10-second-buckets-6-per-window)
+- [9. Windowing is by event time, not receive time](#9-windowing-is-by-event-time-not-receive-time)
+- [10. Bucket eviction happens on write, not on a timer](#10-bucket-eviction-happens-on-write-not-on-a-timer)
+- [11. `/stats?window=` is caller-tunable but capped at retention](#11-statswindow-is-caller-tunable-but-capped-at-retention)
+
+**The request contract**
+
+- [12. `name` and `ts` are required](#12-name-and-ts-are-required)
+- [13. One method per route, enforced by an `allow` wrapper](#13-one-method-per-route-enforced-by-an-allow-wrapper)
+- [14. `/stats` responds with JSON](#14-stats-responds-with-json)
+- [15. Graceful shutdown on SIGINT / SIGTERM](#15-graceful-shutdown-on-sigint--sigterm)
+- [16. Event time — bucketing and the accepted-`ts` range](#16-event-time--bucketing-and-the-accepted-ts-range)
+- [17. `/ingest` hardening for the hot path](#17-ingest-hardening-for-the-hot-path)
+
+**Alerting**
+
+- [18. Alerting: rules over the windowed aggregates](#18-alerting-rules-over-the-windowed-aggregates)
+
+**Proving it works**
+
+- [19. The load harness is `go test -bench`, not a separate load generator](#19-the-load-harness-is-go-test--bench-not-a-separate-load-generator)
+- [20. Correctness under load: exactness, and tests with teeth](#20-correctness-under-load-exactness-and-tests-with-teeth)
+- [21. `cmd/loadgen`: the claim that needs a real socket](#21-cmdloadgen-the-claim-that-needs-a-real-socket)
+- [22. CI exists to run the things this machine can't](#22-ci-exists-to-run-the-things-this-machine-cant)
+
+**Percentiles**
+
+- [23. Percentiles: a bounded sketch, not the events](#23-percentiles-a-bounded-sketch-not-the-events)
+
+**Throughput**
+
+- [24. Sharding the lock by metric name](#24-sharding-the-lock-by-metric-name)
+- [25. Batch ingest: the request boundary was the bottleneck](#25-batch-ingest-the-request-boundary-was-the-bottleneck)
+
+**Surviving abuse and overload**
+
+- [26. Surviving a bad client: timeouts, and shedding rather than queueing](#26-surviving-a-bad-client-timeouts-and-shedding-rather-than-queueing)
+- [27. Cardinality: the way metrics systems actually die](#27-cardinality-the-way-metrics-systems-actually-die)
+- [28. Bounding the cost of a query, and surviving a panic](#28-bounding-the-cost-of-a-query-and-surviving-a-panic)
+- [29. Client identity, and the fairness it buys](#29-client-identity-and-the-fairness-it-buys)
+
+**Parsing**
+
+- [30. Parsing the one shape this server ingests](#30-parsing-the-one-shape-this-server-ingests)
+
+**Operating it**
+
+- [31. The server watching itself](#31-the-server-watching-itself)
+- [32. Surviving a restart](#32-surviving-a-restart)
+- [33. When the snapshot is the thing that is broken](#33-when-the-snapshot-is-the-thing-that-is-broken)
 
 ## Design choices
 
