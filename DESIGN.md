@@ -1882,7 +1882,9 @@ look exactly like one that restored all of them.
 **Two failures, treated oppositely**, and the asymmetry is deliberate. A path
 the operator got wrong, or a corrupt file, is **fatal at startup**: it is
 certainly wrong and nothing is lost by refusing, the same call §18 makes for a
-bad alert rule and §26 for a bad in-flight limit. A write that fails **later**
+bad alert rule and §26 for a bad in-flight limit. (§33 keeps half of this and
+reverses the other half: a bad *path* stays fatal, a corrupt *file* does not,
+because those are not the same kind of wrong.) A write that fails **later**
 is logged and the loop carries on, because killing a working server to protest
 a full disk would throw away the very data persistence exists to protect.
 
@@ -1926,7 +1928,7 @@ promise of zero.
 - *One file, no history.* There is no rotation and no previous generation to
   fall back on: a snapshot that is corrupt on disk means starting empty, after
   being told so. Keeping the last good one would be cheap and is the first
-  thing to add if this is ever operated seriously.
+  thing to add if this is ever operated seriously. (§33 adds it.)
 - *No format migration.* The version is part of the magic, so a future format
   is refused rather than misread — an upgraded server starts empty and says
   why. That is the right failure, but it is a failure.
@@ -1934,6 +1936,125 @@ promise of zero.
   hand-rolled encoder, and the file is written once every ten seconds.
 - *It does not make the store durable, only the process restartable.* The disk
   is the same machine's; this survives a process dying, not the machine.
+
+### 33. When the snapshot is the thing that is broken
+
+§32 ended with two admissions. There was one file and no history, so a
+snapshot that was corrupt on disk meant starting empty. And starting empty
+was fatal: the server refused to come up. This section is about both, and
+about which half of that turned out to be wrong.
+
+**A second generation, because one copy is not a backup.** Each write rotates
+the file it replaces into `snap.bin.prev` before the new one takes its place.
+Restore tries the current file, then the one behind it, and reports everything
+it passed over on the way.
+
+The subtle part is that **the first write of a process never rotates**. On
+startup the file on disk may be the corrupt one that just failed to load;
+promoting it would overwrite a perfectly good previous generation with a
+known-bad file, turning one damaged copy into two. Only a file this process
+wrote, and therefore knows to be good, is ever promoted. That is the whole
+reason the snapshotter is a struct with state rather than two free functions —
+rotation needs memory, and nothing stateless can answer "did I write this?".
+
+A crash between the two renames leaves no current file and a good previous
+one. Restore treats a missing current file as a fallback rather than a
+failure, because that window is real.
+
+**Reversing §32 on what is fatal.** The old behaviour conflated two different
+failures under one word.
+
+A snapshot *path* the operator got wrong is a configuration error. It is found
+before anything has been served, nothing is lost by refusing, and refusing is
+the only way to make it visible. That stays fatal, exactly like a bad alert
+rule (§18) or a bad in-flight limit (§26).
+
+A *file that will not decode* is a data problem at runtime. The configuration
+is fine; the disk had a bad day. Refusing to start on that turns a damaged
+cache into an outage, and a permanent one — the server cannot come back until
+somebody deletes a file by hand, which under an orchestrator is a crash loop.
+Serving is the job. Losing a minute of aggregates is a far smaller failure
+than not booting.
+
+So it starts empty, says so at the top of its voice, and counts it.
+
+**Two counters, not one, and the live demo is what forced that.** The first
+version counted "startups that found a snapshot and could not use it". Then a
+crash test damaged the current generation, the fallback rescued it, and the
+server reported zero — correct by that definition and useless, because a
+broken newest snapshot looked exactly like a healthy restart. The log said it.
+A log line is not an alert, which was the entire argument of §31.
+
+| metric | what it means |
+| --- | --- |
+| `snapshot.load_failures` | snapshot files found unusable, *including* ones the fallback rescued us from |
+| `snapshot.empty_starts` | startups that ended up with nothing — the one that means data is gone |
+| `snapshot.write_failures` | writes that failed |
+| `snapshot.age_seconds` | time since the last successful write |
+| `snapshot.bytes` | how big it was |
+
+**Age is the signal the failure counters cannot give.** A snapshotter goroutine
+that is wedged, or whose ticker never fires, produces no failures and no
+snapshots: the failure count sits at zero looking healthy. Age is the only
+number that notices nothing is happening.
+
+**They are published only when persistence is switched on.** A zero age reads
+as "just snapshotted", which is the healthiest value there is — a staleness
+alert would be permanently satisfied by a server that has never written a
+snapshot in its life. Absence is the honest answer. Failures, though, are
+published before any write has succeeded, because "every write so far has
+failed" is precisely the state worth seeing.
+
+**Age and size are atomics rather than fields under the snapshotter's lock.**
+That lock is held across a rename and a directory sync, so a reporter taking
+it would block on the very disk it is trying to report about — and a stalling
+disk is exactly when somebody needs the snapshot age. A health signal must not
+wait on the thing whose health it describes.
+
+**A bug the restart tests found, which had nothing to do with snapshots.**
+Running them fifteen times produced a shutdown that failed with a deadline
+error after exactly five seconds, with nothing in flight. `Shutdown` returns
+once every connection is idle, and a connection that has been accepted but has
+sent no bytes is not idle — Go calls it *new*, and `Shutdown` will not close
+it. Nothing frees it but `readHeaderTimeout`. The grace period was also five
+seconds, so the two raced: one silent socket, which costs a port scanner
+nothing to open, could consume the entire drain budget and make a clean
+shutdown report a failed drain. The budgets are added now rather than shared.
+
+**Live, as a real crash followed by a damaged snapshot** — hard kill, no
+graceful shutdown, then the current generation overwritten with garbage:
+
+```
+snapshot: .../snap.bin is unusable: snapshot is too short to be one
+restored 3 metrics (3 buckets) from .../snap.bin.prev, 0 dropped as stale
+
+  svc.checkout     count=6  avg=5.33333  p99=13.0663  survived
+  svc.login        count=6  avg=5.33333  p99=13.0663  survived
+  svc.search       count=6  avg=5.33333  p99=13.0663  survived
+
+  metricflow.snapshot.load_failures   1
+  metricflow.snapshot.empty_starts    0
+  metricflow.snapshot.age_seconds     0.0073
+  metricflow.snapshot.bytes           481
+```
+
+One unusable file reported, zero empty starts, every number intact. That pair
+is the claim: the damage is visible *and* nothing was lost.
+
+**What this deliberately does not do.**
+
+- *Two generations, not N.* The second copy covers the failure that actually
+  happens — the newest write is the one a crash damages. A third would cover
+  correlated corruption of two files, which on one local disk is a bad bet
+  against a problem a real backup solves properly.
+- *No repair, and no verification on write.* A snapshot is not read back after
+  writing, so a file that was born corrupt is discovered at the next start
+  rather than at the write. Reading back every snapshot to prove it decodes
+  would double the I/O for a failure the fallback already covers.
+- *Both copies damaged still means an empty start.* That is the bound, stated
+  rather than hidden, and it is now counted instead of being fatal.
+- *Nothing here makes the disk less of a single point of failure* (§32). Two
+  files on one machine survive a bad write, not a bad machine.
 
 ## Testing
 

@@ -95,9 +95,35 @@ acknowledging it, which is a different system.
 The file is written temp-sync-rename so a reader never sees a partial one, and
 carries a magic, a version and a checksum so a damaged one is refused rather
 than misread — every single-bit flip and every truncation of a real snapshot
-is rejected by a test. A bad path or a corrupt file stops startup; a write that
-fails later is logged and the server keeps serving. See [DESIGN.md](DESIGN.md)
-§32.
+is rejected by a test.
+
+Each write keeps the file it replaces as `snap.bin.prev`, so a snapshot that
+turns out to be unreadable is not the only copy. Startup tries the current
+file, then the one behind it:
+
+```
+snapshot: snap.bin is unusable: snapshot checksum is 6b1d4f02, want c0a93e17
+restored 3 metrics (3 buckets) from snap.bin.prev, 0 dropped as stale
+```
+
+A bad *path* still stops startup — that is a configuration error, and refusing
+is the only way to make it visible. A *corrupt file* does not. Refusing there
+would turn a damaged cache into a crash loop nobody can break without deleting
+a file by hand, so the server starts empty, warns loudly, and counts it.
+
+Persistence reports on itself, under the same reserved prefix:
+
+| metric | |
+| --- | --- |
+| `metricflow.snapshot.load_failures` | files found unusable, including ones the fallback rescued |
+| `metricflow.snapshot.empty_starts` | startups that ended up with nothing |
+| `metricflow.snapshot.write_failures` | writes that failed |
+| `metricflow.snapshot.age_seconds` | time since the last successful write |
+| `metricflow.snapshot.bytes` | size of the last one |
+
+Age is the one worth alerting on: a snapshotter that has silently stopped
+produces no failures at all, so a flat zero failure count looks healthy right
+up until a restart finds nothing. See [DESIGN.md](DESIGN.md) §32 and §33.
 
 ## The server watching itself
 
