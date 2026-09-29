@@ -21,7 +21,10 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
+	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -665,5 +668,169 @@ func BenchmarkClientRefusedByItsShare(b *testing.B) {
 		if c.acquire() {
 			b.Fatalf("iteration %d was admitted past the share", i)
 		}
+	}
+}
+
+// --- the read path while the write path is busy ---
+
+// Every query benchmark above measures a store nobody is writing to, which
+// is the one condition this server never actually runs in. "Fast queries
+// out" is a third of what this project claims, and until now the only
+// evidence for it came from a quiet store.
+//
+// The contention is structural rather than incidental. selectNames takes
+// each shard's lock in turn and walks every name under it, and ingest needs
+// that same lock to record a single event - so a query is not a reader
+// politely sharing with writers, it is a writer's peer holding one shard
+// shut for as long as the walk takes.
+
+// storeNames returns every metric name in the store, so load can be aimed
+// at metrics that already exist. Creating names instead would measure §27's
+// cardinality cap refusing them, which is a different benchmark.
+func storeNames(s *Store) []string {
+	var names []string
+	for i := range s.shards {
+		sh := &s.shards[i]
+		sh.mu.Lock()
+		for name := range sh.aggs {
+			names = append(names, name)
+		}
+		sh.mu.Unlock()
+	}
+	sort.Strings(names)
+	return names
+}
+
+// ingestLoad runs writers goroutines recording into s until stop is called,
+// and reports the rate they actually achieved - the load a query was
+// measured under, rather than the load it was asked for.
+//
+// The timestamp is fixed at the start on purpose: a moving clock would roll
+// buckets mid-benchmark and mix eviction into a measurement about locks.
+func ingestLoad(s *Store, writers int, names []string) (stop func() float64) {
+	if writers == 0 || len(names) == 0 {
+		return func() float64 { return 0 }
+	}
+
+	var (
+		done     = make(chan struct{})
+		wg       sync.WaitGroup
+		recorded atomic.Int64
+	)
+	now := time.Now()
+	ts := now.UnixMilli()
+	started := time.Now()
+
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(seed int) {
+			defer wg.Done()
+			i, n := seed, int64(0)
+			for {
+				select {
+				case <-done:
+					recorded.Add(n)
+					return
+				default:
+				}
+				// A batch between channel checks: the select itself is
+				// cheap but not free, and checking it once per event would
+				// be measuring the check rather than the store.
+				for k := 0; k < 64; k++ {
+					name := names[i%len(names)]
+					i++
+					if s.record(now, Event{Name: name, Value: float64(i%17) + 1, TS: ts}) == nil {
+						n++
+					}
+				}
+			}
+		}(w * 997)
+	}
+
+	return func() float64 {
+		close(done)
+		wg.Wait()
+		return float64(recorded.Load()) / time.Since(started).Seconds()
+	}
+}
+
+// What one /stats costs, and what it costs the firehose, at several levels
+// of concurrent ingest. writers=0 is the quiet-store number every other
+// query benchmark reports, kept here so the comparison is in one place.
+func BenchmarkStatsUnderIngest(b *testing.B) {
+	for _, writers := range []int{0, 1, 4, runtime.GOMAXPROCS(0)} {
+		b.Run(fmt.Sprintf("writers=%d", writers), func(b *testing.B) {
+			s := storeWithMetrics(2000)
+			names := storeNames(s)
+
+			w := &discardWriter{}
+			req := httptest.NewRequest(http.MethodGet, "/stats", nil)
+			lat := make([]time.Duration, 0, b.N)
+
+			stop := ingestLoad(s, writers, names)
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				t0 := time.Now()
+				s.handleStats(w, req)
+				lat = append(lat, time.Since(t0))
+			}
+			b.StopTimer()
+
+			rate := stop()
+
+			// The tail is the number that matters for a query path. A mean
+			// that looks fine while the p99 is ten times worse is exactly
+			// what lock contention produces.
+			sort.Slice(lat, func(i, j int) bool { return lat[i] < lat[j] })
+			b.ReportMetric(float64(lat[len(lat)/2].Microseconds()), "p50_us")
+			b.ReportMetric(float64(lat[len(lat)*99/100].Microseconds()), "p99_us")
+			b.ReportMetric(float64(lat[len(lat)-1].Microseconds()), "max_us")
+			b.ReportMetric(rate/1e6, "ingest_Mev/s")
+		})
+	}
+}
+
+// The same contention from the other side: what a query costs ingest.
+// BenchmarkRecordForExistingMetric is the uncontended comparison.
+func BenchmarkRecordUnderStats(b *testing.B) {
+	for _, queriers := range []int{0, 1} {
+		b.Run(fmt.Sprintf("queriers=%d", queriers), func(b *testing.B) {
+			s := storeWithMetrics(2000)
+			names := storeNames(s)
+			now := time.Now()
+			ts := now.UnixMilli()
+
+			done := make(chan struct{})
+			var wg sync.WaitGroup
+			for q := 0; q < queriers; q++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					w := &discardWriter{}
+					req := httptest.NewRequest(http.MethodGet, "/stats", nil)
+					for {
+						select {
+						case <-done:
+							return
+						default:
+							s.handleStats(w, req)
+						}
+					}
+				}()
+			}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				name := names[i%len(names)]
+				_ = s.record(now, Event{Name: name, Value: float64(i%17) + 1, TS: ts})
+			}
+			b.StopTimer()
+
+			close(done)
+			wg.Wait()
+		})
 	}
 }
