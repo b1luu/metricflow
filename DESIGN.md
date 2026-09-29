@@ -96,6 +96,9 @@ Event shape (see `Event` in `main.go`):
 - [32. Surviving a restart](#32-surviving-a-restart)
 - [33. When the snapshot is the thing that is broken](#33-when-the-snapshot-is-the-thing-that-is-broken)
 
+**The read path under load**
+
+- [34. The read path while the write path is busy](#34-the-read-path-while-the-write-path-is-busy)
 ## Design choices
 
 ### 1. Store the conclusion, not the events
@@ -2129,6 +2132,93 @@ is the claim: the damage is visible *and* nothing was lost.
   rather than hidden, and it is now counted instead of being fatal.
 - *Nothing here makes the disk less of a single point of failure* (§32). Two
   files on one machine survive a bad write, not a bad machine.
+
+### 34. The read path while the write path is busy
+
+Every query benchmark before this one ran against a store nobody was writing
+to, which is the one condition this server never runs in. "Fast queries out"
+is a third of what §1 set out to build, and the only evidence for it came
+from a quiet store.
+
+**The contention is structural, not incidental.** `selectNames` takes each
+shard's lock in turn and walks every name under it; ingest needs that same
+lock to record a single event. A query is not a reader politely sharing with
+writers — it is their peer, holding one shard shut for the length of the
+walk. Sharding (§24) means it shuts one thirty-second of the store at a time
+rather than all of it, which is the whole reason the number below is a
+doubling and not a collapse.
+
+**Measured**, 2 000 metrics, p50 of one full `/stats`:
+
+| writers | p50 | while ingesting |
+| --- | --- | --- |
+| 0 | 2.00 ms | — |
+| 1 | 2.04 ms | 6.3 M ev/s |
+| 4 | 2.07 ms | 16.9 M ev/s |
+| 16 | 3.72 ms | 32.8 M ev/s |
+
+and from the other side, `record` against a query loop running back to back
+with no think time at all: **131 ns → 199 ns**.
+
+So a saturating firehose roughly doubles query latency, and a pathological
+query loop costs ingest about a third of its throughput. Neither is a
+realistic load — a dashboard polls every ten seconds — which is the point of
+measuring it: the worst case is bounded and unremarkable.
+
+**Reporting p99 alone would have invented a problem that is not there.** The
+benchmark reports p50, p99 and max, and p99 is five times p50 *at zero
+writers*, where there is one goroutine and no contention whatsoever. That
+tail is the Windows scheduler, not the server. `GOGC=off` left it unchanged,
+so it is not the collector either. A tail that is identical with and without
+the thing you are measuring is not evidence about the thing you are
+measuring.
+
+**The profile found something better than the contention.** A fifth of every
+object the query path allocated was inside `reflect.unsafe_New` and
+`reflectlite.Swapper` — neither of which appears anywhere in this codebase.
+They come from `sort.Slice`, which takes its slice as an interface and builds
+a reflect-based swapper, allocating twice per call. `sortedBuckets` runs once
+per histogram per query, so a `/stats` over a thousand metrics was spending
+two thousand allocations on reflection to sort a `[]int32`. `slices.Sort` is
+the same sort without the interface:
+
+| | before | after |
+| --- | --- | --- |
+| `BenchmarkHistQuantile` | 29.5 µs, 4 allocs | 21.4 µs, 2 allocs |
+| `BenchmarkStats` | 695 µs, 1 014 allocs | 640 µs, 814 allocs |
+| `/stats` under ingest | 2.30 ms, 10 028 allocs | 2.09 ms, 8 027 allocs |
+
+**An `RWMutex` was tried and rejected.** The obvious response to "reads and
+writes contend" is to let reads share, and the shard lock's read sites —
+`selectNames`, `aggFor`, `size` — really are read-only. Measured against the
+plain `Mutex`:
+
+| | change |
+| --- | --- |
+| query p50 | −0.1% / +0.6% / +8.1% / −2.5% — noise |
+| ingest throughput | **−15% to −19%**, consistently |
+| uncontended `record` | +2.5% |
+
+Rejected, because the benefit it buys is concurrent *readers* and there is
+only ever one query goroutine to collect it, while every writer on the hot
+path pays the heavier lock. That is not an argument against `RWMutex` in
+general; it is an argument about a workload with one reader and sixteen
+writers, which is what a metrics ingest engine is.
+
+**What this deliberately does not do.**
+
+- *No attempt to make queries cheaper than the walk.* `selectNames` is O(names
+  in the store) by construction, and §28 bounds what happens after it rather
+  than the walk itself. A secondary index over names would remove the walk and
+  add a structure every ingest has to maintain — the wrong trade for a server
+  that ingests millions of times more often than it queries.
+- *The remaining allocations are not chased.* `hist.merge` is still 41% of the
+  objects, and it is honest work: merging sparse maps across a metric's
+  buckets. Removing it means not materialising a merged histogram at all,
+  which is a different design and not one 2 ms is asking for.
+- *These numbers are from one machine with no `-race` and a noisy scheduler.*
+  The p50s are stable and the ingest deltas reproduce; the tails are not
+  evidence of anything.
 
 ## Testing
 
