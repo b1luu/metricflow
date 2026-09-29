@@ -600,7 +600,21 @@ func runUntil(t *testing.T, snapPath string) (addr string, stop func() error) {
 
 // testClient has a timeout, so a server that stops answering fails a test in
 // seconds rather than hanging it. http.DefaultClient has none.
-var testClient = &http.Client{Timeout: 10 * time.Second}
+//
+// Keep-alives are off to stop the transport leaving pooled connections
+// behind. A connection it opened and did not end up using is, from the
+// server's side, a socket that has never sent a byte - which Shutdown will
+// not close until readHeaderTimeout does, adding five seconds to a restart
+// test that is otherwise instant.
+//
+// It makes that rarer rather than impossible: a run of these tests still
+// occasionally takes the five seconds, so something else opens one too. That
+// is a slow test and not a wrong one, because the server now survives it -
+// which is the only reason this is a comment and not a bug.
+var testClient = &http.Client{
+	Timeout:   10 * time.Second,
+	Transport: &http.Transport{DisableKeepAlives: true},
+}
 
 func postEvent(t *testing.T, addr, name string, value float64) {
 	t.Helper()
@@ -1282,8 +1296,57 @@ func TestACorruptSnapshotIsVisibleInStats(t *testing.T) {
 
 	// The reporter samples once at startup, but on its own goroutine, so
 	// the first sample may not have landed yet.
-	if got := awaitSelfMetric(t, addr, selfSnapLoadFail); got.Max < 1 {
-		t.Errorf("%s = %v, want a failure reported", selfSnapLoadFail, got.Max)
+	// Both files were unusable, so both are counted...
+	if got := awaitSelfMetric(t, addr, selfSnapLoadFail); got.Max != 2 {
+		t.Errorf("%s = %v, want both damaged files counted", selfSnapLoadFail, got.Max)
+	}
+	// ...and this is the one that means data was actually lost.
+	if got := awaitSelfMetric(t, addr, selfSnapEmptyStart); got.Max != 1 {
+		t.Errorf("%s = %v, want 1", selfSnapEmptyStart, got.Max)
+	}
+}
+
+// The case the live demo exposed. A damaged current generation that the
+// previous one rescued loses nothing - and would therefore look exactly like
+// a healthy restart if the only counter were "started empty". The newest
+// snapshot being broken is worth seeing while there is still a second copy
+// left to lose.
+func TestAFallbackIsVisibleEvenThoughNothingWasLost(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "snap.bin")
+
+	// A run that leaves two good generations behind it.
+	addr, stop := runUntil(t, path)
+	postEvent(t, addr, "svc.requests", 1)
+	if err := stop(); err != nil {
+		t.Fatalf("shutting down: %v", err)
+	}
+	addr, stop = runUntil(t, path)
+	if err := stop(); err != nil {
+		t.Fatalf("shutting down: %v", err)
+	}
+	if _, err := os.Stat(path + ".prev"); err != nil {
+		t.Fatalf("setup: no previous generation to fall back to: %v", err)
+	}
+
+	// Damage only the current one.
+	if err := os.WriteFile(path, []byte("shredded"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	addr, stop = runUntil(t, path)
+	defer stop()
+
+	// Nothing was lost...
+	if _, ok := fetchStats(t, addr, "").Metrics["svc.requests"]; !ok {
+		t.Error("the fallback did not bring the data back")
+	}
+	if got := awaitSelfMetric(t, addr, selfSnapEmptyStart); got.Max != 0 {
+		t.Errorf("%s = %v, want 0 - the fallback succeeded", selfSnapEmptyStart, got.Max)
+	}
+	// ...and the damage is still reported.
+	if got := awaitSelfMetric(t, addr, selfSnapLoadFail); got.Max != 1 {
+		t.Errorf("%s = %v, want the damaged current generation counted",
+			selfSnapLoadFail, got.Max)
 	}
 }
 
@@ -1308,9 +1371,10 @@ func TestACleanRestartReportsNoLoadFailure(t *testing.T) {
 
 	// Waiting for the metric to be present first, because "absent" would
 	// satisfy a check for zero without proving anything at all.
-	got := awaitSelfMetric(t, addr, selfSnapLoadFail)
-	if got.Max != 0 {
-		t.Errorf("%s = %v after a clean restart, want 0", selfSnapLoadFail, got.Max)
+	for _, name := range []string{selfSnapLoadFail, selfSnapEmptyStart} {
+		if got := awaitSelfMetric(t, addr, name); got.Max != 0 {
+			t.Errorf("%s = %v after a clean restart, want 0", name, got.Max)
+		}
 	}
 }
 

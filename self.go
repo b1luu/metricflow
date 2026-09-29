@@ -70,10 +70,11 @@ const (
 	// because a server with persistence switched off has no snapshot age,
 	// and a zero there would read as "just snapshotted" - indistinguishable
 	// from the healthiest possible value. Absence is the honest answer.
-	selfSnapAge       = selfPrefix + "snapshot.age_seconds"    // gauge
-	selfSnapBytes     = selfPrefix + "snapshot.bytes"          // gauge
-	selfSnapWriteFail = selfPrefix + "snapshot.write_failures" // counter
-	selfSnapLoadFail  = selfPrefix + "snapshot.load_failures"  // counter
+	selfSnapAge        = selfPrefix + "snapshot.age_seconds"    // gauge
+	selfSnapBytes      = selfPrefix + "snapshot.bytes"          // gauge
+	selfSnapWriteFail  = selfPrefix + "snapshot.write_failures" // counter
+	selfSnapLoadFail   = selfPrefix + "snapshot.load_failures"  // counter
+	selfSnapEmptyStart = selfPrefix + "snapshot.empty_starts"   // counter
 )
 
 // reserved reports whether a metric name belongs to the server rather than
@@ -92,12 +93,21 @@ type counters struct {
 	rejected atomic.Int64
 	swept    atomic.Int64
 
-	// snapLoadFail counts startups that found a snapshot and could not use
-	// it. Starting empty is no longer fatal (§33), so this is what stops it
-	// being silent: it is the difference between "this server has no
-	// history because it is new" and "this server has no history because
-	// its snapshot was damaged".
-	snapLoadFail atomic.Int64
+	// snapFileFail counts snapshot files found unusable at startup, and
+	// snapEmptyStart counts the startups that ended up with nothing.
+	//
+	// They are separate because the fallback makes them different events. A
+	// damaged current generation that the previous one rescued increments
+	// the first and not the second: no data was lost, but the newest
+	// snapshot is broken and somebody should look before the copy behind it
+	// breaks too. Collapsing them would leave that state indistinguishable
+	// from a healthy restart, which is precisely the "quietly fell back"
+	// failure keeping a second generation was supposed to avoid.
+	//
+	// The second is the one that means data is gone: this server has no
+	// history, and not because it is new.
+	snapFileFail   atomic.Int64
+	snapEmptyStart atomic.Int64
 }
 
 func (c *counters) addAccepted(n int) {
@@ -118,7 +128,13 @@ func (c *counters) addSwept(n int) {
 	}
 }
 
-func (c *counters) addSnapshotLoadFailure() { c.snapLoadFail.Add(1) }
+func (c *counters) addSnapshotFileFailures(n int) {
+	if n > 0 {
+		c.snapFileFail.Add(int64(n))
+	}
+}
+
+func (c *counters) addSnapshotEmptyStart() { c.snapEmptyStart.Add(1) }
 
 // selfReporter samples the server and records the result into the store it
 // is sampling.
@@ -186,7 +202,8 @@ func (r *selfReporter) sample(now time.Time) {
 		// because "every write so far has failed" is precisely the state
 		// worth seeing, and gating it on a success would hide it.
 		rec(selfSnapWriteFail, float64(writeFailures))
-		rec(selfSnapLoadFail, float64(r.counts.snapLoadFail.Load()))
+		rec(selfSnapLoadFail, float64(r.counts.snapFileFail.Load()))
+		rec(selfSnapEmptyStart, float64(r.counts.snapEmptyStart.Load()))
 
 		if fresh {
 			rec(selfSnapAge, age.Seconds())

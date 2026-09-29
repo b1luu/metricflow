@@ -647,7 +647,9 @@ func TestPersistenceMetricsAreAbsentWhenPersistenceIsOff(t *testing.T) {
 
 	r.sample(time.Now())
 
-	for _, name := range []string{selfSnapAge, selfSnapBytes, selfSnapWriteFail, selfSnapLoadFail} {
+	for _, name := range []string{
+		selfSnapAge, selfSnapBytes, selfSnapWriteFail, selfSnapLoadFail, selfSnapEmptyStart,
+	} {
 		if _, ok := mergeAll(s, name); ok {
 			t.Errorf("%s was published by a server with persistence off", name)
 		}
@@ -663,7 +665,9 @@ func TestPersistenceMetricsAppearWhenPersistenceIsOn(t *testing.T) {
 
 	r.sample(now)
 
-	for _, name := range []string{selfSnapAge, selfSnapBytes, selfSnapWriteFail, selfSnapLoadFail} {
+	for _, name := range []string{
+		selfSnapAge, selfSnapBytes, selfSnapWriteFail, selfSnapLoadFail, selfSnapEmptyStart,
+	} {
 		if _, ok := mergeAll(s, name); !ok {
 			t.Errorf("%s was not published", name)
 		}

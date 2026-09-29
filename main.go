@@ -646,6 +646,13 @@ func run(ctx context.Context, ln net.Listener) error {
 		for _, problem := range res.problems {
 			log.Printf("snapshot: %s", problem)
 		}
+
+		// Counted even when the fallback then succeeded. A log line is not
+		// an alert, and "the newest snapshot is broken but the one behind
+		// it saved us" is a state worth seeing while there is still a
+		// second copy left to lose.
+		store.counts.addSnapshotFileFailures(len(res.problems))
+
 		switch {
 		case res.from == "" && len(res.problems) > 0:
 			// Loud, but not fatal (§33). §32 refused to start here, which
@@ -665,7 +672,7 @@ func run(ctx context.Context, ln net.Listener) error {
 			// and counts it where an alert can reach it.
 			log.Printf("WARNING: no usable snapshot at %s; starting with an empty store. "+
 				"The last %s of aggregates is gone.", snapPath, window)
-			store.counts.addSnapshotLoadFailure()
+			store.counts.addSnapshotEmptyStart()
 		case res.from == "":
 			log.Printf("no snapshot at %s yet; starting empty", snapPath)
 		default:
