@@ -396,3 +396,153 @@ jobs:
           PY
 
           kill -TERM "$(cat server.pid)" || true
+
+      # The whole reason a second generation is kept. The current file is
+      # damaged and the server has to notice, say so, and use the one behind
+      # it rather than losing the window.
+      - name: a corrupt snapshot falls back to the previous generation
+        env:
+          METRICFLOW_SNAPSHOT: snap.bin
+        run: |
+          for i in $(seq 1 25); do
+            kill -0 "$(cat server.pid)" 2>/dev/null || break
+            sleep 0.2
+          done
+
+          test -f snap.bin      || { echo "no current snapshot"; exit 1; }
+          test -f snap.bin.prev || { echo "no previous generation - rotation never happened"; exit 1; }
+          ls -l snap.bin snap.bin.prev
+
+          # Damage the current file only, leaving the one behind it intact.
+          printf 'shredded' > snap.bin
+
+          ./metricflow > third.log 2>&1 &
+          echo $! > server.pid
+          for i in $(seq 1 50); do
+            curl -sf localhost:8080/health > /dev/null && break
+            sleep 0.2
+          done
+
+          grep -E "snap\.bin is unusable" third.log             || { echo "the damaged file was not reported"; cat third.log; exit 1; }
+          grep -E "restored .* from snap\.bin\.prev" third.log             || { echo "it did not fall back to the previous generation"; cat third.log; exit 1; }
+
+          curl -sf "localhost:8080/stats?prefix=metric." > fallback.json
+
+          # Let the self-reporter's first sample land.
+          for i in $(seq 1 30); do
+            curl -sf "localhost:8080/stats?prefix=metricflow.snapshot." > fallback-self.json
+            python3 -c "import json,sys; sys.exit(0 if 'metricflow.snapshot.load_failures' in json.load(open('fallback-self.json'))['metrics'] else 1)" && break
+            sleep 0.5
+          done
+
+          python3 - <<'PY'
+          import json, sys
+
+          def load(path):
+              with open(path) as f:
+                  return json.load(f)["metrics"]
+
+          before, after = load("before.json"), load("fallback.json")
+
+          if not before:
+              sys.exit("the first server recorded nothing; this proves nothing")
+
+          for name, b in sorted(before.items()):
+              a = after.get(name)
+              if a is None:
+                  sys.exit("%s was lost when the current snapshot was damaged" % name)
+              for field in ("count", "avg", "min", "max", "p50", "p90", "p99"):
+                  if a[field] != b[field]:
+                      sys.exit("%s %s = %r after the fallback, %r before"
+                               % (name, field, a[field], b[field]))
+
+          print("%d metrics came back from the previous generation, intact" % len(before))
+
+          # Nothing was lost, and the damage still has to be visible. If it
+          # is not, a broken newest snapshot is indistinguishable from a
+          # healthy restart and nobody finds out until the copy behind it
+          # breaks too.
+          selfm = load("fallback-self.json")
+
+          lf = selfm.get("metricflow.snapshot.load_failures")
+          if lf is None:
+              sys.exit("no load failures published after falling back")
+          if lf["max"] != 1:
+              sys.exit("load failures = %r, want exactly the one damaged file" % lf["max"])
+
+          empty = selfm.get("metricflow.snapshot.empty_starts")
+          if empty is None:
+              sys.exit("no empty starts published")
+          if empty["max"] != 0:
+              sys.exit("empty starts = %r, but the fallback succeeded" % empty["max"])
+
+          print("the damaged generation was reported, and nothing was lost")
+          PY
+
+          kill -TERM "$(cat server.pid)" || true
+
+      # And when there is nothing left to fall back to, it still starts. This
+      # is the behaviour that changed: refusing here would turn a damaged
+      # cache into a crash loop no operator can break without deleting a file
+      # by hand.
+      - name: both generations corrupt must still start, and say so
+        env:
+          METRICFLOW_SNAPSHOT: snap.bin
+        run: |
+          for i in $(seq 1 25); do
+            kill -0 "$(cat server.pid)" 2>/dev/null || break
+            sleep 0.2
+          done
+
+          printf 'shredded' > snap.bin
+          printf 'shredded' > snap.bin.prev
+
+          ./metricflow > fourth.log 2>&1 &
+          echo $! > server.pid
+          started=no
+          for i in $(seq 1 50); do
+            curl -sf localhost:8080/health > /dev/null && { started=yes; break; }
+            sleep 0.2
+          done
+          [ "$started" = yes ]             || { echo "the server refused to start on a damaged snapshot"; cat fourth.log; exit 1; }
+
+          grep -E "WARNING: no usable snapshot" fourth.log             || { echo "it started empty without saying so"; cat fourth.log; exit 1; }
+
+          # Serving is the claim, so make it serve.
+          curl -sf -X POST localhost:8080/ingest             -d "{\"name\":\"svc.after.corruption\",\"value\":1,\"ts\":$(date +%s)000}"             > /dev/null || { echo "the server started but will not ingest"; exit 1; }
+
+          # And it has to be visible as a metric, not just in a log line
+          # nobody greps at 3am.
+          for i in $(seq 1 30); do
+            curl -sf "localhost:8080/stats?prefix=metricflow.snapshot." > self.json
+            python3 -c "import json,sys; sys.exit(0 if 'metricflow.snapshot.load_failures' in json.load(open('self.json'))['metrics'] else 1)" && break
+            sleep 0.5
+          done
+
+          python3 - <<'PY'
+          import json, sys
+
+          with open("self.json") as f:
+              m = json.load(f)["metrics"]
+
+          lf = m.get("metricflow.snapshot.load_failures")
+          if lf is None:
+              sys.exit("the server started empty and published no load failure")
+          if lf["max"] != 2:
+              sys.exit("load failures = %r, want both damaged files counted" % lf["max"])
+
+          empty = m.get("metricflow.snapshot.empty_starts")
+          if empty is None:
+              sys.exit("nothing was restored and no empty start was published")
+          if empty["max"] < 1:
+              sys.exit("empty starts = %r, want at least 1" % empty["max"])
+
+          age = m.get("metricflow.snapshot.age_seconds")
+          if age is None:
+              sys.exit("no snapshot age published, so staleness is unalertable")
+
+          print("reported %d unusable file(s), %d empty start(s); snapshot age %gs"
+                % (lf["max"], empty["max"], age["max"]))
+          PY
+
+          kill -TERM "$(cat server.pid)" || true
