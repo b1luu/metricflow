@@ -14,7 +14,7 @@ package main
 
 import (
 	"math"
-	"sort"
+	"slices"
 )
 
 // relAccuracy is the relative error the bucketing guarantees: a reported
@@ -196,6 +196,11 @@ func sortedBuckets(m map[int32]int64) []int32 {
 	for i := range m {
 		out = append(out, i)
 	}
-	sort.Slice(out, func(a, b int) bool { return out[a] < out[b] })
+	// slices.Sort rather than sort.Slice: sort.Slice takes the slice as an
+	// interface and builds a reflect-based swapper, which allocates twice
+	// per call. That is invisible on one histogram and is not invisible on
+	// a /stats over a thousand metrics, where it was a fifth of every
+	// object the query path allocated.
+	slices.Sort(out)
 	return out
 }
