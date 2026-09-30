@@ -205,6 +205,32 @@ rotating the header falls back to the global limits, which still hold. A
 deployment facing untrusted callers should set the header at a trusted proxy
 and strip whatever the caller sent. See [DESIGN.md](DESIGN.md) §29.
 
+### Queries are budgeted by work, not by request count
+
+Concurrency alone is a weak limit on reads: a client well inside its share can
+ask for a thousand metrics over and over, one request at a time, and look
+perfectly well behaved by every other measure the server keeps.
+
+So each client gets a budget of **20,000 metric-equivalents per 10 s**. One
+unit is the work of merging and sorting one metric's buckets; walking 325
+names in the store costs the same as one unit, which lets a single number
+price both halves of a query:
+
+```
+cost = metricsComputed + namesWalked/325
+```
+
+Both terms matter. Charging only for metrics returned would leave a client
+free to run unlimited full-store scans behind a prefix that matches nothing —
+real work, and free.
+
+A dashboard polling six panels at `limit=100` spends around 1,200 of its
+20,000. A client polling flat out is cut off with `429` and recovers at the
+next epoch. The refusals are published as
+`metricflow.clients.query_budget_refusals`, counted separately from
+`requests.throttled` because they mean different things: throttled is *too
+much at once*, this is *too much work*. See [DESIGN.md](DESIGN.md) §34 and §35.
+
 ## Querying
 
 `/stats` is bounded. It computes at most 1000 metrics per request, whatever

@@ -96,9 +96,10 @@ Event shape (see `Event` in `main.go`):
 - [32. Surviving a restart](#32-surviving-a-restart)
 - [33. When the snapshot is the thing that is broken](#33-when-the-snapshot-is-the-thing-that-is-broken)
 
-**The read path under load**
+**What reads cost, and who pays**
 
 - [34. The read path while the write path is busy](#34-the-read-path-while-the-write-path-is-busy)
+- [35. Charging a client for the work it causes](#35-charging-a-client-for-the-work-it-causes)
 ## Design choices
 
 ### 1. Store the conclusion, not the events
@@ -1650,7 +1651,8 @@ difference: the budget is now spent by whoever is spending it.
   concurrency.* A client within its concurrency share can still issue expensive
   queries back to back. A cost-weighted budget — charging a client for the
   metrics a query computed rather than the requests it made — is the natural
-  next step, and needs a notion of cost the server does not have yet.
+  next step, and needs a notion of cost the server does not have yet. (§34
+  measured that cost and §35 charges it.)
 - *The limits are fixed, not adaptive.* A client gets the same share whether it
   is the only one connected or one of two hundred. Adaptive shares would use
   the pool better and would need the server to track offered load per client
@@ -2219,6 +2221,69 @@ writers, which is what a metrics ingest engine is.
 - *These numbers are from one machine with no `-race` and a noisy scheduler.*
   The p50s are stable and the ingest deltas reproduce; the tails are not
   evidence of anything.
+
+### 35. Charging a client for the work it causes
+
+§29 gave each client a share of concurrency and a share of new metric names,
+and left a hole it named: *"A client within its concurrency share can still
+issue expensive queries back to back."* One request at a time, entirely
+inside every limit the server kept, a caller could ask for a thousand metrics
+forever. It stopped there because a cost-weighted budget "needs a notion of
+cost the server does not have yet". §34 measured that cost; this spends it.
+
+**The unit is a metric-equivalent**: merging and sorting one metric's
+buckets, about 2.6 µs. §34 also measured a name walk at 7.9 ns, so walking
+325 names costs what one metric-equivalent costs — and that ratio is what
+lets a single number price both halves of a query:
+
+```
+cost = metricsComputed + namesWalked/325
+```
+
+**Both terms, deliberately.** Pricing only the metrics returned would leave a
+client free to run unlimited full-store scans behind a prefix matching
+nothing: 260 µs of real work each, and free under that pricing. A test fails
+if the walk term is dropped.
+
+**20 000 units per 10 s epoch** is roughly 52 ms of query work — half a
+percent of one core, or about 1.3 cores if all 256 clients sat at their
+ceiling at once. A dashboard polling six panels at `limit=100` over a full
+store spends about 1 200 of it. The ceiling is around eighteen maximum-size
+queries, or many thousands of narrow ones: invisible to a real caller, finite
+to a loop. The epoch is derived from the clock exactly as §29's name budget
+is, so there is no third background loop to run and a client that goes quiet
+needs no cleanup.
+
+**Checked before, charged after.** What a query cost is not known until it
+has run, so the budget is tested on the way in and billed on the way out. A
+client can therefore overshoot by exactly one query — bounded by §28's
+per-request limit, and pinned by a test that it is one rather than unlimited.
+The alternative is estimating the cost beforehand, which buys away the
+overshoot by being wrong about the number, a poor trade for a limit whose
+entire purpose is to be proportional to real work.
+
+**`429`, not `503`**, for the reason §26 and §29 both give: the server may be
+completely idle while one client is over its own share. And the refusals are
+published as `metricflow.clients.query_budget_refusals`, counted apart from
+`requests.throttled` because they describe different faults — throttled is
+*too much at once*, this is *too much work*, which a client can reach one
+polite request at a time.
+
+**What this deliberately does not do.**
+
+- *Only `/stats` is priced.* `/alerts` costs a walk of the rule set, which is
+  fixed by configuration rather than chosen by the caller, and `/ingest` is
+  priced by §27 and §29 already. A caller cannot make `/alerts` expensive.
+- *The price is a model, not a measurement.* Cost is computed from counts, not
+  from time spent, so a metric with six buckets and one with a single bucket
+  are billed the same. Timing each query would be exact and would make the
+  bill depend on how loaded the server happened to be, which is a worse
+  property for a limit a client is meant to be able to predict.
+- *The ratio is a constant, not a calibration.* 325 comes from one machine.
+  It is the right order of magnitude rather than the right number, and the
+  benchmarks that produced it are checked in so a future machine can say so.
+- *Still not adaptive* (§29). A client gets the same budget whether it is
+  alone or one of two hundred.
 
 ## Testing
 
