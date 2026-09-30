@@ -588,7 +588,7 @@ func BenchmarkSelectNames(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, matched := s.selectNames(q); matched == 0 {
+		if _, matched, _ := s.selectNames(q); matched == 0 {
 			b.Fatal("selected nothing")
 		}
 	}

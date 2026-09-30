@@ -123,7 +123,7 @@ func TestSelectNamesIsSortedAndDeterministic(t *testing.T) {
 	seedNames(t, s, "c.metric", "a.metric", "b.metric", "d.metric")
 
 	q := statsQuery{window: window, limit: maxStatsLimit}
-	first, matched := s.selectNames(q)
+	first, matched, _ := s.selectNames(q)
 
 	if matched != 4 {
 		t.Errorf("matched = %d, want 4", matched)
@@ -132,7 +132,7 @@ func TestSelectNamesIsSortedAndDeterministic(t *testing.T) {
 		t.Errorf("names are not sorted: %v", first)
 	}
 	for i := 0; i < 20; i++ {
-		again, _ := s.selectNames(q)
+		again, _, _ := s.selectNames(q)
 		if !slices.Equal(first, again) {
 			t.Fatalf("selection is not stable: %v then %v", first, again)
 		}
@@ -144,7 +144,7 @@ func TestSelectNamesHonoursPrefix(t *testing.T) {
 	seedNames(t, s,
 		"svc.api.latency", "svc.api.errors", "svc.db.latency", "other.metric")
 
-	names, matched := s.selectNames(statsQuery{window: window, limit: maxStatsLimit, prefix: "svc.api."})
+	names, matched, _ := s.selectNames(statsQuery{window: window, limit: maxStatsLimit, prefix: "svc.api."})
 	want := []string{"svc.api.errors", "svc.api.latency"}
 	if !slices.Equal(names, want) {
 		t.Errorf("names = %v, want %v", names, want)
@@ -160,7 +160,7 @@ func TestSelectNamesAfterIsExclusive(t *testing.T) {
 	s := newStore()
 	seedNames(t, s, "a", "b", "c")
 
-	names, _ := s.selectNames(statsQuery{window: window, limit: maxStatsLimit, after: "b"})
+	names, _, _ := s.selectNames(statsQuery{window: window, limit: maxStatsLimit, after: "b"})
 	if !slices.Equal(names, []string{"c"}) {
 		t.Errorf("names = %v, want [c]", names)
 	}
@@ -178,7 +178,7 @@ func TestSelectNamesTruncatesButMatchedCountsEverything(t *testing.T) {
 	}
 	seedNames(t, s, names...)
 
-	got, matched := s.selectNames(statsQuery{window: window, limit: 10})
+	got, matched, _ := s.selectNames(statsQuery{window: window, limit: 10})
 	if len(got) != 10 {
 		t.Errorf("returned %d names, want 10", len(got))
 	}
@@ -193,7 +193,7 @@ func TestSelectNamesTruncatesButMatchedCountsEverything(t *testing.T) {
 
 func TestSelectNamesOnAnEmptyStore(t *testing.T) {
 	s := newStore()
-	names, matched := s.selectNames(statsQuery{window: window, limit: maxStatsLimit})
+	names, matched, _ := s.selectNames(statsQuery{window: window, limit: maxStatsLimit})
 	if len(names) != 0 || matched != 0 {
 		t.Errorf("got %v / matched %d, want empty", names, matched)
 	}
@@ -515,7 +515,7 @@ func TestSelectNamesCountsMatchesItDiscards(t *testing.T) {
 		}
 	}
 
-	names, matched := s.selectNames(statsQuery{window: window, limit: 5})
+	names, matched, _ := s.selectNames(statsQuery{window: window, limit: 5})
 	if len(names) != 5 {
 		t.Errorf("kept %d names, want 5", len(names))
 	}

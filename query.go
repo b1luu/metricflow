@@ -160,7 +160,7 @@ func (ns *nameSelector) result() []string {
 // reproducible - map order is random, so an unsorted selection would return
 // a different subset every call - and it is what lets `after` page through
 // the store with no cursor the server has to remember.
-func (s *Store) selectNames(q statsQuery) (names []string, matched int) {
+func (s *Store) selectNames(q statsQuery) (names []string, matched, walked int) {
 	sel := newNameSelector(q.limit)
 
 	for i := range s.shards {
@@ -168,6 +168,10 @@ func (s *Store) selectNames(q statsQuery) (names []string, matched int) {
 
 		sh.mu.Lock()
 		for name := range sh.aggs {
+			// Counted whether or not it matches: the walk happens either
+			// way, and it is the term that makes a prefix matching nothing
+			// cost something rather than nothing (§35).
+			walked++
 			if q.matches(name) {
 				// Counted before the selector decides, because matched is
 				// the whole truth about the query and the selector only
@@ -179,7 +183,7 @@ func (s *Store) selectNames(q statsQuery) (names []string, matched int) {
 		sh.mu.Unlock()
 	}
 
-	return sel.result(), matched
+	return sel.result(), matched, walked
 }
 
 // handleStats: GET /stats - per-metric aggregate over a time window, as JSON.
@@ -205,8 +209,26 @@ func (s *Store) handleStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	names, matched := s.selectNames(q)
-	cutoff := windowStart(time.Now(), q.window)
+	now := time.Now()
+
+	// The caller's budget is checked before the query runs and charged
+	// after it, because what a query cost is not known until it has run
+	// (§35). A client can therefore always overshoot by one query, which
+	// is bounded by §28's per-request limit and is the price of pricing
+	// work accurately rather than guessing at it beforehand.
+	c, _ := clientFrom(r.Context())
+	if !c.allowQuery(now) {
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, fmt.Sprintf(
+			"this client is over its query budget (%d metric-equivalents per %s)",
+			maxQueryCostPerEpoch, queryEpoch), http.StatusTooManyRequests)
+		return
+	}
+
+	names, matched, walked := s.selectNames(q)
+	c.chargeQuery(now, queryCost(walked, len(names)))
+
+	cutoff := windowStart(now, q.window)
 
 	resp := StatsResponse{
 		Window:    q.window.String(),

@@ -900,3 +900,158 @@ func TestExactnessHoldsWhileClientsAreThrottled(t *testing.T) {
 		t.Errorf("recordFor accepted %d events, store holds %d", accepted.Load(), recorded)
 	}
 }
+
+// --- the query budget ---
+
+// statsAs runs one /stats as a given client and returns the response.
+func statsAs(t *testing.T, s *Store, c *client, query string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/stats"+query, nil)
+	req = req.WithContext(withClient(req.Context(), c, "tester"))
+	rec := httptest.NewRecorder()
+	s.handleStats(rec, req)
+	return rec
+}
+
+// The claim §29 deferred: a client is charged for the work its queries
+// caused, not for the number of requests it made. Same request count, two
+// very different bills.
+func TestQueryCostFollowsWorkNotRequests(t *testing.T) {
+	s := storeWithMetrics(2000)
+
+	wide := &client{}
+	statsAs(t, s, wide, "?limit=1000")
+
+	narrow := &client{}
+	statsAs(t, s, narrow, "?prefix=svc.metric.42&limit=1")
+
+	wide.mu.Lock()
+	wideSpent := wide.querySpent
+	wide.mu.Unlock()
+
+	narrow.mu.Lock()
+	narrowSpent := narrow.querySpent
+	narrow.mu.Unlock()
+
+	if narrowSpent >= wideSpent {
+		t.Errorf("one narrow query cost %d and one wide query cost %d; "+
+			"the budget is counting requests, not work", narrowSpent, wideSpent)
+	}
+	// The wide query computed 1000 metrics, so the bill has to be of that
+	// order rather than a token charge.
+	if wideSpent < 1000 {
+		t.Errorf("a 1000-metric query cost %d metric-equivalents, want at least 1000", wideSpent)
+	}
+}
+
+// The hole that charging only for returned metrics would leave: a prefix
+// matching nothing still walks the whole store, and still has to be paid
+// for.
+func TestAScanThatMatchesNothingStillCosts(t *testing.T) {
+	s := storeWithMetrics(2000)
+
+	c := &client{}
+	statsAs(t, s, c, "?prefix=nothing.matches.this")
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.querySpent <= 0 {
+		t.Errorf("a full-store scan returning nothing cost %d; "+
+			"an empty result is not free work", c.querySpent)
+	}
+}
+
+// Spend the budget and the next query is refused, with the status §29 uses
+// for a client over its own share rather than §26's server-at-capacity.
+func TestAClientOverItsQueryBudgetIsRefused(t *testing.T) {
+	s := storeWithMetrics(2000)
+	c := &client{}
+
+	var refused *httptest.ResponseRecorder
+	for i := 0; i < 200; i++ {
+		rec := statsAs(t, s, c, "?limit=1000")
+		if rec.Code == http.StatusTooManyRequests {
+			refused = rec
+			break
+		}
+		if rec.Code != http.StatusOK {
+			t.Fatalf("unexpected status %d: %s", rec.Code, rec.Body.String())
+		}
+	}
+	if refused == nil {
+		t.Fatal("a client querying in a loop was never refused")
+	}
+	if got := refused.Header().Get("Retry-After"); got == "" {
+		t.Error("a refusal with no Retry-After tells the client nothing about when to come back")
+	}
+	if body := refused.Body.String(); !strings.Contains(body, "query budget") {
+		t.Errorf("refusal body = %q, want it to name the budget", body)
+	}
+}
+
+// And the budget refills, or a client that once went over is silenced
+// forever.
+func TestTheQueryBudgetRefillsNextEpoch(t *testing.T) {
+	c := &client{}
+	now := time.Now().Truncate(queryEpoch)
+
+	c.chargeQuery(now, maxQueryCostPerEpoch*2)
+	if c.allowQuery(now) {
+		t.Fatal("a client well over its budget was still allowed")
+	}
+	if !c.allowQuery(now.Add(queryEpoch)) {
+		t.Error("the budget did not refill in the next epoch")
+	}
+}
+
+// One client's spending must not touch another's, which is the entire
+// point of a per-client budget rather than a global one.
+func TestOneClientsQueriesDoNotSpendAnothers(t *testing.T) {
+	s := storeWithMetrics(2000)
+	greedy, quiet := &client{}, &client{}
+
+	for i := 0; i < 200; i++ {
+		if statsAs(t, s, greedy, "?limit=1000").Code == http.StatusTooManyRequests {
+			break
+		}
+	}
+	if greedy.allowQuery(time.Now()) {
+		t.Fatal("setup: the greedy client never exhausted its budget")
+	}
+
+	if rec := statsAs(t, s, quiet, "?limit=1000"); rec.Code != http.StatusOK {
+		t.Errorf("a quiet client got %d while another was over budget", rec.Code)
+	}
+}
+
+// Internal callers have no client and must stay unmetered - the alerter and
+// the self-reporter read the store constantly and answer to §28 alone.
+func TestANilClientIsUnmetered(t *testing.T) {
+	var c *client
+
+	c.chargeQuery(time.Now(), maxQueryCostPerEpoch*100)
+	if !c.allowQuery(time.Now()) {
+		t.Error("a nil client was refused; internal readers must not be budgeted")
+	}
+}
+
+// Overshoot is bounded to one query, because the charge lands after the
+// work. Worth pinning: it is the deliberate cost of pricing accurately
+// instead of guessing beforehand.
+func TestOvershootIsBoundedToOneQuery(t *testing.T) {
+	c := &client{}
+	now := time.Now().Truncate(queryEpoch)
+
+	// One unit short of the ceiling: the next query is allowed however
+	// expensive it turns out to be.
+	c.chargeQuery(now, maxQueryCostPerEpoch-1)
+	if !c.allowQuery(now) {
+		t.Fatal("a client just under its ceiling was refused")
+	}
+	c.chargeQuery(now, maxStatsLimit)
+
+	// But only that one.
+	if c.allowQuery(now) {
+		t.Error("a client past its ceiling was allowed a second query")
+	}
+}

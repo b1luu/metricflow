@@ -140,6 +140,12 @@ type client struct {
 	mu      sync.Mutex
 	epoch   int64
 	created int64
+
+	// The query budget (§35), on its own epoch because it is a different
+	// resource from name creation and a client that exhausts one has no
+	// business losing the other.
+	queryEpoch int64
+	querySpent int64
 }
 
 // acquire takes one of this client's in-flight slots, reporting whether it
@@ -157,6 +163,74 @@ func (c *client) acquire() bool {
 }
 
 func (c *client) release() { c.inFlight.Add(-1) }
+
+// queryEpoch is the window a client's query budget refills on, and
+// maxQueryCostPerEpoch is how much it may spend inside one.
+//
+// The unit is a metric-equivalent: the work of merging and sorting one
+// metric's buckets, about 2.6 us, measured in §35. Walking namesPerMetric
+// names costs the same as one of them, which is what lets a single number
+// price both halves of a query.
+//
+// 20 000 units is roughly 52 ms of query work per 10 s, half a percent of
+// one core, and 256 clients all at their ceiling would be about 1.3 cores.
+// A dashboard polling six panels at limit=100 over a full store spends
+// about 1 200 of it. The ceiling is around 18 maximum-size queries, or
+// many thousands of narrow ones - set to be invisible to a real caller and
+// firmly finite to a loop.
+const (
+	queryEpoch           = bucketWidth
+	maxQueryCostPerEpoch = 20000
+	namesPerMetric       = 325
+)
+
+// queryCost prices one /stats in metric-equivalents.
+//
+// Both terms are charged. Pricing only the metrics returned would leave a
+// client free to run unlimited full-store scans behind a prefix that
+// matches nothing: 260 us of walk each, and free.
+func queryCost(walked, computed int) int64 {
+	return int64(computed) + int64(walked)/namesPerMetric
+}
+
+// allowQuery reports whether this client has any query budget left in the
+// current epoch. It does not reserve anything - the charge happens after
+// the query, when what it cost is actually known.
+//
+// A nil client is unmetered, like everywhere else here: internal callers
+// and tests are subject to §28's per-request bound and nothing else.
+func (c *client) allowQuery(now time.Time) bool {
+	if c == nil {
+		return true
+	}
+
+	epoch := now.Truncate(queryEpoch).Unix()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.queryEpoch != epoch {
+		c.queryEpoch, c.querySpent = epoch, 0
+	}
+	return c.querySpent < maxQueryCostPerEpoch
+}
+
+// chargeQuery bills a completed query against the current epoch.
+func (c *client) chargeQuery(now time.Time, cost int64) {
+	if c == nil {
+		return
+	}
+
+	epoch := now.Truncate(queryEpoch).Unix()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.queryEpoch != epoch {
+		c.queryEpoch, c.querySpent = epoch, 0
+	}
+	c.querySpent += cost
+}
 
 // allowNewName reports whether this client may introduce another metric name
 // now, charging it if so.
