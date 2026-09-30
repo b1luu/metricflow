@@ -834,3 +834,55 @@ func BenchmarkRecordUnderStats(b *testing.B) {
 		})
 	}
 }
+
+// --- what a query costs, as a number a budget could charge ---
+
+// §29 wanted to charge a client for the metrics a query computed rather
+// than the requests it made, and said it needed "a notion of cost the
+// server does not have yet". These two benchmarks are that notion, derived
+// rather than invented.
+//
+// A /stats has two terms. selectNames walks every name in the store no
+// matter how few it returns, and then each selected metric is merged and
+// sorted. The walk is the floor a query cannot get under; the merges are
+// what a caller actually chooses by asking for more metrics.
+
+// The walk alone: a prefix that matches nothing scans every name and merges
+// none, so this is the fixed cost of asking at all.
+func BenchmarkQueryWalkOnly(b *testing.B) {
+	for _, metrics := range []int{1000, 4000, 16000, shardCount * maxMetricsPerShard} {
+		b.Run(fmt.Sprintf("metrics=%d", metrics), func(b *testing.B) {
+			s := storeWithMetrics(metrics)
+			w := &discardWriter{}
+			req := httptest.NewRequest(http.MethodGet, "/stats?prefix=nothing.matches.this", nil)
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				s.handleStats(w, req)
+			}
+			b.StopTimer()
+			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N)/float64(metrics), "ns/name")
+		})
+	}
+}
+
+// The per-metric term: one store, varying how many metrics the caller asks
+// to have computed. The difference between limit=1 and limit=1000 is the
+// work a cost-weighted budget exists to charge for.
+func BenchmarkQueryByMetricsComputed(b *testing.B) {
+	s := storeWithMetrics(shardCount * maxMetricsPerShard)
+	for _, limit := range []int{1, 10, 100, 1000} {
+		b.Run(fmt.Sprintf("limit=%d", limit), func(b *testing.B) {
+			w := &discardWriter{}
+			req := httptest.NewRequest(http.MethodGet,
+				fmt.Sprintf("/stats?prefix=svc.metric.&limit=%d", limit), nil)
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				s.handleStats(w, req)
+			}
+		})
+	}
+}
