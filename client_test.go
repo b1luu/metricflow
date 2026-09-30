@@ -1055,3 +1055,32 @@ func TestOvershootIsBoundedToOneQuery(t *testing.T) {
 		t.Error("a client past its ceiling was allowed a second query")
 	}
 }
+
+// A refusal nobody can see is a refusal nobody can alert on (§31), so the
+// counter is checked through the real handler rather than by calling the
+// increment and watching it increment.
+func TestQueryBudgetRefusalsAreCounted(t *testing.T) {
+	s := storeWithMetrics(2000)
+	c := &client{}
+
+	if got := s.counts.queryRefused.Load(); got != 0 {
+		t.Fatalf("a fresh store already counts %d refusals", got)
+	}
+
+	refused := 0
+	for i := 0; i < 200; i++ {
+		if statsAs(t, s, c, "?limit=1000").Code == http.StatusTooManyRequests {
+			refused++
+			if refused == 3 {
+				break
+			}
+		}
+	}
+	if refused == 0 {
+		t.Fatal("setup: a client querying in a loop was never refused")
+	}
+
+	if got := s.counts.queryRefused.Load(); got != int64(refused) {
+		t.Errorf("counted %d refusals, want the %d the handler actually made", got, refused)
+	}
+}

@@ -66,6 +66,13 @@ const (
 	selfStoreBuckets = selfPrefix + "store.buckets"           // gauge
 	selfGoroutines   = selfPrefix + "runtime.goroutines"      // gauge
 
+	// Counted apart from requests.throttled for the same reason that one
+	// is counted apart from requests.shed (§26): they say different things
+	// to an operator. Throttled means a client asked for too much at once;
+	// this means a client asked for too much work (§35), which it can hit
+	// with a single request at a time.
+	selfQueryRefused = selfPrefix + "clients.query_budget_refusals" // counter
+
 	// Persistence (§33). Published only when a snapshot path is configured,
 	// because a server with persistence switched off has no snapshot age,
 	// and a zero there would read as "just snapshotted" - indistinguishable
@@ -108,6 +115,10 @@ type counters struct {
 	// history, and not because it is new.
 	snapFileFail   atomic.Int64
 	snapEmptyStart atomic.Int64
+
+	// queryRefused counts queries refused for being over a client's cost
+	// budget (§35).
+	queryRefused atomic.Int64
 }
 
 func (c *counters) addAccepted(n int) {
@@ -135,6 +146,8 @@ func (c *counters) addSnapshotFileFailures(n int) {
 }
 
 func (c *counters) addSnapshotEmptyStart() { c.snapEmptyStart.Add(1) }
+
+func (c *counters) addQueryRefused() { c.queryRefused.Add(1) }
 
 // selfReporter samples the server and records the result into the store it
 // is sampling.
@@ -176,6 +189,7 @@ func (r *selfReporter) sample(now time.Time) {
 		{selfAccepted, float64(r.counts.accepted.Load())},
 		{selfRejected, float64(r.counts.rejected.Load())},
 		{selfSweptMetrics, float64(r.counts.swept.Load())},
+		{selfQueryRefused, float64(r.counts.queryRefused.Load())},
 		{selfClients, float64(r.clients.tracked())},
 		{selfStoreMetrics, float64(metrics)},
 		{selfStoreBuckets, float64(buckets)},

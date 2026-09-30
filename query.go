@@ -218,6 +218,7 @@ func (s *Store) handleStats(w http.ResponseWriter, r *http.Request) {
 	// work accurately rather than guessing at it beforehand.
 	c, _ := clientFrom(r.Context())
 	if !c.allowQuery(now) {
+		s.counts.addQueryRefused()
 		w.Header().Set("Retry-After", "1")
 		http.Error(w, fmt.Sprintf(
 			"this client is over its query budget (%d metric-equivalents per %s)",
