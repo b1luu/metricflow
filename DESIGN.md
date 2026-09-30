@@ -2269,6 +2269,28 @@ published as `metricflow.clients.query_budget_refusals`, counted apart from
 *too much at once*, this is *too much work*, which a client can reach one
 polite request at a time.
 
+**Live.** A store filled by 24 clients — one could not do it, because §29
+caps a client at 64 new names per epoch, which is exactly what that limit is
+for — then a greedy caller asking for 1 000 metrics in a loop while a quiet
+one asks for 100:
+
+| | 200 | 429 |
+| --- | --- | --- |
+| greedy, `limit=1000` | 20 | **40** |
+| quiet, `limit=100` | 10 | 0 |
+
+```
+store holds 5930 metrics
+metricflow.clients.query_budget_refusals   40
+greedy after one epoch: 200
+```
+
+The twenty is the part worth checking, because the model predicts it: at
+5 930 metrics a `limit=1000` query costs 1000 + 5930/325 ≈ 1018, and
+20 000/1018 ≈ 19.6. The budget ran out where the arithmetic said it would,
+the quiet client never noticed, and the greedy one was serving again one
+epoch later.
+
 **What this deliberately does not do.**
 
 - *Only `/stats` is priced.* `/alerts` costs a walk of the rule set, which is
