@@ -12,7 +12,19 @@ Standard library only (`net/http`), no database, no external services.
 ## Run
 
 ```
-go run main.go
+go run .
+```
+
+`.` means the package in this directory, not one file. `go run main.go` does
+not work and never will: `package main` is spread over a dozen files, and
+compiling one of them alone leaves every type it refers to undefined.
+
+To get a binary instead — which the `METRICFLOW_*` examples further down
+assume:
+
+```
+go build -o metricflow .
+./metricflow
 ```
 
 Listens on `:8080`. `Ctrl-C` (or `SIGTERM`) drains in-flight requests, then
@@ -431,9 +443,35 @@ go test ./... -race                        # needs a 64-bit C toolchain
 go test -run=^$ -bench=. -benchmem         # throughput of the engine
 ```
 
-CI runs all three on every push, plus an end-to-end job that starts the
-server, drives it with `loadgen`, and checks it shuts down cleanly on
-`SIGTERM`.
+One test, or a group — `-run` takes a regex:
+
+```
+go test -run TestACorruptSnapshotDoesNotStopStartup -v .
+go test -run 'TestQueryCost|TestOvershoot' -v .
+```
+
+Repeat a test to find the flaky ones. A concurrency bug that shows up once in
+twenty runs passes a single run every time, and this is how the shutdown bug
+in §33 was found:
+
+```
+go test -run 'TestDataSurvives|TestACorrupt' -count=15 .
+```
+
+Benchmarks need `-benchtime` to settle; the default is too short to compare
+two runs of anything that touches a lock:
+
+```
+go test -run XXX -bench BenchmarkStatsUnderIngest -benchtime 2s -count=5 .
+```
+
+CI runs five jobs on every push: `check` (vet and gofmt), `test` (the suite,
+the race detector, and a 45-second fuzz run against `encoding/json` whose
+findings are kept as a corpus), `e2e` (starts the server, drives it with
+`loadgen`, and checks a clean `SIGTERM` shutdown), `overload` (proves the
+shedding path on a deliberately tiny in-flight limit), and `persistence`
+(kills a server, restarts it, and checks every number came back — then
+damages the snapshot and checks the fallback).
 
 ## Design
 
