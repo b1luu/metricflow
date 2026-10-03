@@ -32,77 +32,119 @@ Event shape (see `Event` in `main.go`):
 
 ## Index
 
+Every section opens with a one-line summary, so this document can be skimmed
+for *what* was decided and read in full only where the *why* matters.
+
 **The shape of the store**
 
-- [1. Store the conclusion, not the events](#1-store-the-conclusion-not-the-events)
-- [2. In-memory state, no persistence](#2-in-memory-state-no-persistence)
-- [3. Bucket maps hold `*Agg` — pointer values](#3-bucket-maps-hold-agg--pointer-values)
-- [4. Seed Min/Max with the first value](#4-seed-minmax-with-the-first-value)
-- [5. One mutex around the whole map](#5-one-mutex-around-the-whole-map)
-- [5a. State lives on a `Store`, not in package globals](#5a-state-lives-on-a-store-not-in-package-globals)
-- [6. Route registration before `ListenAndServe`](#6-route-registration-before-listenandserve)
-- [7. Missing JSON fields are not an error (except `name` and `ts`)](#7-missing-json-fields-are-not-an-error-except-name-and-ts)
+- [1. Store the conclusion, not the events](#1-store-the-conclusion-not-the-events)  
+  A million events for one metric collapse into four numbers, so memory is flat in traffic and no event is ever written down.
+- [2. In-memory state, no persistence](#2-in-memory-state-no-persistence)  
+  Reads are served from memory alone; §32 later added snapshots, so a restart costs at most one interval rather than everything.
+- [3. Bucket maps hold `*Agg` — pointer values](#3-bucket-maps-hold-agg--pointer-values)  
+  Buckets hold pointers, so an update mutates an aggregate in place instead of copying a struct back into the map.
+- [4. Seed Min/Max with the first value](#4-seed-minmax-with-the-first-value)  
+  Min and Max are seeded from the first observed value, because a zero-initialised Min would make every metric's minimum zero.
+- [5. One mutex around the whole map](#5-one-mutex-around-the-whole-map)  
+  One global lock was correct and measurably a bottleneck; kept because §24's fix only makes sense against it.
+- [5a. State lives on a `Store`, not in package globals](#5a-state-lives-on-a-store-not-in-package-globals)  
+  State is a struct with methods rather than package globals, so every test gets a fresh store instead of sharing one.
+- [6. Route registration before `ListenAndServe`](#6-route-registration-before-listenandserve)  
+  ListenAndServe blocks for the life of the process, so a route registered after it is dead code — this was a real bug.
+- [7. Missing JSON fields are not an error (except `name` and `ts`)](#7-missing-json-fields-are-not-an-error-except-name-and-ts)  
+  json.Unmarshal only rejects bad syntax, so required fields need explicit checks rather than faith in the decoder.
 
 **Time and the window**
 
-- [8. Time-windowed aggregates: 10-second buckets, 6 per window](#8-time-windowed-aggregates-10-second-buckets-6-per-window)
-- [9. Windowing is by event time, not receive time](#9-windowing-is-by-event-time-not-receive-time)
-- [10. Bucket eviction happens on write, not on a timer](#10-bucket-eviction-happens-on-write-not-on-a-timer)
-- [11. `/stats?window=` is caller-tunable but capped at retention](#11-statswindow-is-caller-tunable-but-capped-at-retention)
+- [8. Time-windowed aggregates: 10-second buckets, 6 per window](#8-time-windowed-aggregates-10-second-buckets-6-per-window)  
+  Time is chopped into six ten-second buckets, and a window query sums the buckets that overlap it.
+- [9. Windowing is by event time, not receive time](#9-windowing-is-by-event-time-not-receive-time)  
+  An event lands in the bucket its own ts names, not the one it happened to arrive in.
+- [10. Bucket eviction happens on write, not on a timer](#10-bucket-eviction-happens-on-write-not-on-a-timer)  
+  Eviction rides on writes rather than a timer, which §27 later had to supplement for metrics nobody writes to.
+- [11. `/stats?window=` is caller-tunable but capped at retention](#11-statswindow-is-caller-tunable-but-capped-at-retention)  
+  Callers may shorten the window but not exceed retention, and an over-long one is an error rather than something silently clamped.
 
 **The request contract**
 
-- [12. `name` and `ts` are required](#12-name-and-ts-are-required)
-- [13. One method per route, enforced by an `allow` wrapper](#13-one-method-per-route-enforced-by-an-allow-wrapper)
-- [14. `/stats` responds with JSON](#14-stats-responds-with-json)
-- [15. Graceful shutdown on SIGINT / SIGTERM](#15-graceful-shutdown-on-sigint--sigterm)
-- [16. Event time — bucketing and the accepted-`ts` range](#16-event-time--bucketing-and-the-accepted-ts-range)
-- [17. `/ingest` hardening for the hot path](#17-ingest-hardening-for-the-hot-path)
+- [12. `name` and `ts` are required](#12-name-and-ts-are-required)  
+  Name and ts have no sane default so they are rejected explicitly; value and type may legitimately be absent.
+- [13. One method per route, enforced by an `allow` wrapper](#13-one-method-per-route-enforced-by-an-allow-wrapper)  
+  Each route accepts exactly one method and answers 405 with the Allow header the spec requires.
+- [14. `/stats` responds with JSON](#14-stats-responds-with-json)  
+  The response is a JSON object keyed by metric name, replacing a plaintext format that was always a placeholder.
+- [15. Graceful shutdown on SIGINT / SIGTERM](#15-graceful-shutdown-on-sigint--sigterm)  
+  A signal cancels the context, in-flight requests get a bounded drain, and a second Ctrl-C kills immediately.
+- [16. Event time — bucketing and the accepted-`ts` range](#16-event-time--bucketing-and-the-accepted-ts-range)  
+  Events too old or too far in the future are refused rather than silently mis-bucketed.
+- [17. `/ingest` hardening for the hot path](#17-ingest-hardening-for-the-hot-path)  
+  Body size, content type and method are all bounded, so one hostile request cannot degrade the server.
 
 **Alerting**
 
-- [18. Alerting: rules over the windowed aggregates](#18-alerting-rules-over-the-windowed-aggregates)
+- [18. Alerting: rules over the windowed aggregates](#18-alerting-rules-over-the-windowed-aggregates)  
+  A rule is one predicate over a window, with ok/firing/nodata states and a For duration that stops a flapping metric alerting.
 
 **Proving it works**
 
-- [19. The load harness is `go test -bench`, not a separate load generator](#19-the-load-harness-is-go-test--bench-not-a-separate-load-generator)
-- [20. Correctness under load: exactness, and tests with teeth](#20-correctness-under-load-exactness-and-tests-with-teeth)
-- [21. `cmd/loadgen`: the claim that needs a real socket](#21-cmdloadgen-the-claim-that-needs-a-real-socket)
-- [22. CI exists to run the things this machine can't](#22-ci-exists-to-run-the-things-this-machine-cant)
+- [19. The load harness is `go test -bench`, not a separate load generator](#19-the-load-harness-is-go-test--bench-not-a-separate-load-generator)  
+  Throughput is measured with Go's own benchmark machinery rather than a bespoke load tool.
+- [20. Correctness under load: exactness, and tests with teeth](#20-correctness-under-load-exactness-and-tests-with-teeth)  
+  The invariant is exactness: every accepted event counted once, and nothing else counted at all.
+- [21. `cmd/loadgen`: the claim that needs a real socket](#21-cmdloadgen-the-claim-that-needs-a-real-socket)  
+  A real socket is the only way to prove the server recorded exactly what it accepted over HTTP.
+- [22. CI exists to run the things this machine can't](#22-ci-exists-to-run-the-things-this-machine-cant)  
+  Every CI job runs something this development machine structurally cannot, starting with the race detector.
 
 **Percentiles**
 
-- [23. Percentiles: a bounded sketch, not the events](#23-percentiles-a-bounded-sketch-not-the-events)
+- [23. Percentiles: a bounded sketch, not the events](#23-percentiles-a-bounded-sketch-not-the-events)  
+  A log-bucketed sketch buys p50/p90/p99 back at 1% relative error without keeping a single event.
 
 **Throughput**
 
-- [24. Sharding the lock by metric name](#24-sharding-the-lock-by-metric-name)
-- [25. Batch ingest: the request boundary was the bottleneck](#25-batch-ingest-the-request-boundary-was-the-bottleneck)
+- [24. Sharding the lock by metric name](#24-sharding-the-lock-by-metric-name)  
+  The lock is split 32 ways by metric name, turning §5's bottleneck into near-linear scaling across distinct metrics.
+- [25. Batch ingest: the request boundary was the bottleneck](#25-batch-ingest-the-request-boundary-was-the-bottleneck)  
+  The request boundary, not the engine, was the limit; NDJSON batching made the engine's real throughput visible.
 
 **Surviving abuse and overload**
 
-- [26. Surviving a bad client: timeouts, and shedding rather than queueing](#26-surviving-a-bad-client-timeouts-and-shedding-rather-than-queueing)
-- [27. Cardinality: the way metrics systems actually die](#27-cardinality-the-way-metrics-systems-actually-die)
-- [28. Bounding the cost of a query, and surviving a panic](#28-bounding-the-cost-of-a-query-and-surviving-a-panic)
-- [29. Client identity, and the fairness it buys](#29-client-identity-and-the-fairness-it-buys)
+- [26. Surviving a bad client: timeouts, and shedding rather than queueing](#26-surviving-a-bad-client-timeouts-and-shedding-rather-than-queueing)  
+  Every timeout is set, and under overload the server sheds rather than queues, because a queue hides work instead of reducing it.
+- [27. Cardinality: the way metrics systems actually die](#27-cardinality-the-way-metrics-systems-actually-die)  
+  An unbounded metric-name space is how metrics systems actually die, so names are capped per shard and idle ones swept.
+- [28. Bounding the cost of a query, and surviving a panic](#28-bounding-the-cost-of-a-query-and-surviving-a-panic)  
+  A query computes a bounded number of metrics however large the store, and a panicking handler returns 500 instead of dropping the connection.
+- [29. Client identity, and the fairness it buys](#29-client-identity-and-the-fairness-it-buys)  
+  A self-asserted X-Client-ID buys per-client shares of concurrency and new names, so one broken service cannot cost everyone else their monitoring.
 
 **Parsing**
 
-- [30. Parsing the one shape this server ingests](#30-parsing-the-one-shape-this-server-ingests)
+- [30. Parsing the one shape this server ingests](#30-parsing-the-one-shape-this-server-ingests)  
+  A hand-written parser for the one shape this server ingests is about 4x faster than encoding/json, held honest by differential testing and fuzzing.
 
 **Operating it**
 
-- [31. The server watching itself](#31-the-server-watching-itself)
-- [32. Surviving a restart](#32-surviving-a-restart)
-- [33. When the snapshot is the thing that is broken](#33-when-the-snapshot-is-the-thing-that-is-broken)
+- [31. The server watching itself](#31-the-server-watching-itself)  
+  The server records its own telemetry as ordinary metrics, under a reserved prefix no client can write to.
+- [32. Surviving a restart](#32-surviving-a-restart)  
+  Periodic binary snapshots of the aggregates mean a crash costs at most one interval and a clean shutdown costs nothing.
+- [33. When the snapshot is the thing that is broken](#33-when-the-snapshot-is-the-thing-that-is-broken)  
+  A second generation is kept and a corrupt file no longer stops startup, because refusing to boot turns a damaged cache into a crash loop.
 
 **What reads cost, and who pays**
 
-- [34. The read path while the write path is busy](#34-the-read-path-while-the-write-path-is-busy)
-- [35. Charging a client for the work it causes](#35-charging-a-client-for-the-work-it-causes)
+- [34. The read path while the write path is busy](#34-the-read-path-while-the-write-path-is-busy)  
+  A query roughly doubles in latency under a saturating firehose; the fix that mattered was an allocation, and an RWMutex measured worse.
+- [35. Charging a client for the work it causes](#35-charging-a-client-for-the-work-it-causes)  
+  Clients are billed for the work their queries cause — metrics computed plus names walked — rather than for the number of requests they made.
 ## Design choices
 
 ### 1. Store the conclusion, not the events
+
+> **In one line:** A million events for one metric collapse into four
+> numbers, so memory is flat in traffic and no event is ever written down.
 
 Each metric collapses into a single `Agg{Count, Sum, Min, Max}` — four numbers,
 regardless of how many events arrive. A million `cpu.load` events use the same
@@ -118,6 +160,10 @@ memory as one.
   percentiles just turned out to be affordable within it.
 
 ### 2. In-memory state, no persistence
+
+> **In one line:** Reads are served from memory alone; §32 later added
+> snapshots, so a restart costs at most one interval rather than
+> everything.
 
 *Revisited by §32. The store is still in memory and still the only copy that
 serves a request - but it is now snapshotted to disk periodically and
@@ -135,6 +181,9 @@ saved once the server had anything worth keeping.*
 
 ### 3. Bucket maps hold `*Agg` — pointer values
 
+> **In one line:** Buckets hold pointers, so an update mutates an
+> aggregate in place instead of copying a struct back into the map.
+
 State is `map[string]map[int64]*Agg` (metric name → bucket start → aggregate;
 the buckets come from §8). The inner map holds `*Agg`, not `Agg`.
 
@@ -149,6 +198,9 @@ the buckets come from §8). The inner map holds `*Agg`, not `Agg`.
 
 ### 4. Seed Min/Max with the first value
 
+> **In one line:** Min and Max are seeded from the first observed value,
+> because a zero-initialised Min would make every metric's minimum zero.
+
 When a metric is first seen: `a = &Agg{Min: ev.Value, Max: ev.Value}`.
 
 - Leaving them at `0` would be a correctness bug: `Min` would stay `0` for any
@@ -157,6 +209,9 @@ When a metric is first seen: `a = &Agg{Min: ev.Value, Max: ev.Value}`.
 - The first real observation is the only correct starting point for both.
 
 ### 5. One mutex around the whole map
+
+> **In one line:** One global lock was correct and measurably a
+> bottleneck; kept because §24's fix only makes sense against it.
 
 *Superseded by §24, which shards the lock. Kept because the reasoning that
 led here — and the measurement that ended it — is the point.*
@@ -207,6 +262,9 @@ A `sync.Mutex` guarded every read and write of the aggregate map.
 
 ### 5a. State lives on a `Store`, not in package globals
 
+> **In one line:** State is a struct with methods rather than package
+> globals, so every test gets a fresh store instead of sharing one.
+
 `mu` and the aggregate map are fields of a `Store` struct; `record`,
 `handleIngest`, and `handleStats` are methods on `*Store`. `main` creates one
 `Store` and closes the handlers over it.
@@ -223,11 +281,17 @@ A `sync.Mutex` guarded every read and write of the aggregate map.
 
 ### 6. Route registration before `ListenAndServe`
 
+> **In one line:** ListenAndServe blocks for the life of the process, so a
+> route registered after it is dead code — this was a real bug.
+
 `http.ListenAndServe` blocks for the life of the process, so every
 `http.HandleFunc` call must come before it. A handler registered after it is
 dead code. (This was an actual bug earlier in development.)
 
 ### 7. Missing JSON fields are not an error (except `name` and `ts`)
+
+> **In one line:** json.Unmarshal only rejects bad syntax, so required
+> fields need explicit checks rather than faith in the decoder.
 
 `json.Unmarshal` only fails on *syntactically* invalid JSON. A body like
 `{"name":"cpu.load","ts":1757200000000}` parses fine with `Value` and `Type`
@@ -239,6 +303,9 @@ left at their zero values.
 - `Name` and `TS` are the exceptions — see §12.
 
 ### 8. Time-windowed aggregates: 10-second buckets, 6 per window
+
+> **In one line:** Time is chopped into six ten-second buckets, and a
+> window query sums the buckets that overlap it.
 
 All-time aggregates are being replaced with windowed ones ("avg over the last
 minute"). The approach is **bucketing**: time is chopped into fixed slices, each
@@ -262,6 +329,9 @@ usage pattern (or a load-harness measurement) to react to.
 
 ### 9. Windowing is by event time, not receive time
 
+> **In one line:** An event lands in the bucket its own ts names, not the
+> one it happened to arrive in.
+
 An event's bucket is chosen by its payload `ts`, not by `time.Now()` when the
 request lands. See §16 for the mechanics and what's still open.
 
@@ -273,6 +343,9 @@ request lands. See §16 for the mechanics and what's still open.
   Each landed as its own slice (§12, §16).
 
 ### 10. Bucket eviction happens on write, not on a timer
+
+> **In one line:** Eviction rides on writes rather than a timer, which §27
+> later had to supplement for metrics nobody writes to.
 
 *Still true for buckets, but no longer the whole story: §27 adds a sweeper,
 because "on write" means a metric nobody writes to is never reclaimed at all.*
@@ -298,6 +371,10 @@ touched, every time it runs (`evict(series, windowStart(now, window))`).
 
 ### 11. `/stats?window=` is caller-tunable but capped at retention
 
+> **In one line:** Callers may shorten the window but not exceed
+> retention, and an over-long one is an error rather than something
+> silently clamped.
+
 `/stats` takes an optional `?window=` (Go duration syntax: `30s`, `1m`,
 `500ms`). With no parameter it uses the full retention window (`window`, 60s).
 
@@ -316,6 +393,9 @@ touched, every time it runs (`evict(series, windowStart(now, window))`).
   default query window move together when the constants change.
 
 ### 12. `name` and `ts` are required
+
+> **In one line:** Name and ts have no sane default so they are rejected
+> explicitly; value and type may legitimately be absent.
 
 `/ingest` rejects, with `400`, an event missing `name` (`name is required`) or
 `ts` (`ts is required`). `value` and `type` keep the zero-value-is-fine
@@ -339,6 +419,9 @@ behavior from §7.
 
 ### 13. One method per route, enforced by an `allow` wrapper
 
+> **In one line:** Each route accepts exactly one method and answers 405
+> with the Allow header the spec requires.
+
 Each route accepts exactly one method (`GET /health`, `POST /ingest`,
 `GET /stats`). Anything else returns `405 Method Not Allowed` with an `Allow`
 header naming the permitted method (the HTTP spec requires that header on a
@@ -357,6 +440,9 @@ header naming the permitted method (the HTTP spec requires that header on a
   "right URL, wrong verb" instead of sending them hunting for a typo.
 
 ### 14. `/stats` responds with JSON
+
+> **In one line:** The response is a JSON object keyed by metric name,
+> replacing a plaintext format that was always a placeholder.
 
 `/stats` returns a JSON object — `{"window": "1m0s", "metrics": {"<name>":
 {"count", "avg", "min", "max"}}}` — with `Content-Type: application/json`.
@@ -381,6 +467,9 @@ The old line-per-metric plaintext was always a placeholder.
 
 ### 15. Graceful shutdown on SIGINT / SIGTERM
 
+> **In one line:** A signal cancels the context, in-flight requests get a
+> bounded drain, and a second Ctrl-C kills immediately.
+
 `main` builds a signal-cancelled context (`signal.NotifyContext` on
 `os.Interrupt` / `SIGTERM`) and hands it to `run(ctx, ln)`. `run` serves until
 the context is cancelled, then calls `srv.Shutdown` with a 5-second deadline.
@@ -402,6 +491,9 @@ the context is cancelled, then calls `srv.Shutdown` with a 5-second deadline.
   path→handler + method-gate wiring is unit-tested (`TestRoutesWireHandlers`).
 
 ### 16. Event time — bucketing and the accepted-`ts` range
+
+> **In one line:** Events too old or too far in the future are refused
+> rather than silently mis-bucketed.
 
 `record` buckets an event by `time.UnixMilli(ev.TS).Truncate(bucketWidth)` —
 event time, not arrival time. Eviction still runs off `now` (wall clock): it's
@@ -432,6 +524,9 @@ therefore takes both — `now` for eviction, `ev.TS` for the bucket.
 
 ### 17. `/ingest` hardening for the hot path
 
+> **In one line:** Body size, content type and method are all bounded, so
+> one hostile request cannot degrade the server.
+
 Ahead of the load harness, `/ingest` is tightened so a single bad or hostile
 request can't degrade the whole server:
 
@@ -449,6 +544,10 @@ request can't degrade the whole server:
   client that hung up mid-read — nothing the server can or should act on.
 
 ### 18. Alerting: rules over the windowed aggregates
+
+> **In one line:** A rule is one predicate over a window, with
+> ok/firing/nodata states and a For duration that stops a flapping metric
+> alerting.
 
 A `Rule` is one predicate over a metric's window: *"`cpu.load`'s `avg` over
 `30s` is `>` `0.9`"* — metric, stat, op, threshold, window. Which **stat**
@@ -593,6 +692,9 @@ ok/nodata ──breach──> pending ──held for For──> firing
 
 ### 19. The load harness is `go test -bench`, not a separate load generator
 
+> **In one line:** Throughput is measured with Go's own benchmark
+> machinery rather than a bespoke load tool.
+
 `bench_test.go` measures the engine through the ordinary Go benchmark
 machinery:
 
@@ -631,6 +733,9 @@ go test -run=^$ -bench=Record -cpuprofile=cpu.out
     with rule count and is free at any event rate.
 
 ### 20. Correctness under load: exactness, and tests with teeth
+
+> **In one line:** The invariant is exactness: every accepted event
+> counted once, and nothing else counted at all.
 
 `harness_test.go` is the other half. The benchmarks answer *how fast*; these
 answer *still right*. The invariant is always **exactness** — every accepted
@@ -682,6 +787,9 @@ detector would find. That gap is closed in CI rather than caveated forever;
 see §22.
 
 ### 21. `cmd/loadgen`: the claim that needs a real socket
+
+> **In one line:** A real socket is the only way to prove the server
+> recorded exactly what it accepted over HTTP.
 
 The benchmarks (§19) measure the engine and the harness (§20) proves it stays
 exact under concurrency — but both run in-process. `cmd/loadgen` exists for
@@ -739,6 +847,9 @@ verify: OK - 106215 accepted, 106215 recorded
 
 ### 22. CI exists to run the things this machine can't
 
+> **In one line:** Every CI job runs something this development machine
+> structurally cannot, starting with the race detector.
+
 `.github/workflows/ci.yml` is not box-ticking. Every job is there because it
 checks something the development environment structurally cannot.
 
@@ -768,6 +879,9 @@ either flaky on a slow runner or wasted time on a fast one, and there is a
 readiness endpoint (`/health`) precisely so nobody has to guess.
 
 ### 23. Percentiles: a bounded sketch, not the events
+
+> **In one line:** A log-bucketed sketch buys p50/p90/p99 back at 1%
+> relative error without keeping a single event.
 
 §1 named this as the price of storing conclusions: no percentiles, because
 those need the distribution. `histogram.go` buys them back without keeping a
@@ -835,6 +949,9 @@ tests hold the histogram to the same standard as the summary numbers. A lost
 update must not be able to hide behind "percentiles are estimates".
 
 ### 24. Sharding the lock by metric name
+
+> **In one line:** The lock is split 32 ways by metric name, turning §5's
+> bottleneck into near-linear scaling across distinct metrics.
 
 §5 left a measured bottleneck and an explicit decision not to fix it. This
 section is the fix, and the reason the decision changed: the ceiling wasn't
@@ -929,6 +1046,9 @@ accumulators, or atomics on the `Agg` fields) for a different day, and one
 nothing in this project is anywhere near needing.
 
 ### 25. Batch ingest: the request boundary was the bottleneck
+
+> **In one line:** The request boundary, not the engine, was the limit;
+> NDJSON batching made the engine's real throughput visible.
 
 §24 ended with the store doing ~100 M events/sec on distinct metrics. The
 server answered ~53 k requests/sec over loopback. Both numbers were true, and
@@ -1050,6 +1170,10 @@ optimising the dominant term and optimising the 14% this section declined to.
   event cap exists at all rather than only the byte cap.
 
 ### 26. Surviving a bad client: timeouts, and shedding rather than queueing
+
+> **In one line:** Every timeout is set, and under overload the server
+> sheds rather than queues, because a queue hides work instead of reducing
+> it.
 
 The project's spine says the harness should prove throughput and correctness
 *under injected failure*. Up to here "failure" meant bad input — `-bad`
@@ -1203,6 +1327,9 @@ the transport rather than at the contract.
   first is bounded here.
 
 ### 27. Cardinality: the way metrics systems actually die
+
+> **In one line:** An unbounded metric-name space is how metrics systems
+> actually die, so names are capped per shard and idle ones swept.
 
 Every limit so far has bounded a *request* — its size (§17, §25), how long
 it may take, how many may run at once (§26). None of them bounded what a
@@ -1362,6 +1489,10 @@ against a server with no limit.
 
 ### 28. Bounding the cost of a query, and surviving a panic
 
+> **In one line:** A query computes a bounded number of metrics however
+> large the store, and a panicking handler returns 500 instead of dropping
+> the connection.
+
 §27 fixed the last unbounded *input* and, in doing so, created the problem
 this section is about. Capping cardinality bounded memory — but it also made
 the ceiling reachable and stable. An attacker can push the store to exactly
@@ -1510,6 +1641,10 @@ Two panics it deliberately does not swallow:
   recover.
 
 ### 29. Client identity, and the fairness it buys
+
+> **In one line:** A self-asserted X-Client-ID buys per-client shares of
+> concurrency and new names, so one broken service cannot cost everyone
+> else their monitoring.
 
 Three sections ended with the same admission. §26's shed slots are global, so
 one noisy client can consume all 256 and shed everyone else. §27's cardinality
@@ -1663,6 +1798,10 @@ difference: the budget is now spent by whoever is spending it.
 
 ### 30. Parsing the one shape this server ingests
 
+> **In one line:** A hand-written parser for the one shape this server
+> ingests is about 4x faster than encoding/json, held honest by
+> differential testing and fuzzing.
+
 §25 measured the batch path at ~730 ns per event and found decoding was 536 of
 it — 73%, against about 100 ns for everything the store does. It named JSON
 decoding as the next bottleneck and left it there. A probe split the number
@@ -1794,6 +1933,9 @@ that a clean end would tell a client its whole batch had been seen.
 
 ### 31. The server watching itself
 
+> **In one line:** The server records its own telemetry as ordinary
+> metrics, under a reserved prefix no client can write to.
+
 §26, §27 and §29 each added a counter and each stopped short of exposing it.
 `shedded()`, `throttledCount()` and `tracked()` had exactly **zero callers
 outside tests**: the server counted how often it refused a request for
@@ -1897,6 +2039,9 @@ one-second sampling interval costs.
   what `/health` has always been for.
 
 ### 32. Surviving a restart
+
+> **In one line:** Periodic binary snapshots of the aggregates mean a
+> crash costs at most one interval and a clean shutdown costs nothing.
 
 §2 chose in-memory state with no persistence, and every section since has been
 written on top of it: a restart loses the last minute of every metric. §31
@@ -2018,6 +2163,10 @@ promise of zero.
 
 ### 33. When the snapshot is the thing that is broken
 
+> **In one line:** A second generation is kept and a corrupt file no
+> longer stops startup, because refusing to boot turns a damaged cache
+> into a crash loop.
+
 §32 ended with two admissions. There was one file and no history, so a
 snapshot that was corrupt on disk meant starting empty. And starting empty
 was fatal: the server refused to come up. This section is about both, and
@@ -2137,6 +2286,10 @@ is the claim: the damage is visible *and* nothing was lost.
 
 ### 34. The read path while the write path is busy
 
+> **In one line:** A query roughly doubles in latency under a saturating
+> firehose; the fix that mattered was an allocation, and an RWMutex
+> measured worse.
+
 Every query benchmark before this one ran against a store nobody was writing
 to, which is the one condition this server never runs in. "Fast queries out"
 is a third of what §1 set out to build, and the only evidence for it came
@@ -2223,6 +2376,10 @@ writers, which is what a metrics ingest engine is.
   evidence of anything.
 
 ### 35. Charging a client for the work it causes
+
+> **In one line:** Clients are billed for the work their queries cause —
+> metrics computed plus names walked — rather than for the number of
+> requests they made.
 
 §29 gave each client a share of concurrency and a share of new metric names,
 and left a hole it named: *"A client within its concurrency share can still
