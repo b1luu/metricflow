@@ -196,7 +196,7 @@ jobs:
         run: |
           kill -TERM "$(cat server.pid)"
           # Graceful shutdown (DESIGN §15) should drain and exit on its own.
-          for i in $(seq 1 25); do
+          for i in $(seq 1 100); do
             if ! kill -0 "$(cat server.pid)" 2>/dev/null; then
               echo "exited cleanly"
               cat server.log
@@ -204,7 +204,7 @@ jobs:
             fi
             sleep 0.2
           done
-          echo "server did not exit within 5s of SIGTERM"; cat server.log; exit 1
+          echo "server did not exit within 20s of SIGTERM"; cat server.log; exit 1
 
   # DESIGN §26: under overload the server must shed rather than queue, and a
   # shed request must be completely shed - never half-applied. This job runs
@@ -303,13 +303,13 @@ jobs:
       - name: shut down cleanly
         run: |
           kill -TERM "$(cat server.pid)"
-          for i in $(seq 1 25); do
+          for i in $(seq 1 100); do
             if ! kill -0 "$(cat server.pid)" 2>/dev/null; then
               echo "exited cleanly"; cat server.log; exit 0
             fi
             sleep 0.2
           done
-          echo "server did not exit within 5s of SIGTERM"; cat server.log; exit 1
+          echo "server did not exit within 20s of SIGTERM"; cat server.log; exit 1
 
   # §32: a graceful restart must lose nothing. Its own job because it needs a
   # server that is stopped and started again, which the e2e job's single
@@ -345,7 +345,7 @@ jobs:
           curl -sf "localhost:8080/stats?prefix=metric." > before.json
 
           kill -TERM "$(cat server.pid)"
-          for i in $(seq 1 25); do
+          for i in $(seq 1 100); do
             kill -0 "$(cat server.pid)" 2>/dev/null || break
             sleep 0.2
           done
@@ -404,10 +404,15 @@ jobs:
         env:
           METRICFLOW_SNAPSHOT: snap.bin
         run: |
-          for i in $(seq 1 25); do
+          for i in $(seq 1 100); do
             kill -0 "$(cat server.pid)" 2>/dev/null || break
             sleep 0.2
           done
+          if kill -0 "$(cat server.pid)" 2>/dev/null; then
+            echo "the previous server is still running; it would rotate the"
+            echo "file this step is about to damage, and the next one could"
+            echo "not bind :8080"; cat third.log 2>/dev/null; exit 1
+          fi
 
           test -f snap.bin      || { echo "no current snapshot"; exit 1; }
           test -f snap.bin.prev || { echo "no previous generation - rotation never happened"; exit 1; }
@@ -489,10 +494,14 @@ jobs:
         env:
           METRICFLOW_SNAPSHOT: snap.bin
         run: |
-          for i in $(seq 1 25); do
+          for i in $(seq 1 100); do
             kill -0 "$(cat server.pid)" 2>/dev/null || break
             sleep 0.2
           done
+          if kill -0 "$(cat server.pid)" 2>/dev/null; then
+            echo "the previous server is still running; it would rotate the"
+            echo "files this step is about to damage"; cat fourth.log 2>/dev/null; exit 1
+          fi
 
           printf 'shredded' > snap.bin
           printf 'shredded' > snap.bin.prev

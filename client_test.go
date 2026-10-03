@@ -1084,3 +1084,60 @@ func TestQueryBudgetRefusalsAreCounted(t *testing.T) {
 		t.Errorf("counted %d refusals, want the %d the handler actually made", got, refused)
 	}
 }
+
+// queryCost must never price real work at zero.
+//
+// It did. The walk term was `walked / namesPerMetric` in integer
+// arithmetic, so any store holding fewer than 325 metrics priced its walk
+// at nothing, and a scan matching nothing was free - precisely the hole the
+// term exists to close. TestAScanThatMatchesNothingStillCosts passed
+// throughout, because it happens to seed 2 000 metrics.
+func TestQueryCostNeverPricesRealWorkAtZero(t *testing.T) {
+	for _, walked := range []int{1, 2, 50, 324, 325, 326, 2000} {
+		if got := queryCost(walked, 0); got < 1 {
+			t.Errorf("queryCost(walked=%d, computed=0) = %d; walking %d names is not free",
+				walked, got, walked)
+		}
+	}
+
+	// An empty store really is free: there is nothing to walk.
+	if got := queryCost(0, 0); got != 0 {
+		t.Errorf("queryCost(0, 0) = %d, want 0", got)
+	}
+}
+
+// And the same thing through the handler, on a store small enough that the
+// old arithmetic would have charged nothing at all.
+func TestAScanOfASmallStoreStillCosts(t *testing.T) {
+	const metrics = 50 // far below namesPerMetric
+	s := storeWithMetrics(metrics)
+	c := &client{}
+
+	statsAs(t, s, c, "?prefix=nothing.matches.this")
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.querySpent <= 0 {
+		t.Errorf("scanning a %d-metric store cost %d metric-equivalents, want at least 1",
+			metrics, c.querySpent)
+	}
+}
+
+// A client must be able to page through the whole store inside one epoch.
+// §28 offers keyset pagination as the way to read a store larger than one
+// page; a budget that cannot cover one full pass makes the two features
+// contradict each other. At 20 000 it could not - it refused at page 19
+// of 33.
+func TestTheBudgetCoversOneFullPageThrough(t *testing.T) {
+	const fullStore = shardCount * maxMetricsPerShard
+
+	pages := (fullStore + maxStatsLimit - 1) / maxStatsLimit
+	perPage := queryCost(fullStore, maxStatsLimit)
+	total := int64(pages) * perPage
+
+	if total > maxQueryCostPerEpoch {
+		t.Errorf("paging through a full store costs %d (%d pages x %d) but the "+
+			"budget is %d; a documented client cannot finish",
+			total, pages, perPage, maxQueryCostPerEpoch)
+	}
+}

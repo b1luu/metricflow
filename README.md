@@ -223,10 +223,11 @@ Concurrency alone is a weak limit on reads: a client well inside its share can
 ask for a thousand metrics over and over, one request at a time, and look
 perfectly well behaved by every other measure the server keeps.
 
-So each client gets a budget of **20,000 metric-equivalents per 10 s**. One
-unit is the work of merging and sorting one metric's buckets; walking 325
-names in the store costs the same as one unit, which lets a single number
-price both halves of a query:
+So each client gets a budget of **50,000 metric-equivalents per 10 s** — the
+cost of paging through the entire store once, which is the most expensive
+thing a client is documented to do. One unit is the work of merging and
+sorting one metric's buckets; walking 325 names costs the same as one unit,
+which lets a single number price both halves of a query:
 
 ```
 cost = metricsComputed + namesWalked/325
@@ -237,7 +238,7 @@ free to run unlimited full-store scans behind a prefix that matches nothing —
 real work, and free.
 
 A dashboard polling six panels at `limit=100` spends around 1,200 of its
-20,000. A client polling flat out is cut off with `429` and recovers at the
+50,000. A client polling flat out is cut off with `429` and recovers at the
 next epoch. The refusals are published as
 `metricflow.clients.query_budget_refusals`, counted separately from
 `requests.throttled` because they mean different things: throttled is *too

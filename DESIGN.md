@@ -2402,14 +2402,29 @@ client free to run unlimited full-store scans behind a prefix matching
 nothing: 260 µs of real work each, and free under that pricing. A test fails
 if the walk term is dropped.
 
-**20 000 units per 10 s epoch** is roughly 52 ms of query work — half a
-percent of one core, or about 1.3 cores if all 256 clients sat at their
-ceiling at once. A dashboard polling six panels at `limit=100` over a full
-store spends about 1 200 of it. The ceiling is around eighteen maximum-size
-queries, or many thousands of narrow ones: invisible to a real caller, finite
-to a loop. The epoch is derived from the clock exactly as §29's name budget
-is, so there is no third background loop to run and a client that goes quiet
-needs no cleanup.
+The walk term rounds **up**, which is not a detail. Written as
+`walked / 325` in integer arithmetic it floors, so every store holding fewer
+than 325 metrics priced its walk at zero and a scan matching nothing was free
+after all — the exact hole the term exists to close, reopened by the
+arithmetic that implements it. The test that was supposed to catch this
+passed throughout, because it seeded 2 000 metrics and never looked at a
+small store. There is now one that does.
+
+**50 000 units per 10 s epoch**, and the number is derived rather than
+chosen for roundness. The most expensive thing a legitimate client is
+*documented* to do is page through the whole store: §28 offers keyset
+pagination exactly for a store larger than one page, so a full pass has to
+fit inside one epoch, or §28 and §35 contradict each other. A full store is
+32 768 metrics — 33 pages at `1000 + ceil(32768/325) = 1101` each, 36 333 in
+total. 50 000 covers that with room left over.
+
+An earlier value of 20 000 was set from "half a percent of one core" and was
+wrong for precisely that reason: it refused a documented client at page 19
+of 33. The budget is now about 130 ms of query work per 10 s, 1.3% of one
+core, and a dashboard polling six panels at `limit=100` over a full store
+still spends only about 1 200 of it. The epoch is derived from the clock
+exactly as §29's name budget is, so there is no third background loop to run
+and a client that goes quiet needs no cleanup.
 
 **Checked before, charged after.** What a query cost is not known until it
 has run, so the budget is tested on the way in and billed on the way out. A
@@ -2420,7 +2435,10 @@ overshoot by being wrong about the number, a poor trade for a limit whose
 entire purpose is to be proportional to real work.
 
 **`429`, not `503`**, for the reason §26 and §29 both give: the server may be
-completely idle while one client is over its own share. And the refusals are
+completely idle while one client is over its own share. `Retry-After` names
+the epoch rather than one second, because the budget refills on the epoch
+boundary and a client told to come back in a second simply spends nine more
+refusals finding that out. And the refusals are
 published as `metricflow.clients.query_budget_refusals`, counted apart from
 `requests.throttled` because they describe different faults — throttled is
 *too much at once*, this is *too much work*, which a client can reach one
@@ -2433,19 +2451,23 @@ one asks for 100:
 
 | | 200 | 429 |
 | --- | --- | --- |
-| greedy, `limit=1000` | 20 | **40** |
+| greedy, `limit=1000` | 50 | **10** |
 | quiet, `limit=100` | 10 | 0 |
 
 ```
-store holds 5930 metrics
-metricflow.clients.query_budget_refusals   40
+store holds 4618 metrics
+metricflow.clients.query_budget_refusals   10
 greedy after one epoch: 200
 ```
 
-The twenty is the part worth checking, because the model predicts it: at
-5 930 metrics a `limit=1000` query costs 1000 + 5930/325 ≈ 1018, and
-20 000/1018 ≈ 19.6. The budget ran out where the arithmetic said it would,
-the quiet client never noticed, and the greedy one was serving again one
+The fifty is the part worth checking, because the model predicts it exactly,
+and predicts it *including* the overshoot rule. At 4 618 metrics a
+`limit=1000` query costs 1000 + ceil(4618/325) = 1015. After 49 queries the
+client has spent 49 735, still under the ceiling, so a fiftieth is let
+through; that one takes it to 50 750 and the fifty-first is refused. Fifty
+answered, ten refused out of sixty — which is what happened.
+
+The quiet client never noticed, and the greedy one was serving again an
 epoch later.
 
 **What this deliberately does not do.**

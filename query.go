@@ -219,7 +219,11 @@ func (s *Store) handleStats(w http.ResponseWriter, r *http.Request) {
 	c, _ := clientFrom(r.Context())
 	if !c.allowQuery(now) {
 		s.counts.addQueryRefused()
-		w.Header().Set("Retry-After", "1")
+		// The epoch, not a second. The budget refills on the epoch
+		// boundary, so a compliant client told to wait one second simply
+		// spends nine more refusals discovering that - the same reasoning
+		// batch.go and the cardinality refusal already use.
+		w.Header().Set("Retry-After", strconv.Itoa(int(queryEpoch.Seconds())))
 		http.Error(w, fmt.Sprintf(
 			"this client is over its query budget (%d metric-equivalents per %s)",
 			maxQueryCostPerEpoch, queryEpoch), http.StatusTooManyRequests)

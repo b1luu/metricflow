@@ -172,15 +172,25 @@ func (c *client) release() { c.inFlight.Add(-1) }
 // names costs the same as one of them, which is what lets a single number
 // price both halves of a query.
 //
-// 20 000 units is roughly 52 ms of query work per 10 s, half a percent of
-// one core, and 256 clients all at their ceiling would be about 1.3 cores.
-// A dashboard polling six panels at limit=100 over a full store spends
-// about 1 200 of it. The ceiling is around 18 maximum-size queries, or
-// many thousands of narrow ones - set to be invisible to a real caller and
-// firmly finite to a loop.
+// The ceiling is derived from the most expensive thing a legitimate client
+// is documented to do, not picked for roundness. §28 offers keyset
+// pagination for reading a store larger than one page, so paging through
+// all of it has to fit inside one epoch or two sections of this document
+// contradict each other. A full store is 32 768 metrics, which at
+// maxStatsLimit is 33 pages costing 1 000 + ceil(32768/325) = 1 101 each,
+// or 36 333 in total. 50 000 covers that with room to spare.
+//
+// That is about 130 ms of query work per 10 s - 1.3% of one core, or
+// roughly three cores if all 256 clients sat at their ceiling at once. A
+// dashboard polling six panels at limit=100 over a full store spends about
+// 1 200 of it. Invisible to a real caller, finite to a loop.
+//
+// An earlier value of 20 000 was set from "half a percent of a core" and
+// was wrong for exactly the reason above: it refused a documented client
+// at page 19 of 33.
 const (
 	queryEpoch           = bucketWidth
-	maxQueryCostPerEpoch = 20000
+	maxQueryCostPerEpoch = 50000
 	namesPerMetric       = 325
 )
 
@@ -190,7 +200,15 @@ const (
 // client free to run unlimited full-store scans behind a prefix that
 // matches nothing: 260 us of walk each, and free.
 func queryCost(walked, computed int) int64 {
-	return int64(computed) + int64(walked)/namesPerMetric
+	if walked == 0 {
+		return int64(computed)
+	}
+	// Rounded up, never floored. Integer division would price a walk of
+	// fewer than namesPerMetric names at zero, so on any store under 325
+	// metrics a scan matching nothing would be literally free - the exact
+	// hole this term exists to close. The test for it passed only because
+	// it happened to seed 2 000 metrics.
+	return int64(computed) + (int64(walked)+namesPerMetric-1)/namesPerMetric
 }
 
 // allowQuery reports whether this client has any query budget left in the
