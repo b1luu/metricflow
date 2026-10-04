@@ -620,6 +620,15 @@ jobs:
             exit 1
           fi
 
+          # Align to an epoch boundary before starting. The budget refills
+          # on wall-clock multiples of queryEpoch, so a loop that straddles
+          # one collects a second allowance and the model below undercounts.
+          # The first run of this job did exactly that: it started at
+          # :09.94, crossed :10.000, and 56 queries got through where 50
+          # were predicted.
+          python3 -c "import time; time.sleep(10 - time.time() % 10 + 0.3)"
+          started=$(date +%s)
+
           g200=0; g429=0
           for i in $(seq 1 70); do
             code=$(curl -s -o /dev/null -w '%{http_code}'               -H "X-Client-ID: greedy" "localhost:8080/stats?limit=1000")
@@ -639,6 +648,17 @@ jobs:
           done
           echo "$q200 $q429" > quiet.txt
           echo "quiet:  $q200 x 200, $q429 x 429"
+
+          # Both loops must land inside the one epoch they were aligned to,
+          # or the counts above include a refilled budget and mean nothing.
+          elapsed=$(( $(date +%s) - started ))
+          echo "both loops took ${elapsed}s"
+          if [ "$elapsed" -ge 9 ]; then
+            echo "the query loops took ${elapsed}s and crossed an epoch"
+            echo "boundary, so the client was given a second budget midway."
+            echo "This runner is far slower than the ~1s these loops take."
+            exit 1
+          fi
 
       - name: the refusals must be real, isolated, and visible
         run: |
