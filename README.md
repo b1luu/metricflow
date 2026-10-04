@@ -466,13 +466,15 @@ two runs of anything that touches a lock:
 go test -run XXX -bench BenchmarkStatsUnderIngest -benchtime 2s -count=5 .
 ```
 
-CI runs five jobs on every push: `check` (vet and gofmt), `test` (the suite,
+CI runs six jobs on every push: `check` (vet and gofmt), `test` (the suite,
 the race detector, and a 45-second fuzz run against `encoding/json` whose
 findings are kept as a corpus), `e2e` (starts the server, drives it with
 `loadgen`, and checks a clean `SIGTERM` shutdown), `overload` (proves the
-shedding path on a deliberately tiny in-flight limit), and `persistence`
-(kills a server, restarts it, and checks every number came back — then
-damages the snapshot and checks the fallback).
+shedding path on a deliberately tiny in-flight limit), `persistence` (kills a
+server, restarts it, and checks every number came back — then damages the
+snapshot and checks the fallback), and `querybudget` (fills a store with
+thousands of metrics, then proves a client hammering `/stats` is cut off
+while a quiet one beside it is not).
 
 ## Design
 

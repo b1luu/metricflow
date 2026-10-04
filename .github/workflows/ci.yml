@@ -555,3 +555,162 @@ jobs:
           PY
 
           kill -TERM "$(cat server.pid)" || true
+
+  # §35: a client is billed for the work its queries cause, not the number of
+  # requests it makes. Its own job because it needs a store with thousands of
+  # metrics in it, which no other job wants to pay for.
+  #
+  # Without this the budget was covered by unit tests alone. Those can prove
+  # the arithmetic; only a real server over a real socket proves that a client
+  # hammering /stats is actually cut off, that a quiet one beside it is not,
+  # and that the refusals reach /stats where an operator would look.
+  querybudget:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - run: go build -o metricflow .
+      - run: go build -o loadgen ./cmd/loadgen
+
+      - name: start a server
+        run: |
+          ./metricflow > server.log 2>&1 &
+          echo $! > server.pid
+          for i in $(seq 1 50); do
+            curl -sf localhost:8080/health > /dev/null && exit 0
+            sleep 0.2
+          done
+          echo "server never became healthy"; cat server.log; exit 1
+
+      # Sixteen clients rather than one, because §29 caps a client at 64 new
+      # metric names per epoch. One greedy filler cannot build a large store,
+      # which is exactly what that limit is for - and is the reason the first
+      # attempt at this demo produced a 74-metric store and proved nothing.
+      - name: fill the store, which takes many clients
+        run: |
+          pids=""
+          for i in $(seq 1 24); do
+            ./loadgen -duration 25s -workers 1 -cardinality 500               -client "filler$i" -verify=false > "fill$i.log" 2>&1 &
+            pids="$pids $!"
+          done
+          # Only the fillers: a bare `wait` would also wait for the server,
+          # which never exits.
+          wait $pids
+          echo "fillers done"
+
+      - name: a greedy client is cut off; a quiet one is not
+        run: |
+          curl -sf -H "X-Client-ID: observer"             "localhost:8080/stats?prefix=metricflow.store.metrics" > store.json
+          python3 -c "import json; print(int(json.load(open('store.json'))['metrics']['metricflow.store.metrics']['max']))" > store.txt
+          echo "store holds $(cat store.txt) metrics"
+
+          # The queries below ask for 1000 metrics, and a query only costs
+          # what it computes. On a store smaller than that they get cheap,
+          # 70 of them stop exhausting the budget, and this job fails later
+          # with a confusing "never refused" instead of the real cause:
+          # the fill was too small. A client creates at most 64 names per
+          # epoch (§29), so this is really a check that enough epochs ran.
+          if [ "$(cat store.txt)" -lt 1500 ]; then
+            echo "only $(cat store.txt) metrics; the fill did not produce enough"
+            echo "for a limit=1000 query to be expensive. Expected ~3000 from"
+            echo "24 clients over 25s at 64 new names per 10s epoch each."
+            exit 1
+          fi
+
+          g200=0; g429=0
+          for i in $(seq 1 70); do
+            code=$(curl -s -o /dev/null -w '%{http_code}'               -H "X-Client-ID: greedy" "localhost:8080/stats?limit=1000")
+            if [ "$code" = "200" ]; then g200=$((g200+1))
+            elif [ "$code" = "429" ]; then g429=$((g429+1))
+            else echo "greedy got an unexpected $code"; exit 1; fi
+          done
+          echo "$g200 $g429" > greedy.txt
+          echo "greedy: $g200 x 200, $g429 x 429"
+
+          q200=0; q429=0
+          for i in $(seq 1 10); do
+            code=$(curl -s -o /dev/null -w '%{http_code}'               -H "X-Client-ID: quiet" "localhost:8080/stats?limit=100")
+            if [ "$code" = "200" ]; then q200=$((q200+1))
+            elif [ "$code" = "429" ]; then q429=$((q429+1))
+            else echo "quiet got an unexpected $code"; exit 1; fi
+          done
+          echo "$q200 $q429" > quiet.txt
+          echo "quiet:  $q200 x 200, $q429 x 429"
+
+      - name: the refusals must be real, isolated, and visible
+        run: |
+          sleep 2   # let the self-reporter sample
+          curl -sf -H "X-Client-ID: observer"             "localhost:8080/stats?prefix=metricflow.clients." > self.json
+
+          python3 - <<'PY'
+          import json, math, sys
+
+          store = int(open("store.txt").read().strip())
+          g200, g429 = map(int, open("greedy.txt").read().split())
+          q200, q429 = map(int, open("quiet.txt").read().split())
+
+          with open("self.json") as f:
+              metrics = json.load(f)["metrics"]
+          for name in sorted(metrics):
+              print("%-46s max=%g" % (name, metrics[name]["max"]))
+
+          # 1. The budget is enforced at all.
+          if g429 == 0:
+              sys.exit("a client made 70 full-size queries and was never refused")
+          # 2. And it is not refusing from the first request, which would be a
+          #    limit that simply does not work rather than one that bites.
+          if g200 == 0:
+              sys.exit("the greedy client was refused from the very first query")
+          # 3. One client's spending must not touch another's.
+          if q429 != 0:
+              sys.exit("a quiet client got %d refusals while another was over budget" % q429)
+
+          # 4. The refusals have to reach /stats, or nobody can alert on them.
+          r = metrics.get("metricflow.clients.query_budget_refusals")
+          if r is None:
+              sys.exit("the server refused queries and published no counter for it")
+          if r["max"] != g429:
+              sys.exit("published %g refusals, but the greedy client saw %d"
+                       % (r["max"], g429))
+
+          # 5. The price is roughly right, not merely present. The model says
+          #    how many full-size queries fit, including the deliberate
+          #    overshoot of one (checked before, charged after).
+          # A query computes min(limit, metrics present), not the limit.
+          per = min(1000, store) + math.ceil(store / 325)
+          spent, predicted = 0, 0
+          while spent < 50000:
+              predicted += 1
+              spent += per
+          if abs(g200 - predicted) > 5:
+              sys.exit("model says ~%d queries fit (%d metrics, %d each); %d got through"
+                       % (predicted, store, per, g200))
+
+          print("store %d | %d queries at ~%d each | model %d, observed %d | %d refused, all published"
+                % (store, g200, per, predicted, g200, g429))
+          PY
+
+      - name: and the budget refills on the next epoch
+        run: |
+          sleep 11   # one queryEpoch (bucketWidth) plus margin
+          code=$(curl -s -o /dev/null -w '%{http_code}'             -H "X-Client-ID: greedy" "localhost:8080/stats?limit=1000")
+          if [ "$code" != "200" ]; then
+            echo "the greedy client is still refused ($code) an epoch later;"
+            echo "a budget that does not refill is a permanent ban"
+            exit 1
+          fi
+          echo "greedy served again after one epoch"
+
+      - name: shut down cleanly
+        run: |
+          kill -TERM "$(cat server.pid)"
+          for i in $(seq 1 100); do
+            if ! kill -0 "$(cat server.pid)" 2>/dev/null; then
+              echo "exited cleanly"; exit 0
+            fi
+            sleep 0.2
+          done
+          echo "server did not exit within 20s of SIGTERM"; cat server.log; exit 1
