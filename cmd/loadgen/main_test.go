@@ -1139,7 +1139,7 @@ func TestTheClientIDIsSentOnEveryRequest(t *testing.T) {
 	if tal := sendUntil(ctx, newClient(1), cfg, 0); tal.events == 0 {
 		t.Fatal("no events were sent")
 	}
-	if _, _, err := fetchRecorded(newClient(1), cfg); err != nil {
+	if _, _, _, err := fetchRecorded(newClient(1), cfg); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1182,5 +1182,155 @@ func TestNoClientIDMeansNoHeader(t *testing.T) {
 	}
 	if got != "" {
 		t.Errorf("sent %s = %q with no -client set", clientIDHeader, got)
+	}
+}
+
+// --- verification under the server's own backpressure ---
+
+// A read refused for capacity or for a query budget is the server working,
+// not failing. It used to abort verification with "/stats returned 503",
+// which reported a correctness failure for a server that was behaving
+// correctly - and made §26's shedding and §35's budget untestable alongside
+// the exactness claim they share a server with.
+func TestVerifyWaitsOutARefusedRead(t *testing.T) {
+	var reads int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/stats") {
+			fmt.Fprint(w, `{"accepted":1,"rejected":0,"errors":[]}`)
+			return
+		}
+		// Refuse the first two reads, then answer.
+		if atomic.AddInt32(&reads, 1) <= 2 {
+			w.Header().Set("Retry-After", "0")
+			http.Error(w, "server at capacity", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"window":"1m0s","metrics":{"metric.abc.0":{"count":7}},`+
+			`"matched":1,"truncated":false}`)
+	}))
+	defer srv.Close()
+
+	cfg := config{target: srv.URL, workers: 1, metrics: 1, batch: 1, runID: "abc"}
+
+	recorded, _, retries, err := fetchRecorded(newClient(1), cfg)
+	if err != nil {
+		t.Fatalf("a read refused twice and then answered should succeed: %v", err)
+	}
+	if recorded != 7 {
+		t.Errorf("recorded = %d, want the 7 the server eventually reported", recorded)
+	}
+	if retries != 2 {
+		t.Errorf("retries = %d, want the 2 refusals that were waited out", retries)
+	}
+}
+
+// And a 429 is waited out for the same reason - that is the status §35 uses.
+func TestVerifyWaitsOutAQueryBudgetRefusal(t *testing.T) {
+	var reads int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&reads, 1) == 1 {
+			w.Header().Set("Retry-After", "0")
+			http.Error(w, "over its query budget", http.StatusTooManyRequests)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"window":"1m0s","metrics":{"metric.abc.0":{"count":3}},`+
+			`"matched":1,"truncated":false}`)
+	}))
+	defer srv.Close()
+
+	cfg := config{target: srv.URL, workers: 1, metrics: 1, batch: 1, runID: "abc"}
+
+	recorded, _, retries, err := fetchRecorded(newClient(1), cfg)
+	if err != nil {
+		t.Fatalf("a 429 should be waited out, not failed on: %v", err)
+	}
+	if recorded != 3 || retries != 1 {
+		t.Errorf("recorded = %d, retries = %d; want 3 and 1", recorded, retries)
+	}
+}
+
+// A server that never stops refusing must fail - a harness that can hang is
+// worse than one that fails - but it must fail saying exactness was never
+// *checked*, not that it was violated. Those call for opposite reactions
+// from whoever reads the output.
+func TestAServerThatKeepsRefusingIsUnverifiedNotWrong(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "0")
+		http.Error(w, "server at capacity", http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	cfg := config{target: srv.URL, workers: 1, metrics: 1, batch: 1, runID: "abc"}
+
+	_, _, retries, err := fetchRecorded(newClient(1), cfg)
+	if err == nil {
+		t.Fatal("a server refusing every read should not verify")
+	}
+	if retries <= maxVerifyRetries {
+		t.Errorf("gave up after %d retries, want more than %d", retries, maxVerifyRetries)
+	}
+
+	msg := err.Error()
+	if !strings.Contains(msg, "unverified") {
+		t.Errorf("error = %q; it must say exactness is unverified", msg)
+	}
+	// The words that would send a reader hunting for a data-loss bug.
+	for _, wrong := range []string{"recorded", "difference", "accepted"} {
+		if strings.Contains(msg, wrong) {
+			t.Errorf("error = %q; %q reads as a count mismatch, which this is not",
+				msg, wrong)
+		}
+	}
+}
+
+// A status that is not backpressure still fails at once. Retrying a 400
+// would turn a bug into a timeout.
+func TestVerifyDoesNotRetryANonBackpressureStatus(t *testing.T) {
+	var reads int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&reads, 1)
+		http.Error(w, "bad request", http.StatusBadRequest)
+	}))
+	defer srv.Close()
+
+	cfg := config{target: srv.URL, workers: 1, metrics: 1, batch: 1, runID: "abc"}
+
+	if _, _, retries, err := fetchRecorded(newClient(1), cfg); err == nil {
+		t.Fatal("a 400 should fail verification")
+	} else if retries != 0 {
+		t.Errorf("retried a 400 %d times; only backpressure is retryable", retries)
+	}
+	if got := atomic.LoadInt32(&reads); got != 1 {
+		t.Errorf("the server was asked %d times, want exactly 1", got)
+	}
+}
+
+// Retry-After is honoured, and capped: a server answering with an hour must
+// not hang the harness for an hour.
+func TestRetryAfterIsHonouredButCapped(t *testing.T) {
+	cases := []struct {
+		header string
+		want   time.Duration
+	}{
+		{"", defaultRetryWait},
+		{"0", 0},
+		{"2", 2 * time.Second},
+		{"3600", maxRetryAfter},
+		{"not-a-number", defaultRetryWait},
+		{"-5", defaultRetryWait},
+	}
+	for _, c := range cases {
+		resp := &http.Response{Header: http.Header{}}
+		if c.header != "" {
+			resp.Header.Set("Retry-After", c.header)
+		}
+		if got := retryAfter(resp); got != c.want {
+			t.Errorf("retryAfter(%q) = %s, want %s", c.header, got, c.want)
+		}
 	}
 }

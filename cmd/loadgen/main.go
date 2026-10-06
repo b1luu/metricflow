@@ -657,6 +657,98 @@ func (c config) runPrefix() string {
 // into an error with a number in it rather than a build that never ends.
 const maxVerifyPages = 10000
 
+// Verification has to survive the server's own backpressure.
+//
+// A read refused for capacity (§26) or for a client's query budget (§35) is
+// the server working, not failing - and until now any non-200 on this path
+// became "/stats returned 503", reported as a correctness failure. That is
+// the worst answer available: it says the numbers disagree when in fact they
+// were never compared, and it makes the shedding and budget limits
+// untestable alongside the exactness claim they share a server with.
+//
+// So those two statuses are waited out rather than failed on, bounded the
+// same way the page loop is.
+const (
+	maxVerifyRetries = 20
+
+	// Honoured but capped. §35 answers with its whole epoch, which is right
+	// and is ten seconds; a misconfigured or hostile server could answer
+	// with an hour, and a harness that obeys is a harness that hangs.
+	maxRetryAfter = 15 * time.Second
+
+	// Used when the server names no delay. Short, because a refusal with no
+	// Retry-After is most likely §26's shedding, where a slot frees in
+	// milliseconds.
+	defaultRetryWait = 250 * time.Millisecond
+)
+
+// retryAfter is how long the server asked us to wait, bounded.
+func retryAfter(resp *http.Response) time.Duration {
+	s := resp.Header.Get("Retry-After")
+	if s == "" {
+		return defaultRetryWait
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil || n < 0 {
+		// The HTTP-date form is legal and this server never sends it, so
+		// rather than parse a format nothing produces, fall back.
+		return defaultRetryWait
+	}
+	if d := time.Duration(n) * time.Second; d < maxRetryAfter {
+		return d
+	}
+	return maxRetryAfter
+}
+
+// fetchPage gets one page of /stats, waiting out backpressure.
+//
+// The distinction in the error it returns is the point of this function. A
+// server that keeps refusing leaves exactness *unverified*; a server whose
+// numbers are wrong leaves it *violated*. Those call for opposite reactions
+// from whoever reads the output, so they must not arrive worded the same.
+func fetchPage(client *http.Client, cfg config, u string) (stats statsResponse, retries int, err error) {
+	for {
+		req, err := http.NewRequest(http.MethodGet, u, nil)
+		if err != nil {
+			return stats, retries, fmt.Errorf("building the /stats request: %w", err)
+		}
+		cfg.identify(req)
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return stats, retries, fmt.Errorf("fetching /stats: %w", err)
+		}
+
+		switch resp.StatusCode {
+		case http.StatusOK:
+			decErr := json.NewDecoder(resp.Body).Decode(&stats)
+			resp.Body.Close()
+			if decErr != nil {
+				return stats, retries, fmt.Errorf("decoding /stats: %w", decErr)
+			}
+			return stats, retries, nil
+
+		case http.StatusTooManyRequests, http.StatusServiceUnavailable:
+			wait := retryAfter(resp)
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+
+			retries++
+			if retries > maxVerifyRetries {
+				return stats, retries, fmt.Errorf(
+					"the server refused %d verification reads in a row (last %d); "+
+						"exactness is unverified, not violated - the counts were "+
+						"never compared", retries, resp.StatusCode)
+			}
+			time.Sleep(wait)
+
+		default:
+			resp.Body.Close()
+			return stats, retries, fmt.Errorf("/stats returned %d", resp.StatusCode)
+		}
+	}
+}
+
 // fetchRecorded pages through /stats and sums the counts of this run's
 // metrics.
 //
@@ -669,39 +761,23 @@ const maxVerifyPages = 10000
 // The prefix is also applied client-side, not only sent. Verification must
 // not depend on the server having honoured a query parameter, since a server
 // that ignored it is precisely the kind of bug this is here to catch.
-func fetchRecorded(client *http.Client, cfg config) (recorded int, window string, err error) {
+func fetchRecorded(client *http.Client, cfg config) (recorded int, window string, retries int, err error) {
 	prefix := cfg.runPrefix()
 	base := strings.TrimSuffix(cfg.target, "/") + "/stats"
 	after := ""
 
 	for page := 0; ; page++ {
 		if page >= maxVerifyPages {
-			return 0, "", fmt.Errorf("/stats did not finish paging after %d pages", maxVerifyPages)
+			return 0, "", retries, fmt.Errorf("/stats did not finish paging after %d pages", maxVerifyPages)
 		}
 
 		u := fmt.Sprintf("%s?prefix=%s&after=%s",
 			base, url.QueryEscape(prefix), url.QueryEscape(after))
 
-		req, err := http.NewRequest(http.MethodGet, u, nil)
+		stats, pageRetries, err := fetchPage(client, cfg, u)
+		retries += pageRetries
 		if err != nil {
-			return 0, "", fmt.Errorf("building the /stats request: %w", err)
-		}
-		cfg.identify(req)
-
-		resp, err := client.Do(req)
-		if err != nil {
-			return 0, "", fmt.Errorf("fetching /stats: %w", err)
-		}
-		if resp.StatusCode != http.StatusOK {
-			resp.Body.Close()
-			return 0, "", fmt.Errorf("/stats returned %d", resp.StatusCode)
-		}
-
-		var stats statsResponse
-		decErr := json.NewDecoder(resp.Body).Decode(&stats)
-		resp.Body.Close()
-		if decErr != nil {
-			return 0, "", fmt.Errorf("decoding /stats: %w", decErr)
+			return 0, "", retries, err
 		}
 		window = stats.Window
 
@@ -712,10 +788,10 @@ func fetchRecorded(client *http.Client, cfg config) (recorded int, window string
 		}
 
 		if !stats.Truncated {
-			return recorded, window, nil
+			return recorded, window, retries, nil
 		}
 		if stats.Next <= after {
-			return 0, "", fmt.Errorf("/stats cursor did not advance past %q", after)
+			return 0, "", retries, fmt.Errorf("/stats cursor did not advance past %q", after)
 		}
 		after = stats.Next
 	}
@@ -725,9 +801,17 @@ func fetchRecorded(client *http.Client, cfg config) (recorded int, window string
 // run over a real socket, the server recorded exactly as many events as it
 // told us it accepted. Returns an error if they disagree.
 func verify(client *http.Client, cfg config, total tally, elapsed time.Duration, w io.Writer) error {
-	recorded, reportedWindow, err := fetchRecorded(client, cfg)
+	recorded, reportedWindow, retries, err := fetchRecorded(client, cfg)
 	if err != nil {
 		return err
+	}
+	// Said out loud, because a verification that quietly waited out a
+	// hundred refusals measured a different server from the one the run
+	// hit - and because retries here are evidence that §26 or §35 was
+	// active, which is worth seeing next to the result.
+	if retries > 0 {
+		fmt.Fprintf(w, "verify: waited out %d refused read(s) before the server would answer\n",
+			retries)
 	}
 
 	// The server reports the window it applied, so we can tell whether this
