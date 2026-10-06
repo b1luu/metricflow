@@ -139,6 +139,8 @@ for *what* was decided and read in full only where the *why* matters.
   A query roughly doubles in latency under a saturating firehose; the fix that mattered was an allocation, and an RWMutex measured worse.
 - [35. Charging a client for the work it causes](#35-charging-a-client-for-the-work-it-causes)  
   Clients are billed for the work their queries cause — metrics computed plus names walked — rather than for the number of requests they made.
+- [36. A refused read is not a failed verification](#36-a-refused-read-is-not-a-failed-verification)  
+  A harness has to tell "the server refused to answer me" apart from "the server's numbers are wrong", because those call for opposite reactions and only one of them is a bug.
 ## Design choices
 
 ### 1. Store the conclusion, not the events
@@ -2485,6 +2487,65 @@ epoch later.
   benchmarks that produced it are checked in so a future machine can say so.
 - *Still not adaptive* (§29). A client gets the same budget whether it is
   alone or one of two hundred.
+
+### 36. A refused read is not a failed verification
+
+> **In one line:** A harness has to tell "the server refused to answer me"
+> apart from "the server's numbers are wrong", because those call for
+> opposite reactions and only one of them is a bug.
+
+§20 made exactness the invariant: every accepted event counted once, nothing
+else counted at all. §21 moved that claim onto a real socket. Both predate
+every limit the server now has — and `verify` aborted on any non-200 from
+`/stats`, so a read refused for capacity (§26) or for a client's query budget
+(§35) surfaced as `"/stats returned 503"`.
+
+**That is the worst answer available.** It reports a correctness failure for
+a server that was behaving exactly as designed. Worse, it is reported in the
+same register as a genuine mismatch, so a reader cannot tell which they are
+looking at — and the two demand opposite responses. A mismatch means find the
+data-loss bug. A refusal means the comparison never happened.
+
+It was not hypothetical. The `overload` job runs `verify` against a server
+pinned to `METRICFLOW_MAX_INFLIGHT=4` immediately after sixty-four workers
+saturated it. One residual in-flight request holding the last slot was enough
+to fail the build and blame the server.
+
+**So `429` and `503` are waited out**, and nothing else is. Retrying a `400`
+would convert a bug into a timeout, which a test pins by asserting the harness
+asks exactly once.
+
+**`Retry-After` is honoured and capped.** §35 answers with its whole
+ten-second epoch, which is correct — retrying sooner only spends refusals
+discovering that. But a misconfigured or hostile server can answer with an
+hour, and a harness that obeys is a harness that hangs. The ceiling is 15
+seconds; a refusal with no header at all waits 250 ms, because that case is
+most likely §26's shedding, where a slot frees in microseconds.
+
+**The bound exists for the same reason `maxVerifyPages` does**: a harness that
+can hang is worse than one that fails. Twenty refusals in a row and it gives
+up — but the message it gives up with says *unverified, not violated*, and a
+test asserts it contains none of the words (`recorded`, `difference`,
+`accepted`) that would send a reader hunting for a data-loss bug that is not
+there.
+
+**Retries are reported, not silent.** A verification that quietly waited out
+a hundred refusals measured a different server from the one the run hit, and
+the count is also evidence that §26 or §35 was active — worth seeing beside
+the result rather than hidden by it.
+
+**What this deliberately does not do.**
+
+- *It does not retry the ingest path.* A shed `POST` is already accounted for
+  by §26's `shedEv` bucket, and resending it would change what the run claims
+  to have sent. The asymmetry is deliberate: a refused write is data about the
+  run, a refused read is an obstacle to measuring it.
+- *It does not parse the HTTP-date form of `Retry-After`.* It is legal and this
+  server never sends it, so the fallback is a short wait rather than a parser
+  for a format nothing here produces.
+- *It still cannot verify a server that is permanently saturated.* Twenty
+  refusals and it stops, honestly, rather than waiting for a quiet moment that
+  may not come.
 
 ## Testing
 
