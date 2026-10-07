@@ -141,6 +141,8 @@ for *what* was decided and read in full only where the *why* matters.
   Clients are billed for the work their queries cause — metrics computed plus names walked — rather than for the number of requests they made.
 - [36. A refused read is not a failed verification](#36-a-refused-read-is-not-a-failed-verification)  
   A harness has to tell "the server refused to answer me" apart from "the server's numbers are wrong", because those call for opposite reactions and only one of them is a bug.
+- [37. A known name is a lookup, not a search](#37-a-known-name-is-a-lookup-not-a-search)  
+  The shard a metric lives in is a function of its name, so a caller who already knows the name never needed the store walked — 324 µs of scan became 2.9 µs of lookup.
 ## Design choices
 
 ### 1. Store the conclusion, not the events
@@ -2546,6 +2548,77 @@ the result rather than hidden by it.
 - *It still cannot verify a server that is permanently saturated.* Twenty
   refusals and it stops, honestly, rather than waiting for a quiet moment that
   may not come.
+
+### 37. A known name is a lookup, not a search
+
+> **In one line:** The shard a metric lives in is a function of its name, so a
+> caller who already knows the name never needed the store walked — 324 µs of
+> scan became 2.9 µs of lookup.
+
+§34 measured the two halves of a query and found the walk was 260 µs on a full
+store. §28 bounded what happens *after* the walk and left the walk itself
+alone, on the grounds that removing it meant a secondary index that every
+ingest would have to maintain — the wrong trade for a server that writes
+millions of times more often than it reads.
+
+That reasoning is still right, and it answered a question nobody asked. **No
+index is needed for a name the caller already has.** §24 shards the store by
+hashing the metric name, so the shard is a pure function of the name. Given
+`cpu.load`, the server can open exactly one shard and do one map lookup. The
+only reason it was walking 32 768 names was that `?prefix=` cannot know
+whether a longer name shares the prefix it was given — a limitation of the
+*parameter*, not of the store.
+
+So `?name=` asks the question directly:
+
+| | |
+| --- | --- |
+| one metric via `?prefix=` | 324 961 ns |
+| one metric via `?name=` | **2 854 ns** — 114× |
+| six metrics via `?name=` | 11 885 ns, about 1 980 each |
+
+Allocations are identical in the single-metric case, so the entire difference
+is walk that no longer happens.
+
+**It changes the price, not just the latency.** §35 charges
+`metricsComputed + namesWalked/325`, so on a full store a one-metric scan
+costs about 101 units and the same question by name costs 1. A dashboard
+polling six known panels every ten seconds is the difference between spending
+6 of its budget and 606 of it — which also means §35's ceiling stopped being
+something a normal dashboard could approach by accident.
+
+**`?name=` cannot be combined with `?prefix=` or `?after=`.** The combination
+has two readable meanings — intersect them, or let one win — and no obvious
+one, so it is a `400`. That is the call §11 made for a window the server
+cannot honour and §28 made for an over-large limit: a query the server cannot
+answer as asked is refused, not answered with something else.
+
+**A named query is never truncated and carries no cursor.** It returns exactly
+what it was asked for, so a cursor would invite a client into a loop with no
+termination condition. Names that were never there are simply absent, which is
+the same answer `/stats` already gives for a metric whose buckets have all
+aged out: asking about something that does not exist is not an error.
+
+Names are deduplicated, so `matched` counts metrics rather than parameters,
+and sorted, so a repeated request is byte-identical. More than `maxStatsLimit`
+distinct names is refused rather than quietly truncated.
+
+**The reserved namespace is reachable this way too**, because §31 made the
+server's own telemetry ordinary metrics and an access path that skipped them
+would quietly make that untrue.
+
+**What this deliberately does not do.**
+
+- *It does not make `?prefix=` cheaper.* A prefix query still walks, and still
+  must: the store is hashed by name, so names sharing a prefix are scattered
+  across all 32 shards by construction. Making prefixes cheap means an ordered
+  index, which is the trade §34 declined and this section did not reopen.
+- *It does not batch the lookups by shard.* Six names take six locks even when
+  two live in the same shard. At 2 µs a name that is not worth the bookkeeping,
+  and §25 already measured a shard-grouping idea moving a total by under 2%.
+- *It does not add a way to ask "does this metric exist".* An absent name is
+  indistinguishable from one whose data aged out, which is the existing
+  `/stats` contract rather than a new ambiguity.
 
 ## Testing
 
