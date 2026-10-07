@@ -49,6 +49,12 @@ type statsQuery struct {
 	prefix string // only names starting with this
 	after  string // only names strictly greater than this (keyset paging)
 	limit  int    // at most this many metrics get merged
+
+	// names is the exact set a caller asked for, from ?name=. When it is
+	// non-empty the store is not walked at all (§37) - the shard a name
+	// lives in is a function of the name, so a known name is a lookup
+	// rather than a search.
+	names []string
 }
 
 // parseStatsQuery validates the query string, rejecting rather than
@@ -86,7 +92,63 @@ func parseStatsQuery(r *http.Request) (statsQuery, error) {
 
 	q.prefix = v.Get("prefix")
 	q.after = v.Get("after")
+
+	if names, ok := v["name"]; ok {
+		// Mutually exclusive with the scanning parameters, and an error
+		// rather than a silent precedence rule. ?name=a&prefix=b has two
+		// readable meanings and no obvious one, and §11 already decided
+		// that a query the server cannot answer as asked is a 400 rather
+		// than a 200 over something else.
+		if q.prefix != "" || q.after != "" {
+			return q, fmt.Errorf("name cannot be combined with prefix or after")
+		}
+		// Deduplicated, so matched counts metrics rather than parameters,
+		// and sorted so a repeated request is byte-identical.
+		seen := make(map[string]struct{}, len(names))
+		for _, n := range names {
+			if n == "" {
+				return q, fmt.Errorf("name must not be empty")
+			}
+			seen[n] = struct{}{}
+		}
+		if len(seen) > maxStatsLimit {
+			return q, fmt.Errorf("asked for %d distinct names, over the maximum of %d",
+				len(seen), maxStatsLimit)
+		}
+		q.names = make([]string, 0, len(seen))
+		for n := range seen {
+			q.names = append(q.names, n)
+		}
+		slices.Sort(q.names)
+	}
+
 	return q, nil
+}
+
+// lookupNames resolves an exact ?name= set without walking the store.
+//
+// This is the whole point of §37. The shard a metric lives in is a pure
+// function of its name (§24), so a caller who already knows the name needs
+// one lock and one map lookup - not a scan of every name in the store, which
+// is what the prefix path has to do and what a single-metric query was
+// paying 323 µs for.
+//
+// Names that do not exist are simply absent from the result, which is the
+// same answer /stats gives for a metric whose buckets have all aged out.
+// Asking about something that was never there is not an error.
+func (s *Store) lookupNames(q statsQuery) (names []string, matched int) {
+	names = make([]string, 0, len(q.names))
+	for _, name := range q.names {
+		sh := s.shardFor(name)
+		sh.mu.Lock()
+		_, ok := sh.aggs[name]
+		sh.mu.Unlock()
+		if ok {
+			names = append(names, name)
+			matched++
+		}
+	}
+	return names, matched
 }
 
 // matches reports whether a metric name is in scope for this query.
@@ -230,16 +292,30 @@ func (s *Store) handleStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	names, matched, walked := s.selectNames(q)
+	// An exact ?name= set costs no walk at all, which is the difference
+	// between a dashboard polling six known metrics for six units and
+	// paying six hundred for the privilege of six full-store scans (§37).
+	var (
+		names   []string
+		matched int
+		walked  int
+	)
+	if len(q.names) > 0 {
+		names, matched = s.lookupNames(q)
+	} else {
+		names, matched, walked = s.selectNames(q)
+	}
 	c.chargeQuery(now, queryCost(walked, len(names)))
 
 	cutoff := windowStart(now, q.window)
 
 	resp := StatsResponse{
-		Window:    q.window.String(),
-		Metrics:   make(map[string]MetricStats, len(names)),
-		Matched:   matched,
-		Truncated: matched > len(names),
+		Window:  q.window.String(),
+		Metrics: make(map[string]MetricStats, len(names)),
+		Matched: matched,
+		// A named query returns exactly what was asked for, so there is
+		// nothing to page through and no cursor to hand back.
+		Truncated: len(q.names) == 0 && matched > len(names),
 	}
 	if resp.Truncated && len(names) > 0 {
 		// The last name considered, not the last one returned with data: a

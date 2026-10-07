@@ -523,3 +523,156 @@ func TestSelectNamesCountsMatchesItDiscards(t *testing.T) {
 		t.Errorf("matched = %d, want %d - discarded names still matched", matched, total)
 	}
 }
+
+// --- exact ?name= lookup (§37) ---
+
+// The equivalence that matters: a named query and a prefix query asking about
+// the same metric must agree on every number. The named path skips the walk,
+// not the arithmetic.
+func TestANamedQueryAgreesWithAScan(t *testing.T) {
+	s := newStore()
+	for i := 0; i < 50; i++ {
+		for v := 0; v < 20; v++ {
+			recordNow(s, fmt.Sprintf("svc.m.%02d", i), float64(v%7)+1)
+		}
+	}
+
+	byName := getStats(t, s, "?name=svc.m.07")
+	byScan := getStats(t, s, "?prefix=svc.m.07")
+
+	want, ok := byScan.Metrics["svc.m.07"]
+	if !ok {
+		t.Fatal("setup: the scan did not find the metric")
+	}
+	got, ok := byName.Metrics["svc.m.07"]
+	if !ok {
+		t.Fatal("the named query did not find a metric the scan found")
+	}
+	if got != want {
+		t.Errorf("named query returned %+v, scan returned %+v", got, want)
+	}
+	if len(byName.Metrics) != 1 {
+		t.Errorf("a named query returned %d metrics, want exactly the 1 asked for",
+			len(byName.Metrics))
+	}
+}
+
+// Several names in one request, which is the shape a dashboard uses.
+func TestANamedQueryTakesSeveralNames(t *testing.T) {
+	s := newStore()
+	for _, n := range []string{"a.one", "b.two", "c.three", "d.four"} {
+		recordNow(s, n, 5)
+	}
+
+	resp := getStats(t, s, "?name=a.one&name=c.three")
+	if len(resp.Metrics) != 2 {
+		t.Fatalf("returned %d metrics, want 2: %v", len(resp.Metrics), resp.Metrics)
+	}
+	for _, want := range []string{"a.one", "c.three"} {
+		if _, ok := resp.Metrics[want]; !ok {
+			t.Errorf("%s is missing from the response", want)
+		}
+	}
+	if _, ok := resp.Metrics["b.two"]; ok {
+		t.Error("b.two was returned without being asked for")
+	}
+}
+
+// A name that was never there is absent, not an error - the same answer
+// /stats gives for a metric whose buckets have all aged out.
+func TestANamedQueryForSomethingAbsentIsNotAnError(t *testing.T) {
+	s := newStore()
+	recordNow(s, "exists", 1)
+
+	resp := getStats(t, s, "?name=exists&name=never.existed")
+	if len(resp.Metrics) != 1 {
+		t.Errorf("returned %d metrics, want only the one that exists", len(resp.Metrics))
+	}
+	if resp.Matched != 1 {
+		t.Errorf("matched = %d, want 1 - matched counts metrics found, not names asked", resp.Matched)
+	}
+}
+
+// A named query answers exactly what was asked, so there is nothing to page
+// and no cursor to hand back. Returning one would invite a client into a
+// loop that cannot terminate.
+func TestANamedQueryIsNeverTruncated(t *testing.T) {
+	s := newStore()
+	for i := 0; i < maxStatsLimit+500; i++ {
+		recordNow(s, fmt.Sprintf("m.%05d", i), 1)
+	}
+
+	resp := getStats(t, s, "?name=m.00001&name=m.00002")
+	if resp.Truncated {
+		t.Error("truncated = true on a query that returned every name it was given")
+	}
+	if resp.Next != "" {
+		t.Errorf("next = %q; a named query has nothing to page to", resp.Next)
+	}
+}
+
+// Duplicates collapse, so matched counts metrics rather than parameters.
+func TestANamedQueryDeduplicates(t *testing.T) {
+	s := newStore()
+	recordNow(s, "once", 1)
+
+	resp := getStats(t, s, "?name=once&name=once&name=once")
+	if resp.Matched != 1 {
+		t.Errorf("matched = %d from three copies of one name, want 1", resp.Matched)
+	}
+}
+
+// Combining the two access modes has two readable meanings and no obvious
+// one, so it is refused rather than given a silent precedence rule.
+func TestNameCannotBeCombinedWithScanning(t *testing.T) {
+	s := newStore()
+	recordNow(s, "svc.one", 1)
+
+	for _, raw := range []string{
+		"?name=svc.one&prefix=svc.",
+		"?name=svc.one&after=a",
+		"?name=", // an empty name asks for nothing in particular
+	} {
+		rec := httptest.NewRecorder()
+		s.handleStats(rec, httptest.NewRequest(http.MethodGet, "/stats"+raw, nil))
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("%s: status = %d, want 400", raw, rec.Code)
+		}
+	}
+
+	// A name on its own is fine, known or not.
+	rec := httptest.NewRecorder()
+	s.handleStats(rec, httptest.NewRequest(http.MethodGet, "/stats?name=nothing.here", nil))
+	if rec.Code != http.StatusOK {
+		t.Errorf("a lone unknown name: status = %d, want 200", rec.Code)
+	}
+}
+
+// Too many names is an error rather than a silent truncation, for the same
+// reason an over-large limit is (§28).
+func TestTooManyNamesIsRefused(t *testing.T) {
+	s := newStore()
+
+	var sb strings.Builder
+	for i := 0; i < maxStatsLimit+1; i++ {
+		fmt.Fprintf(&sb, "&name=m.%05d", i)
+	}
+	rec := httptest.NewRecorder()
+	s.handleStats(rec, httptest.NewRequest(http.MethodGet, "/stats?"+sb.String()[1:], nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 for %d names", rec.Code, maxStatsLimit+1)
+	}
+}
+
+// The server's own metrics are reachable by name too. §31 made them ordinary
+// metrics; an access path that skipped them would make that untrue.
+func TestANamedQueryReachesTheReservedNamespace(t *testing.T) {
+	s := newStore()
+	r, _, _ := newTestReporter(s)
+	r.sample(time.Now())
+
+	resp := getStats(t, s, "?name="+selfStoreMetrics)
+	if _, ok := resp.Metrics[selfStoreMetrics]; !ok {
+		t.Errorf("%s was not reachable by exact name", selfStoreMetrics)
+	}
+}

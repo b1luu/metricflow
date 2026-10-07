@@ -886,3 +886,36 @@ func BenchmarkQueryByMetricsComputed(b *testing.B) {
 		})
 	}
 }
+
+// An exact ?name= lookup against a full store, next to the prefix query that
+// returns the same one metric. The prefix path has to walk every name,
+// because it cannot know there is no longer name sharing that prefix; the
+// named path knows which shard to open before it starts (§37).
+func BenchmarkStatsByName(b *testing.B) {
+	s := storeWithMetrics(shardCount * maxMetricsPerShard)
+	w := &discardWriter{}
+	req := httptest.NewRequest(http.MethodGet, "/stats?name=svc.metric.42", nil)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		s.handleStats(w, req)
+	}
+}
+
+// Several known metrics in one request, which is what a dashboard actually
+// does. Still no walk, so the cost is linear in what was asked for rather
+// than in what the store happens to hold.
+func BenchmarkStatsBySixNames(b *testing.B) {
+	s := storeWithMetrics(shardCount * maxMetricsPerShard)
+	w := &discardWriter{}
+	q := "/stats?name=svc.metric.1&name=svc.metric.900&name=svc.metric.4000" +
+		"&name=svc.metric.11000&name=svc.metric.20000&name=svc.metric.31000"
+	req := httptest.NewRequest(http.MethodGet, q, nil)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		s.handleStats(w, req)
+	}
+}

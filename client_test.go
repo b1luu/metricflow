@@ -1141,3 +1141,35 @@ func TestTheBudgetCoversOneFullPageThrough(t *testing.T) {
 			total, pages, perPage, maxQueryCostPerEpoch)
 	}
 }
+
+// A named query pays no walk, which is the other half of why §37 matters.
+// §35 prices a query as metricsComputed + namesWalked/325, so on a full
+// store a single-metric scan costs ~101 units and the same question asked by
+// name costs 1. A dashboard polling six known panels is the difference
+// between 6 and 606.
+func TestANamedQueryIsNotChargedForAWalk(t *testing.T) {
+	s := storeWithMetrics(2000)
+
+	byName := &client{}
+	statsAs(t, s, byName, "?name=svc.metric.42")
+
+	byScan := &client{}
+	statsAs(t, s, byScan, "?prefix=svc.metric.42")
+
+	byName.mu.Lock()
+	named := byName.querySpent
+	byName.mu.Unlock()
+
+	byScan.mu.Lock()
+	scanned := byScan.querySpent
+	byScan.mu.Unlock()
+
+	if named != 1 {
+		t.Errorf("a one-metric named query cost %d, want exactly 1 - "+
+			"one metric computed and nothing walked", named)
+	}
+	if scanned <= named {
+		t.Errorf("the scan cost %d and the named query %d; the walk is supposed "+
+			"to be the difference", scanned, named)
+	}
+}
