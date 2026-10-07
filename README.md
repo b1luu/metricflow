@@ -257,11 +257,31 @@ the store holds, and says so:
 (it may only narrow — asking for more is a `400`, not a silent clamp), and
 `?after=` continues from a previous page's `next`.
 
+**If you already know the name, ask for it directly.** `?name=` is repeatable
+and skips the store walk entirely, because the store is sharded by metric name
+so the shard is a function of the name:
+
+```
+curl -s "localhost:8080/stats?name=cpu.load&name=mem.used"
+```
+
+| | |
+| --- | --- |
+| one metric via `?prefix=` | 325 µs |
+| one metric via `?name=` | **2.9 µs** — 114× |
+
+It is also 100× cheaper against the per-client query budget, since that
+charges for names walked as well as metrics computed. `?name=` cannot be
+combined with `?prefix=` or `?after=`; a named query is never truncated and
+returns no `next`, and a name that does not exist is simply absent rather than
+an error. See [DESIGN.md](DESIGN.md) §37.
+
 This exists because it was the last unbounded thing in the server. With the
 store at its cardinality ceiling, one ~30-byte `GET /stats` used to cost
 77 ms of CPU and 62 MB of allocation — and the concurrency limiter will admit
 256 at once. It is now 3.7 ms and 1.2 MB, and the allocation count no longer
-depends on how many metrics exist at all. A narrow `?prefix=` query is 364 µs.
+depends on how many metrics exist at all. A narrow `?prefix=` query is 325 µs,
+and the same single metric by `?name=` is 2.9 µs.
 
 Two details worth knowing as a client: `matched` counts metric *names*, so a
 page can hold fewer metrics than its limit without being the last page (a
