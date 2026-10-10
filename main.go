@@ -691,7 +691,43 @@ func run(ctx context.Context, ln net.Listener) error {
 
 	// Bad rules are a programming error, so fail before serving a single
 	// request rather than discovering it on the first tick.
-	alerter, err := newAlerter(time.Now(), store, defaultRules())
+	// Rules come from a file when one is configured, and from code when
+	// none is (§38). Either way they go through the same newAlerter, so a
+	// rule from a file is validated exactly as a built-in one is.
+	//
+	// A bad rules file is fatal, for the reason §18 gives and §33
+	// sharpened: this is a configuration error, found before anything has
+	// been served, and refusing is the only way to make it visible. An
+	// operator who mistyped a threshold should not learn about it from the
+	// alert that never fired.
+	rules := defaultRules()
+	if path := rulesPath(); path != "" {
+		loaded, err := loadRules(path)
+		if err != nil {
+			return fmt.Errorf("alert rules: %w", err)
+		}
+		rules = loaded
+
+		switch {
+		case len(rules) == 0:
+			// Not fatal: a deployment may genuinely want no alerting, and
+			// an empty list is unusual rather than certainly wrong. Loud,
+			// because a server that alerts on nothing looks identical to a
+			// server where nothing is wrong.
+			log.Printf("WARNING: %s configures no rules; nothing is being alerted on", path)
+		default:
+			log.Printf("loaded %d alert rules from %s", len(rules), path)
+		}
+		// The file replaces the built-in set rather than extending it,
+		// which is predictable and has one trap: §31's two rules watching
+		// the server itself go with the rest, and nothing else would say so.
+		if !watchesItself(rules) {
+			log.Printf("WARNING: no rule watches the %s namespace; "+
+				"the server's own shedding and cardinality are unalerted", selfPrefix)
+		}
+	}
+
+	alerter, err := newAlerter(time.Now(), store, rules)
 	if err != nil {
 		return fmt.Errorf("alert rules: %w", err)
 	}
