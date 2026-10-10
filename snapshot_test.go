@@ -407,6 +407,30 @@ func TestTrailingBytesAreRejected(t *testing.T) {
 	}
 }
 
+// A file cut short and then given a valid checksum gets past everything
+// above, so it is the only way to reach the bounds checks inside a record -
+// and the reader's sticky error, which lets a record be decoded without
+// checking every field. Cut at every length, so the failure lands on every
+// field in turn.
+func TestResealedTruncationsAreRejected(t *testing.T) {
+	s := newStore()
+	for i, v := range []float64{12.5, -3, 0, 7} {
+		recordNow(s, fmt.Sprintf("svc.metric.%d", i%3), v)
+	}
+	good := s.snapshot(time.Now())
+	body := good[:len(good)-4]
+
+	for n := 0; n < len(body); n++ {
+		bad := append([]byte(nil), body[:n]...)
+		bad = binary.LittleEndian.AppendUint32(bad, crc32.Checksum(bad, crcTable))
+
+		if _, _, err := decodeSnapshot(bad); err == nil {
+			t.Fatalf("a snapshot cut to %d of %d bytes and re-checksummed was accepted",
+				n, len(body))
+		}
+	}
+}
+
 // --- on disk ---
 
 func TestWriteAndReadSnapshotFile(t *testing.T) {

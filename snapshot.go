@@ -173,50 +173,70 @@ func appendHistBuckets(b []byte, m map[int32]int64) []byte {
 // rejects a damaged file, but a file with a valid checksum can still have
 // been written by something else entirely, and "we wrote it" is not a
 // property the process reading it can verify.
+//
+// The first failure sticks. Once err is set every later read returns zero
+// and consumes nothing, so a record is decoded as a straight run of reads
+// with one check at the end rather than one after every field - the same
+// arrangement bufio.Scanner uses. A zero length or count is always in
+// bounds, which is what makes carrying on after a failure safe: nothing
+// read past the error can size an allocation or a loop.
 type reader struct {
-	b []byte
-	i int
+	b   []byte
+	i   int
+	err error
 }
 
 var errTruncated = errors.New("snapshot ends mid-record")
 
-func (r *reader) take(n int) ([]byte, error) {
-	if n < 0 || len(r.b)-r.i < n {
-		return nil, errTruncated
+// fail records err unless an earlier failure is already held: the first
+// thing to go wrong is the cause, and anything after it is a consequence.
+func (r *reader) fail(err error) {
+	if r.err == nil {
+		r.err = err
+	}
+}
+
+// remaining is how many bytes are left to read.
+func (r *reader) remaining() int { return len(r.b) - r.i }
+
+func (r *reader) take(n int) []byte {
+	if r.err != nil {
+		return nil
+	}
+	if n < 0 || r.remaining() < n {
+		r.err = errTruncated
+		return nil
 	}
 	out := r.b[r.i : r.i+n]
 	r.i += n
-	return out, nil
+	return out
 }
 
-func (r *reader) uint16() (uint16, error) {
-	b, err := r.take(2)
-	if err != nil {
-		return 0, err
+func (r *reader) uint16() uint16 {
+	b := r.take(2)
+	if r.err != nil {
+		return 0
 	}
-	return binary.LittleEndian.Uint16(b), nil
+	return binary.LittleEndian.Uint16(b)
 }
 
-func (r *reader) uint32() (uint32, error) {
-	b, err := r.take(4)
-	if err != nil {
-		return 0, err
+func (r *reader) uint32() uint32 {
+	b := r.take(4)
+	if r.err != nil {
+		return 0
 	}
-	return binary.LittleEndian.Uint32(b), nil
+	return binary.LittleEndian.Uint32(b)
 }
 
-func (r *reader) uint64() (uint64, error) {
-	b, err := r.take(8)
-	if err != nil {
-		return 0, err
+func (r *reader) uint64() uint64 {
+	b := r.take(8)
+	if r.err != nil {
+		return 0
 	}
-	return binary.LittleEndian.Uint64(b), nil
+	return binary.LittleEndian.Uint64(b)
 }
 
-func (r *reader) float64() (float64, error) {
-	v, err := r.uint64()
-	return math.Float64frombits(v), err
-}
+func (r *reader) float64() float64 { return math.Float64frombits(r.uint64()) }
 
 // snapshotMetric is one metric's worth of decoded buckets.
 type snapshotMetric struct {
@@ -249,146 +269,101 @@ func decodeSnapshot(b []byte) ([]snapshotMetric, time.Time, error) {
 
 	r := &reader{b: body, i: len(snapMagic)}
 
-	ms, err := r.uint64()
-	if err != nil {
-		return nil, zero, err
-	}
-	written := time.UnixMilli(int64(ms))
-
-	n, err := r.uint32()
-	if err != nil {
-		return nil, zero, err
+	written := time.UnixMilli(int64(r.uint64()))
+	n := r.uint32()
+	if r.err != nil {
+		return nil, zero, r.err
 	}
 	// Sized against the bytes actually left rather than against the count
 	// the file claims: the smallest possible metric is a few bytes, so a
 	// count far larger than the file could hold is a corrupt one.
-	if int(n) > len(body)-r.i {
+	if int(n) > r.remaining() {
 		return nil, zero, fmt.Errorf("snapshot claims %d metrics in %d remaining bytes",
-			n, len(body)-r.i)
+			n, r.remaining())
 	}
 
 	out := make([]snapshotMetric, 0, n)
 	for i := uint32(0); i < n; i++ {
-		m, err := readMetric(r)
-		if err != nil {
-			return nil, zero, err
+		m := readMetric(r)
+		if r.err != nil {
+			return nil, zero, r.err
 		}
 		out = append(out, m)
 	}
-	if r.i != len(body) {
-		return nil, zero, fmt.Errorf("snapshot has %d trailing bytes", len(body)-r.i)
+	if r.remaining() != 0 {
+		return nil, zero, fmt.Errorf("snapshot has %d trailing bytes", r.remaining())
 	}
 	return out, written, nil
 }
 
-func readMetric(r *reader) (snapshotMetric, error) {
+// readMetric, readBucket and readHistBuckets report failure through r.err,
+// and what they return is meaningless once it is set.
+func readMetric(r *reader) snapshotMetric {
 	var m snapshotMetric
 
-	nameLen, err := r.uint16()
-	if err != nil {
-		return m, err
+	m.name = string(r.take(int(r.uint16())))
+	count := r.uint32()
+	if r.err != nil {
+		return m
 	}
-	name, err := r.take(int(nameLen))
-	if err != nil {
-		return m, err
-	}
-	m.name = string(name)
-
-	count, err := r.uint32()
-	if err != nil {
-		return m, err
-	}
-	if int(count) > len(r.b)-r.i {
-		return m, fmt.Errorf("metric %q claims %d buckets in %d remaining bytes",
-			m.name, count, len(r.b)-r.i)
+	if int(count) > r.remaining() {
+		r.fail(fmt.Errorf("metric %q claims %d buckets in %d remaining bytes",
+			m.name, count, r.remaining()))
+		return m
 	}
 
 	m.buckets = make(map[int64]*Agg, count)
 	for i := uint32(0); i < count; i++ {
-		key, a, err := readBucket(r)
-		if err != nil {
-			return m, err
+		key, a := readBucket(r)
+		if r.err != nil {
+			return m
 		}
 		m.buckets[key] = a
 	}
-	return m, nil
+	return m
 }
 
-func readBucket(r *reader) (int64, *Agg, error) {
-	key, err := r.uint64()
-	if err != nil {
-		return 0, nil, err
+func readBucket(r *reader) (int64, *Agg) {
+	key := int64(r.uint64())
+	a := &Agg{
+		Count: int(r.uint64()),
+		Sum:   r.float64(),
+		Min:   r.float64(),
+		Max:   r.float64(),
+		h:     &hist{},
 	}
-	count, err := r.uint64()
-	if err != nil {
-		return 0, nil, err
-	}
-	sum, err := r.float64()
-	if err != nil {
-		return 0, nil, err
-	}
-	min, err := r.float64()
-	if err != nil {
-		return 0, nil, err
-	}
-	max, err := r.float64()
-	if err != nil {
-		return 0, nil, err
-	}
-
-	h := &hist{}
-	zeros, err := r.uint64()
-	if err != nil {
-		return 0, nil, err
-	}
-	hcount, err := r.uint64()
-	if err != nil {
-		return 0, nil, err
-	}
-	h.zeros, h.count = int64(zeros), int64(hcount)
-
-	if h.pos, err = readHistBuckets(r); err != nil {
-		return 0, nil, err
-	}
-	if h.neg, err = readHistBuckets(r); err != nil {
-		return 0, nil, err
-	}
-
-	return int64(key), &Agg{
-		Count: int(count), Sum: sum, Min: min, Max: max, h: h,
-	}, nil
+	a.h.zeros = int64(r.uint64())
+	a.h.count = int64(r.uint64())
+	a.h.pos = readHistBuckets(r)
+	a.h.neg = readHistBuckets(r)
+	return key, a
 }
 
-func readHistBuckets(r *reader) (map[int32]int64, error) {
-	n, err := r.uint32()
-	if err != nil {
-		return nil, err
+func readHistBuckets(r *reader) map[int32]int64 {
+	n := r.uint32()
+	if r.err != nil {
+		return nil
 	}
 	// Each entry is twelve bytes, so a count that could not fit is corrupt.
 	// Checked before allocating, which is the whole point.
-	if int(n)*12 > len(r.b)-r.i {
-		return nil, fmt.Errorf("histogram claims %d buckets in %d remaining bytes",
-			n, len(r.b)-r.i)
+	if int(n)*12 > r.remaining() {
+		r.fail(fmt.Errorf("histogram claims %d buckets in %d remaining bytes",
+			n, r.remaining()))
+		return nil
 	}
 	if n == 0 {
 		// Left nil rather than allocated, matching a histogram that never
 		// saw a value of that sign (§23).
-		return nil, nil
+		return nil
 	}
 
+	// The bound above means none of these reads can run out of bytes.
 	m := make(map[int32]int64, n)
 	for i := uint32(0); i < n; i++ {
-		k, err := r.uint32()
-		if err != nil {
-			return nil, err
-		}
-		v, err := r.uint64()
-		if err != nil {
-			return nil, err
-		}
-		m[int32(k)] = int64(v)
+		k := r.uint32()
+		m[int32(k)] = int64(r.uint64())
 	}
-	return m, nil
+	return m
 }
 
 // load inserts a decoded snapshot into the store, dropping anything that has
