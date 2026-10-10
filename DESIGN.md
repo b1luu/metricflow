@@ -143,6 +143,11 @@ for *what* was decided and read in full only where the *why* matters.
   A harness has to tell "the server refused to answer me" apart from "the server's numbers are wrong", because those call for opposite reactions and only one of them is a bug.
 - [37. A known name is a lookup, not a search](#37-a-known-name-is-a-lookup-not-a-search)  
   The shard a metric lives in is a function of its name, so a caller who already knows the name never needed the store walked — 324 µs of scan became 2.9 µs of lookup.
+
+**Configuration**
+
+- [38. Rules an operator can write](#38-rules-an-operator-can-write)  
+  An alerting system whose rules live in a Go function is one nobody but its author can configure, so rules come from a file — and the most valuable line in the change is the one that refuses unknown fields.
 ## Design choices
 
 ### 1. Store the conclusion, not the events
@@ -2619,6 +2624,98 @@ would quietly make that untrue.
 - *It does not add a way to ask "does this metric exist".* An absent name is
   indistinguishable from one whose data aged out, which is the existing
   `/stats` contract rather than a new ambiguity.
+
+### 38. Rules an operator can write
+
+> **In one line:** An alerting system whose rules live in a Go function is one
+> nobody but its author can configure, so rules come from a file — and the
+> most valuable line in the change is the one that refuses unknown fields.
+
+§18 built the alerting engine and left the rules in `defaultRules`, a function
+in `main.go`. Everything else operational is already settable from outside: the
+in-flight limit (§26) and the snapshot path (§32). Rules were the remaining
+choice that most obviously belongs to whoever runs the server rather than
+whoever wrote it — and the only way to add one for your own metric was to edit
+Go, have a toolchain, and rebuild.
+
+`METRICFLOW_RULES` names a JSON file. Unset keeps the built-in set, so a
+server nobody configured behaves exactly as it did before this existed.
+
+```json
+[
+  {"name":"checkout-slow", "metric":"svc.checkout.latency_ms",
+   "stat":"p99", "op":">", "value":250, "window":"30s", "for":"20s"}
+]
+```
+
+**The wire form is a separate struct**, not `Rule` with tags bolted on.
+`Window` and `For` are `time.Duration`, which `encoding/json` treats as the
+`int64` it is — so the honest JSON for half a minute is `30000000000`. A file
+people write by hand has to say `"30s"`, and that means string fields and a
+conversion step. Keeping `jsonRule` separate is the same call `cmd/loadgen`
+makes about `statsResponse`: the wire contract and the domain type drift for
+different reasons, and a change to one should not silently be a change to the
+other.
+
+**Unknown fields are refused, and that is the most valuable line in the
+change.** Without it, `"windwo": "30s"` is discarded in silence and the rule
+runs with a zero window — which legally means *the full retention window*. The
+rule works, answers honestly, and watches sixty seconds instead of the thirty
+its author intended, and nothing downstream can tell. A typo that quietly
+widens an alert's lookback is exactly the class of misconfiguration §18
+refuses to start on.
+
+**Nothing validates twice.** `jsonRule` converts and `newAlerter` validates, so
+a rule from a file meets precisely the checks a built-in one does — unknown
+stat, unknown op, window past retention, negative `For`, duplicate names. A
+second validator would be a second place to forget something.
+
+**A bad file is fatal; an empty one is not.** The distinction is §33's. A file
+that will not parse, or a rule that will not validate, is a configuration
+error found before anything has been served, and refusing to start is the only
+way to make it visible — an operator who mistyped a threshold should not learn
+about it from the alert that never fired. A file configuring *zero* rules is
+unusual rather than wrong, so it loads and says so loudly, because a server
+alerting on nothing looks identical to a server where nothing is wrong.
+
+**A file replaces the built-in set rather than extending it.** Predictable, and
+it has one trap: §31's two rules watching the server itself go with everything
+else, and nothing about the server's behaviour would tell you. So startup says
+it:
+
+```
+loaded 2 alert rules from .../rules.json
+WARNING: no rule watches the metricflow. namespace; the server's own
+         shedding and cardinality are unalerted
+```
+
+**Live**, a rule written by hand and driven past its threshold:
+
+```
+checkout-slow        pending    value=907.03
+queue-backing-up     nodata     value=0
+```
+
+`pending` rather than `firing` because the rule carries `for: 20s` and eleven
+seconds had passed — §18's flap suppression, reached from a file with no code
+involved. The second rule stays `nodata`, which is the honest answer for a
+metric nothing has reported.
+
+**What this deliberately does not do.**
+
+- *No reload without a restart.* Rules are read once at startup. Watching the
+  file would mean deciding what a half-written file means mid-write, and the
+  answer would be the temp-and-rename dance §32 already does for snapshots —
+  worth it only once somebody is editing rules often enough to mind.
+- *No merging with the built-in set, and no way to ask for both.* A flag to
+  extend rather than replace would make the defaults unremovable, and the
+  warning above covers the case it would protect.
+- *The thresholds are still absolute numbers.* A rule says `> 250`, not
+  `> p99 of last week`, which would need history this server does not keep
+  (§1).
+- *Rules are not reachable over HTTP.* There is no endpoint to add one, which
+  would be a write API with authentication questions this project has
+  deliberately avoided (§29).
 
 ## Testing
 

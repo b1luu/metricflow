@@ -41,10 +41,40 @@ exits; a second `Ctrl-C` kills immediately.
 | GET    | `/alerts` | Current state of every alert rule (JSON).              |
 
 `/alerts` reports each rule as `ok`, `pending`, `firing`, or `nodata`, with
-the value it last saw and when it entered that state. Rules are defined in
-code (`defaultRules` in `main.go`) and re-evaluated every 10 seconds, so a
-threshold crossing shows up within one interval — and a rule whose metric has
-no data reads as `nodata`, never as healthy.
+the value it last saw and when it entered that state. Rules are re-evaluated
+every 10 seconds, so a threshold crossing shows up within one interval — and a
+rule whose metric has no data reads as `nodata`, never as healthy.
+
+**Rules come from a file.** Point `METRICFLOW_RULES` at one; leave it unset and
+the built-in set is used.
+
+```json
+[
+  {"name":"checkout-slow", "metric":"svc.checkout.latency_ms",
+   "stat":"p99", "op":">", "value":250, "window":"30s", "for":"20s"}
+]
+```
+
+`stat` is one of `avg`, `max`, `min`, `count`, `p50`, `p90`, `p99`, `increase`;
+`op` is `>`, `>=`, `<` or `<=`. Durations are written as durations (`30s`,
+`1m`), `window` defaults to the full retention window and `for` to firing at
+once.
+
+A file that will not parse, or a rule that will not validate, **stops
+startup** — an operator who mistyped a threshold should not find out from the
+alert that never fired. Unknown field names are refused for the same reason:
+`"windwo": "30s"` would otherwise be dropped in silence, leaving a rule that
+watches 60 seconds instead of the 30 its author meant.
+
+A file *replaces* the built-in set, which means the two rules watching the
+server itself go with it. Startup says so rather than leaving you to notice:
+
+```
+WARNING: no rule watches the metricflow. namespace; the server's own
+         shedding and cardinality are unalerted
+```
+
+See [DESIGN.md](DESIGN.md) §38.
 
 A rule may set `For`, requiring the breach to hold that long before it counts;
 until then it sits in `pending` and logs nothing, so a metric flapping across
