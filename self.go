@@ -33,7 +33,6 @@ package main
 import (
 	"context"
 	"runtime"
-	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -86,7 +85,16 @@ const (
 
 // reserved reports whether a metric name belongs to the server rather than
 // to a client.
-func reserved(name string) bool { return strings.HasPrefix(name, selfPrefix) }
+// Generic for the same reason fnv32 is: the ingest hot path holds a name as
+// bytes and everything else holds it as a string, and this must give the
+// same answer to both without converting one into the other (§40).
+func reserved[T string | []byte](name T) bool {
+	if len(name) < len(selfPrefix) {
+		return false
+	}
+	// Compares without allocating: the compiler special-cases string(b) == s.
+	return string(name[:len(selfPrefix)]) == selfPrefix
+}
 
 // counters are the totals the server keeps about itself.
 //

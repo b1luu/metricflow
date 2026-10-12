@@ -42,8 +42,25 @@ var errIncomplete = errors.New("incomplete JSON value")
 // which is what makes "missing" and "present but zero" indistinguishable here
 // and is why §12 checks for them in validateEvent rather than at parse time.
 func parseEvent(b []byte, ev *Event) (int, error) {
+	var name []byte
+	n, err := parseEventName(b, ev, &name)
+	if err != nil {
+		return 0, err
+	}
+	ev.Name = string(name)
+	return n, nil
+}
+
+// parseEventName is parseEvent without building the name string, which is
+// the only allocation an event costs once its metric exists (§40).
+//
+// The name is left in *name as a slice of b. It is valid until b is reused,
+// which for the batch reader is the next refill - so a caller must finish
+// with it inside the same iteration, and must not put it in the store
+// without copying.
+func parseEventName(b []byte, ev *Event, name *[]byte) (int, error) {
 	p := parser{b: b}
-	if err := p.event(ev); err != nil {
+	if err := p.event(ev, name); err != nil {
 		return 0, err
 	}
 	return p.i, nil
@@ -70,8 +87,9 @@ func (p *parser) space() {
 	}
 }
 
-func (p *parser) event(ev *Event) error {
+func (p *parser) event(ev *Event, name *[]byte) error {
 	*ev = Event{}
+	*name = nil
 
 	p.space()
 	if p.atEnd() {
@@ -125,7 +143,7 @@ func (p *parser) event(ev *Event) error {
 			return errIncomplete
 		}
 
-		if err := p.field(key, ev); err != nil {
+		if err := p.field(key, ev, name); err != nil {
 			return err
 		}
 
@@ -185,10 +203,10 @@ func (p *parser) key() ([]byte, error) {
 //
 // The later of two duplicate keys wins, because that is what encoding/json
 // does: it assigns as it goes rather than rejecting the second.
-func (p *parser) field(key []byte, ev *Event) error {
+func (p *parser) field(key []byte, ev *Event, name *[]byte) error {
 	switch {
 	case matches(key, "name"):
-		return p.strField(&ev.Name)
+		return p.strBytesField(name)
 	case matches(key, "value"):
 		return p.floatField(&ev.Value)
 	case matches(key, "ts"):
@@ -248,6 +266,22 @@ func (p *parser) lit(want string) error {
 		return errors.New("invalid literal")
 	}
 	p.i += len(want)
+	return nil
+}
+
+// strBytesField is strField without the string conversion.
+func (p *parser) strBytesField(dst *[]byte) error {
+	if isNull, err := p.null(); err != nil || isNull {
+		return err
+	}
+	if p.b[p.i] != '"' {
+		return errors.New("expected a string")
+	}
+	b, err := p.strBytes()
+	if err != nil {
+		return err
+	}
+	*dst = b
 	return nil
 }
 
@@ -436,7 +470,28 @@ func isDigit(c byte) bool { return c >= '0' && c <= '9' }
 // resulting string, the same as encoding/json. Escapes take a second pass
 // through a buffer, which is worth nothing to optimise: metric names do not
 // contain them.
+// str is strBytes plus the string conversion, which is the one allocation
+// an event used to cost even when its metric already existed (§40).
 func (p *parser) str() (string, error) {
+	b, err := p.strBytes()
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+// strBytes returns a string's contents where they already are: a slice of
+// the input buffer, with no copy.
+//
+// The two exits that do allocate are the two that must. An escaped string
+// has to be decoded somewhere other than the input it came from, and
+// invalid UTF-8 has to be rewritten with replacement runes (§30). Neither
+// is the common shape of a metric name.
+//
+// The returned slice aliases the parser's buffer, so a caller must not keep
+// it past the call it was handed to: the batch reader's buffer is pooled and
+// will be handed to another request.
+func (p *parser) strBytes() ([]byte, error) {
 	p.i++ // opening quote
 	start := p.i
 
@@ -450,15 +505,19 @@ func (p *parser) str() (string, error) {
 			raw := p.b[start:p.i]
 			p.i++
 			if high && !utf8.Valid(raw) {
-				return coerceUTF8(raw), nil
+				return []byte(coerceUTF8(raw)), nil
 			}
-			return string(raw), nil
+			return raw, nil
 		case c == '\\':
-			return p.strEscaped(start)
+			s, err := p.strEscaped(start)
+			if err != nil {
+				return nil, err
+			}
+			return []byte(s), nil
 		case c < 0x20:
 			// Raw control characters are invalid in a JSON string, and
 			// encoding/json rejects them rather than passing them through.
-			return "", errors.New("control character in string")
+			return nil, errors.New("control character in string")
 		default:
 			if c >= utf8.RuneSelf {
 				high = true
@@ -466,7 +525,7 @@ func (p *parser) str() (string, error) {
 			p.i++
 		}
 	}
-	return "", errIncomplete
+	return nil, errIncomplete
 }
 
 // coerceUTF8 replaces every byte that is not part of a valid UTF-8 sequence
@@ -859,9 +918,24 @@ func (er *eventReader) release() {
 // its start. Re-parsing a prefix is cheap and happens at most once per refill,
 // where the alternative - a resumable parser - would complicate every
 // function in this file to save nothing measurable.
+// next decodes the next event, building its name as a string. Used by
+// tests and by anything that keeps the event past the call; the batch path
+// uses nextName, which does not allocate.
 func (er *eventReader) next(ev *Event) error {
+	var name []byte
+	if err := er.nextName(ev, &name); err != nil {
+		return err
+	}
+	ev.Name = string(name)
+	return nil
+}
+
+// nextName decodes the next event, leaving the name as bytes inside the
+// read buffer. The slice is valid until the next call, because that call
+// may refill the buffer underneath it.
+func (er *eventReader) nextName(ev *Event, name *[]byte) error {
 	for {
-		n, err := parseEvent(er.buf[er.pos:er.end], ev)
+		n, err := parseEventName(er.buf[er.pos:er.end], ev, name)
 		if err == nil {
 			er.pos += n
 			return nil

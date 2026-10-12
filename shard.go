@@ -27,7 +27,12 @@ const shardCount = 32
 // on the ingest hot path where record() is currently allocation-free (§23).
 // FNV-1a is chosen for being cheap and well-mixed in the low bits, which is
 // what a mask-based shard index reads.
-func fnv32(s string) uint32 {
+// Generic over the two ways a name arrives, because the ingest hot path
+// has it as bytes and everything else has it as a string, and len/index
+// work identically on both. One loop rather than two that must agree, and
+// no conversion - fnv32([]byte(name)) would allocate the thing this exists
+// to avoid (§40).
+func fnv32[T string | []byte](s T) uint32 {
 	const (
 		offset32 = 2166136261
 		prime32  = 16777619
@@ -43,6 +48,6 @@ func fnv32(s string) uint32 {
 // shardIndex maps a metric name to its shard. Deterministic: the same name
 // must always resolve to the same shard, or a metric's buckets would scatter
 // and no single lock would cover them.
-func shardIndex(metric string) int {
+func shardIndex[T string | []byte](metric T) int {
 	return int(fnv32(metric) & (shardCount - 1))
 }

@@ -113,8 +113,11 @@ func (s *Store) handleIngestBatch(w http.ResponseWriter, r *http.Request) {
 	status := http.StatusOK
 	retryable := 0 // rejects that may succeed later, i.e. cardinality
 	for index := 0; ; index++ {
-		var ev Event
-		err := events.next(&ev)
+		var (
+			ev   Event
+			name []byte
+		)
+		err := events.nextName(&ev, &name)
 		if errors.Is(err, io.EOF) {
 			break // clean end of the batch
 		}
@@ -135,7 +138,7 @@ func (s *Store) handleIngestBatch(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 
-		if err := s.admitFor(now, c, ev); err != nil {
+		if err := s.admitForName(now, c, name, ev); err != nil {
 			resp.Rejected++
 			mayRetry := retryableIngestError(err)
 			if mayRetry {

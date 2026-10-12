@@ -102,6 +102,14 @@ func (s *Store) shardFor(metric string) *shard {
 	return &s.shards[shardIndex(metric)]
 }
 
+// shardForBytes is shardFor for a name the ingest path still holds as bytes.
+// Two one-line methods rather than one generic one, because Go does not
+// allow type parameters on methods - the logic that must agree lives in
+// shardIndex, which is generic, so there is nothing here to diverge.
+func (s *Store) shardForBytes(metric []byte) *shard {
+	return &s.shards[shardIndex(metric)]
+}
+
 const (
 	bucketWidth = 10 * time.Second         // width of one time bucket
 	numBuckets  = 6                        // buckets kept per metric
@@ -130,16 +138,37 @@ func (s *Store) record(now time.Time, ev Event) error {
 }
 
 // recordFor is record, charging c for any metric name it creates.
+//
+// A thin wrapper over recordForName, which is where the work is. The
+// conversion here allocates, and that is the right trade for its callers:
+// the self-reporter writes thirteen metrics a second and tests write a
+// handful, while the ingest path - the one that does this millions of times
+// a second - goes straight to the bytes form (§40).
 func (s *Store) recordFor(now time.Time, c *client, ev Event) error {
+	return s.recordForName(now, c, []byte(ev.Name), ev)
+}
+
+// recordForName records an event whose name is still bytes.
+//
+// The map lookups below are the point of the whole exercise. Go compiles
+// m[string(b)] into a lookup that hashes and compares the bytes in place,
+// with no string allocated - so an event for a metric that already exists,
+// which is very nearly all of them, now costs nothing at all. The one place
+// a string is built is the insert, where the map has to own its key, and
+// that happens once per metric rather than once per event.
+//
+// name must not be retained: it aliases the request's read buffer, which is
+// pooled (§30). The only thing kept is the string made on insert.
+func (s *Store) recordForName(now time.Time, c *client, name []byte, ev Event) error {
 	bucket := time.UnixMilli(ev.TS).Truncate(bucketWidth).Unix()
 
 	// One metric lives in exactly one shard, so an ingest takes one lock and
 	// never blocks a write to a differently-named metric.
-	sh := s.shardFor(ev.Name)
+	sh := s.shardForBytes(name)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 
-	series := sh.aggs[ev.Name]
+	series := sh.aggs[string(name)]
 	if series == nil {
 		// Creating a name is the only place cardinality can grow, so it is
 		// the only place worth checking - an event for a metric that
@@ -154,7 +183,7 @@ func (s *Store) recordFor(now time.Time, c *client, ev Event) error {
 		// store is exactly when somebody needs to see that it is full. The
 		// set is fixed by self.go rather than by any client, so exempting
 		// it cannot let anything grow without bound.
-		if !reserved(ev.Name) && len(sh.aggs) >= maxMetricsPerShard {
+		if !reserved(name) && len(sh.aggs) >= maxMetricsPerShard {
 			return errCardinality
 		}
 
@@ -168,7 +197,10 @@ func (s *Store) recordFor(now time.Time, c *client, ev Event) error {
 		}
 
 		series = make(map[int64]*Agg)
-		sh.aggs[ev.Name] = series
+		// The one allocation of the name, and the only one that has to
+		// exist: a map owns its keys, so this string outlives the buffer
+		// the bytes came from.
+		sh.aggs[string(name)] = series
 	}
 
 	a := series[bucket]
@@ -221,10 +253,16 @@ func (s *Store) admit(now time.Time, ev Event) error {
 // caller's name allowance, so a client sending garbage cannot spend its own
 // quota on names that were never going to be valid either.
 func (s *Store) admitFor(now time.Time, c *client, ev Event) error {
-	if err := validateEvent(now, ev); err != nil {
+	return s.admitForName(now, c, []byte(ev.Name), ev)
+}
+
+// admitForName is admitFor for a name the parser has not turned into a
+// string, which is the path /ingest/batch takes for every event.
+func (s *Store) admitForName(now time.Time, c *client, name []byte, ev Event) error {
+	if err := validateEventName(now, name, ev); err != nil {
 		return err
 	}
-	return s.recordFor(now, c, ev)
+	return s.recordForName(now, c, name, ev)
 }
 
 // retryableIngestError reports whether a refusal may succeed later.
@@ -353,9 +391,18 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 // the caller getting the contract wrong, so every one of them is a 400 -
 // which is why the error carries a message and not a status code.
 func validateEvent(now time.Time, ev Event) error {
+	return validateEventName(now, ev.Name, ev)
+}
+
+// validateEventName is validateEvent over a name held as either a string or
+// bytes, so the ingest contract has exactly one implementation however the
+// name arrived. A second copy of these checks is a second thing to forget
+// to update - the mistake §38 avoided by making newAlerter the only
+// validator of a rule.
+func validateEventName[T string | []byte](now time.Time, name T, ev Event) error {
 	// Unmarshal only checks syntax, not meaning. Name and TS have no sane
 	// zero-value default, so they are checked explicitly. See DESIGN.md §12.
-	if ev.Name == "" {
+	if len(name) == 0 {
 		return errors.New("name is required")
 	}
 	// A cap on how many names exist is worth little without a cap on how
@@ -363,15 +410,15 @@ func validateEvent(now time.Time, ev Event) error {
 	// client could fill its shard budget with names of a megabyte each and
 	// spend gigabytes doing it (§27). Real metric names are well under a
 	// hundred bytes; this is generous and still bounds the total.
-	if len(ev.Name) > maxMetricNameLen {
+	if len(name) > maxMetricNameLen {
 		return fmt.Errorf("name is %d bytes, over the %d-byte limit",
-			len(ev.Name), maxMetricNameLen)
+			len(name), maxMetricNameLen)
 	}
 	// The reserved namespace belongs to the server (§31). A client that
 	// could write into it could forge the one signal an operator reaches
 	// for during an incident - filling metricflow.requests.shed with zeroes
 	// would make a shedding server look calm.
-	if reserved(ev.Name) {
+	if reserved(name) {
 		return fmt.Errorf("%q is reserved for the server's own metrics", selfPrefix)
 	}
 	if ev.TS == 0 {
