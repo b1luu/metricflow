@@ -199,8 +199,22 @@ is what `/health` is for. See [DESIGN.md](DESIGN.md) §31.
 
 Events are decoded by a hand-written parser for this one three-field schema
 rather than by `encoding/json`. Reflection was 73% of the per-event ingest
-cost; the parser is about 4x faster and allocates a third as much, which
-roughly doubles end-to-end throughput at realistic batch sizes.
+cost; the parser is about 4x faster, which roughly doubles end-to-end
+throughput at realistic batch sizes.
+
+**Ingesting an event allocates nothing.** The store already holds every metric
+name as a map key, and Go compiles `m[string(bytes)]` into a lookup that
+hashes and compares the bytes in place without building a string — so an event
+for a metric that already exists needs no name allocated. A string is built
+only when a metric is created, because a map must own its key:
+
+| batch of 10,000 events | before | after |
+| --- | --- | --- |
+| allocations | 10,051 | **15** |
+| bytes | 85,944 | 5,428 |
+
+Allocation no longer scales with how many events a request carries. See
+[DESIGN.md](DESIGN.md) §40.
 
 Writing a JSON parser is an easy way to be subtly wrong, and being wrong here
 would change the wire format under existing clients. So it is not justified by

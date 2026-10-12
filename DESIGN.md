@@ -153,6 +153,11 @@ for *what* was decided and read in full only where the *why* matters.
 
 - [39. The time dimension the store already kept](#39-the-time-dimension-the-store-already-kept)  
   Six ten-second buckets per metric existed since §8 and every read collapsed them, so a steady metric and a spiky one with the same average were indistinguishable — `/series` stops discarding the shape.
+
+**Allocation**
+
+- [40. Ingest allocates nothing per event](#40-ingest-allocates-nothing-per-event)  
+  The store already holds every metric name as a map key, so an event for a metric that exists needs no name string at all — a batch of ten thousand went from 10 051 allocations to 15.
 ## Design choices
 
 ### 1. Store the conclusion, not the events
@@ -2792,6 +2797,78 @@ a second thing to get wrong.
   across a restart, not a history.
 - *No aggregation across metrics.* Six names give six series, not a sum; a
   query language is a different project.
+
+### 40. Ingest allocates nothing per event
+
+> **In one line:** The store already holds every metric name as a map key, so
+> an event for a metric that exists needs no name string at all — a batch of
+> ten thousand went from 10 051 allocations to 15.
+
+§30 got parsing to 96 ns and left exactly one allocation behind: the name
+string. §34 named interning it as the obvious next step and deliberately did
+not measure it.
+
+Measured, the answer turned out to be better than interning, and it needs no
+table at all. **The store is already the intern table.** Every live metric
+name is a key in a shard's map, and Go compiles `m[string(b)]` into a lookup
+that hashes and compares the bytes where they lie, without building a string.
+So an event for a metric that already exists — very nearly every event — does
+not need one.
+
+The only place a string is still built is the insert, because a map must own
+its key. That is once per *metric* instead of once per *event*.
+
+| batch of 10 000 | before | after |
+| --- | --- | --- |
+| allocations | 10 051 | **15** |
+| bytes | 85 944 | 5 428 |
+| ns/event | 231.7 | ~220 |
+
+**Allocation stopped scaling with the event count**: fifteen per request
+whether it carries ten events or ten thousand. The time saving is about 5%,
+and that is worth stating against the estimate it came from — a parse
+microbenchmark put the name allocation at 17–32 ns, which predicted ~11%. The
+gap is that some of those conversions were already being stack-allocated. The
+sixteen-fold drop in garbage is the result worth having, not the nanoseconds.
+
+**Nothing is hashed or validated twice.** `fnv32` and `reserved` are generic
+over `string` and `[]byte`, because `len` and indexing work identically on
+both — so the two representations cannot drift into disagreeing about which
+shard a metric lives in, or about what counts as reserved. `validateEvent` is
+a wrapper over `validateEventName`; `recordFor` and `admitFor` are wrappers
+over the bytes forms. `shardFor` needed two one-line methods, because Go
+forbids type parameters on methods, but the logic they share lives in the
+generic `shardIndex`.
+
+**The risk is aliasing.** The bytes point into the batch reader's pooled
+buffer (§30). If the store kept that slice rather than copying it, the next
+request would silently rename a metric, and two unrelated series would merge
+with nothing looking wrong until the numbers did. A test overwrites the
+caller's buffer in place and checks the stored name survived; an
+`unsafe.String` version of the insert fails it.
+
+**Two of the three teeth checks I first wrote were not faithful**, and the
+reason is worth recording. A per-event string conversion that does not escape
+is stack-allocated, and `testing.AllocsPerRun` counts heap allocations only —
+so a single-event check passes against a version that reintroduces the
+conversion, and so does a `strings.Clone` mutation. The test that holds
+asserts that allocations do not *scale*: reverting the batch loop to the
+string path reports "10 events allocate 34 and 1000 allocate 1024". Measuring
+one event could not see the thing the change is about.
+
+3.2M fuzz executions still agree with `encoding/json` (§30).
+
+**What this deliberately does not do.**
+
+- *No interning table.* One was never needed, and it would have added a
+  structure to maintain, a lock to contend on, and an eviction policy, in
+  order to replace a map lookup the store was doing anyway.
+- *`/ingest` still allocates its one name.* A single-event request costs about
+  1 845 ns, so one 16-byte allocation is noise there, and the wrapper keeps
+  the code honest rather than fast in a place nothing is measuring.
+- *The name is not interned across shards.* Two shards holding the same string
+  value hold two copies. Thirty-two copies of a name is bounded and
+  irrelevant; sharing them would need exactly the table this avoided.
 
 ## Testing
 
