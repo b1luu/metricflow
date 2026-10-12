@@ -183,8 +183,14 @@ jobs:
             echo "the quiet client did not verify while another client flooded names"
             exit 1
           fi
-          if grep -q "429" quiet.log; then
+          # Anchored to the status table, which loadgen prints as
+          # "  %3d %9d  %5.1f%%", because a bare grep for 429 matches any
+          # number containing those digits. This failed on a run where the
+          # quiet client made 54291 requests and was never throttled at all:
+          # "54291" contains "429". The gate was reading digits, not statuses.
+          if grep -qE '^[[:space:]]+429[[:space:]]' quiet.log; then
             echo "the quiet client was throttled by another client's flood"
+            grep -E '^[[:space:]]+[0-9]{3}[[:space:]]' quiet.log
             exit 1
           fi
           if ! grep -q "refused" noisy.log; then
