@@ -38,6 +38,7 @@ exits; a second `Ctrl-C` kills immediately.
 | POST   | `/ingest` | Submit one metric event as a JSON body.                |
 | POST   | `/ingest/batch` | Submit many events as newline-delimited JSON.    |
 | GET    | `/stats`  | Per-metric count/avg/min/max and p50/p90/p99 over a time window (JSON, default 60s). Bounded — see below. |
+| GET    | `/series` | Per-bucket values for named metrics, for plotting (JSON). |
 | GET    | `/alerts` | Current state of every alert rule (JSON).              |
 
 `/alerts` reports each rule as `ok`, `pending`, `firing`, or `nodata`, with
@@ -286,6 +287,34 @@ the store holds, and says so:
 `?prefix=` narrows by name, `?limit=` narrows how many metrics are computed
 (it may only narrow — asking for more is a `400`, not a silent clamp), and
 `?after=` continues from a previous page's `next`.
+
+### Time series
+
+`/stats` merges the window into one number per metric. `/series` gives the
+buckets back, which is the difference between knowing the average and knowing
+the shape:
+
+```
+curl -s "localhost:8080/series?name=svc.checkout.latency_ms"
+```
+
+```
+/stats    svc.spiky  avg=0.4      svc.steady  avg=0.4
+/series   svc.spiky  0.0 0.0 0.0 0.0 2.4 0.0
+          svc.steady 0.4 0.4 0.4 0.4 0.4 0.4
+```
+
+Each point carries the same fields as `/stats` plus the bucket's `start` in
+unix seconds, and the response echoes its own resolution (`"bucket":"10s"`) so
+you are not guessing how wide a point is. Nothing new is stored — these are
+the buckets the engine has kept since the beginning, read out instead of
+summed away.
+
+`?name=` is **required** here and repeatable: a series over a prefix scan
+would be the most expensive query this server can serve, and nobody plots a
+thousand lines. A metric with no live data is omitted rather than returned as
+zeroes, because a gap in a chart is not a run of zeroes. See
+[DESIGN.md](DESIGN.md) §39.
 
 **If you already know the name, ask for it directly.** `?name=` is repeatable
 and skips the store walk entirely, because the store is sharded by metric name

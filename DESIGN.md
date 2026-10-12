@@ -148,6 +148,11 @@ for *what* was decided and read in full only where the *why* matters.
 
 - [38. Rules an operator can write](#38-rules-an-operator-can-write)  
   An alerting system whose rules live in a Go function is one nobody but its author can configure, so rules come from a file — and the most valuable line in the change is the one that refuses unknown fields.
+
+**Reading time back out**
+
+- [39. The time dimension the store already kept](#39-the-time-dimension-the-store-already-kept)  
+  Six ten-second buckets per metric existed since §8 and every read collapsed them, so a steady metric and a spiky one with the same average were indistinguishable — `/series` stops discarding the shape.
 ## Design choices
 
 ### 1. Store the conclusion, not the events
@@ -2716,6 +2721,77 @@ metric nothing has reported.
 - *Rules are not reachable over HTTP.* There is no endpoint to add one, which
   would be a write API with authentication questions this project has
   deliberately avoided (§29).
+
+### 39. The time dimension the store already kept
+
+> **In one line:** Six ten-second buckets per metric existed since §8 and
+> every read collapsed them, so a steady metric and a spiky one with the same
+> average were indistinguishable — `/series` stops discarding the shape.
+
+§8 chopped time into buckets so a window query could sum the ones overlapping
+it. That is all any read has ever done with them: `mergeBuckets` folds a
+metric's buckets into one `Agg`, and the shape of the time *inside* the window
+goes out with the folding.
+
+The cost of that is easy to state. A metric averaging 0.4 over the minute
+reads identically whether it sat at 0.4 the whole time or was idle for fifty
+seconds and pinned at 2.4 for ten:
+
+```
+/stats    svc.spiky  avg=0.4      svc.steady  avg=0.4
+/series   svc.spiky  0.0 0.0 0.0 0.0 2.4 0.0
+          svc.steady 0.4 0.4 0.4 0.4 0.4 0.4
+```
+
+Nothing new is stored. This is the data §8 has been keeping all along, read
+out instead of summed away.
+
+**`?name=` is required, and that is a bound rather than an omission.** A
+series over a prefix scan is the most expensive thing this server can be
+asked for — every matching metric, every bucket, a sort each — and nobody
+plots a thousand lines. Requiring names makes the cost a function of what was
+asked for rather than of what the store happens to hold, and reuses §37's
+lookup, so a series does no walk at all.
+
+**Charged per bucket, not per metric.** Each bucket is a sort of its own, so
+a metric with six of them costs about six times one with a single bucket, and
+§35's whole argument is that the bill tracks the work rather than the request.
+
+**A metric with nothing live is absent, not an empty array.** A gap in a chart
+is not a run of zeroes, and a client drawing one has to be able to tell the
+difference. Absence is also the answer `/stats` already gives for a metric
+whose buckets have aged out, so the two endpoints agree about what "no data"
+looks like.
+
+**Each bucket is copied with a private histogram under the shard lock.**
+Quantiles sort, and sorting a histogram the store is still writing to is a
+data race; sorting inside the lock would hold a shard shut for as many sorts
+as the metric has buckets. So the copy happens under the lock and the sorts
+happen outside it — the trade `mergeBuckets` already makes (§23, §28), applied
+once per bucket instead of once per metric.
+
+That property needed a better test than it first got. The obvious one — read a
+series, write to the store, check the numbers did not move — passes against an
+aliasing implementation, because the handler computes quantiles immediately
+and the test is comparing numbers already decoded out of JSON. The real check
+is on `seriesFor`, before any quantile is computed, plus a concurrent-write
+test for the race detector to find something in (§22).
+
+**The budget refusal is now one helper**, shared by both read endpoints. It
+had already drifted once — the `Retry-After` was a hardcoded second until a
+review caught that it had to name the epoch — and a second copy of a limit is
+a second thing to get wrong.
+
+**What this deliberately does not do.**
+
+- *No resolution other than the store's.* Points are `bucketWidth` wide
+  because that is what exists; a `?step=` that re-buckets would be
+  interpolation over data this server does not keep (§1).
+- *No range beyond retention.* The window is still capped at 60s, so this
+  plots the last minute and nothing older — §32 persists the aggregates
+  across a restart, not a history.
+- *No aggregation across metrics.* Six names give six series, not a sum; a
+  query language is a different project.
 
 ## Testing
 
