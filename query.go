@@ -125,6 +125,31 @@ func parseStatsQuery(r *http.Request) (statsQuery, error) {
 	return q, nil
 }
 
+// refuseOverBudget answers the request and reports true when the caller has
+// no query budget left (§35).
+//
+// Shared by every read endpoint rather than copied into each, because a
+// limit with two implementations is a limit that will eventually have two
+// behaviours - and this one already drifted once: the Retry-After here was
+// a hardcoded second until a review pointed out it had to name the epoch.
+// A second copy would still be wrong.
+func (s *Store) refuseOverBudget(w http.ResponseWriter, c *client, now time.Time) bool {
+	if c.allowQuery(now) {
+		return false
+	}
+
+	s.counts.addQueryRefused()
+	// The epoch, not a second. The budget refills on the epoch boundary, so
+	// a compliant client told to wait one second simply spends nine more
+	// refusals discovering that - the same reasoning batch.go and the
+	// cardinality refusal already use.
+	w.Header().Set("Retry-After", strconv.Itoa(int(queryEpoch.Seconds())))
+	http.Error(w, fmt.Sprintf(
+		"this client is over its query budget (%d metric-equivalents per %s)",
+		maxQueryCostPerEpoch, queryEpoch), http.StatusTooManyRequests)
+	return true
+}
+
 // lookupNames resolves an exact ?name= set without walking the store.
 //
 // This is the whole point of §37. The shard a metric lives in is a pure
@@ -279,16 +304,7 @@ func (s *Store) handleStats(w http.ResponseWriter, r *http.Request) {
 	// is bounded by §28's per-request limit and is the price of pricing
 	// work accurately rather than guessing at it beforehand.
 	c, _ := clientFrom(r.Context())
-	if !c.allowQuery(now) {
-		s.counts.addQueryRefused()
-		// The epoch, not a second. The budget refills on the epoch
-		// boundary, so a compliant client told to wait one second simply
-		// spends nine more refusals discovering that - the same reasoning
-		// batch.go and the cardinality refusal already use.
-		w.Header().Set("Retry-After", strconv.Itoa(int(queryEpoch.Seconds())))
-		http.Error(w, fmt.Sprintf(
-			"this client is over its query budget (%d metric-equivalents per %s)",
-			maxQueryCostPerEpoch, queryEpoch), http.StatusTooManyRequests)
+	if s.refuseOverBudget(w, c, now) {
 		return
 	}
 

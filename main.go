@@ -497,6 +497,7 @@ func routes(s *Store, a *Alerter, l *limiter, cs *clients) http.Handler {
 		"/ingest":       allow(http.MethodPost, s.handleIngest),
 		"/ingest/batch": allow(http.MethodPost, s.handleIngestBatch),
 		"/stats":        allow(http.MethodGet, s.handleStats),
+		"/series":       allow(http.MethodGet, s.handleSeries),
 		"/alerts":       allow(http.MethodGet, a.handleAlerts),
 	}
 	// identify wraps the limiter rather than the other way round, because
