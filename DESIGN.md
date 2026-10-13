@@ -158,6 +158,11 @@ for *what* was decided and read in full only where the *why* matters.
 
 - [40. Ingest allocates nothing per event](#40-ingest-allocates-nothing-per-event)  
   The store already holds every metric name as a map key, so an event for a metric that exists needs no name string at all — a batch of ten thousand went from 10 051 allocations to 15.
+
+**Reads against the firehose**
+
+- [41. What a series costs the firehose](#41-what-a-series-costs-the-firehose)  
+  Computing a series under the shard lock makes the read 31% faster and 54% leaner and costs ingest 2.7×, so §39's copy stays — and the "don't hold a lock across sorts" rule now has a measurement at the scale of one metric, not a thousand.
 ## Design choices
 
 ### 1. Store the conclusion, not the events
@@ -2869,6 +2874,72 @@ one event could not see the thing the change is about.
 - *The name is not interned across shards.* Two shards holding the same string
   value hold two copies. Thirty-two copies of a name is bounded and
   irrelevant; sharing them would need exactly the table this avoided.
+
+### 41. What a series costs the firehose
+
+> **In one line:** Computing a series under the shard lock makes the read 31%
+> faster and 54% leaner and costs ingest 2.7×, so §39's copy stays — and the
+> "don't hold a lock across sorts" rule now has a measurement at the scale of
+> one metric, not a thousand.
+
+§34 set the rule that every query path gets measured. §39 shipped `/series`
+without following it, so the first job here was the benchmark that should
+have come with it:
+
+| | ns/op | allocations |
+| --- | --- | --- |
+| `/series`, one metric, six buckets | 12 026 | 57 |
+| `/stats`, the same metric | 4 909 | 20 |
+| per name, at 1 / 6 / 24 names | 13 022 / 12 071 / 12 229 | flat |
+
+Two things that settles. The per-name cost is flat, so §39's requirement of
+`?name=` really does bound a series by what was asked for rather than by what
+the store holds. And a series costs about 2.4× the merged answer, which is
+the shape to expect from six small merges and six small sorts instead of one
+of each.
+
+**The 57 allocations invite an obvious simplification.** Nine and a half per
+bucket, and most of them exist to copy a histogram that is sorted once and
+discarded. `quantiles` builds its own slice rather than mutating the
+histogram it reads, so the copy is avoidable: compute the points under the
+shard lock and hand back only numbers.
+
+Measured, that is a real improvement to the read and an unacceptable bill for
+the write:
+
+| | copy (kept) | under the lock |
+| --- | --- | --- |
+| `/series`, one metric | 13 140 ns | **9 076 ns** |
+| allocations | 57 | **26** |
+| `record`, no queriers | 134 ns | 144 ns |
+| `record`, 1 querier | 271 ns | **740 ns** |
+| `record`, 4 queriers | 1 113 ns | **2 603 ns** |
+
+**Rejected.** §34 turned down an `RWMutex` for costing ingest 15–19%; this
+costs 170% to make a read 31% faster — a read no dashboard performs in a
+loop, against a write path that is the first clause of §1. The arithmetic is
+not close.
+
+It is also worth having as evidence rather than as doctrine. §28 and §34
+argued that holding a shard lock across sorts is what hurts the write path,
+and measured it at the scale of a thousand metrics in one shard. This is the
+same claim at the scale of one metric's six buckets, where it was much less
+obvious that it would still hold — and it does, by a factor of nearly three.
+
+So §39's design was right, and there is now a number saying so instead of an
+assumption. The benchmark stays checked in, because the next person to have
+this idea should be handed the data rather than the idea.
+
+**What this deliberately does not do.**
+
+- *It does not chase the remaining 26 allocations.* They are the quantile
+  slices and the response, and a dashboard asking for six series pays 72 µs.
+  There is no evidence anyone is waiting on that.
+- *It does not measure a series under a real firehose.* The contention numbers
+  here come from queriers looping with no think time on 16 cores, so they
+  mix lock contention with CPU competition — which is the worst case and the
+  right one for rejecting something, but not a figure to quote as the cost of
+  a dashboard.
 
 ## Testing
 
