@@ -988,3 +988,50 @@ func BenchmarkSeriesByNameCount(b *testing.B) {
 		})
 	}
 }
+
+// What a series costs ingest. The current design copies each bucket under
+// the shard lock and sorts outside it; the alternative computes quantiles
+// under the lock and copies nothing. This is the number that decides
+// between them, because §34 measured that holding a shard lock across
+// sorts is what hurts the write path.
+func BenchmarkRecordUnderSeries(b *testing.B) {
+	for _, queriers := range []int{0, 1, 4} {
+		b.Run(fmt.Sprintf("queriers=%d", queriers), func(b *testing.B) {
+			s := seriesStore(200)
+			names := storeNames(s)
+			now := time.Now()
+			ts := now.UnixMilli()
+
+			done := make(chan struct{})
+			var wg sync.WaitGroup
+			for q := 0; q < queriers; q++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					w := &discardWriter{}
+					req := httptest.NewRequest(http.MethodGet,
+						"/series?name=svc.metric.42", nil)
+					for {
+						select {
+						case <-done:
+							return
+						default:
+							s.handleSeries(w, req)
+						}
+					}
+				}()
+			}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				name := names[i%len(names)]
+				_ = s.record(now, Event{Name: name, Value: float64(i%17) + 1, TS: ts})
+			}
+			b.StopTimer()
+
+			close(done)
+			wg.Wait()
+		})
+	}
+}
