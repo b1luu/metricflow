@@ -322,3 +322,48 @@ func TestSeriesRejectsNonGET(t *testing.T) {
 		t.Errorf("POST /series: status = %d, want 405", rec.Code)
 	}
 }
+
+// Every point must sit on the grid the response claims (§42).
+//
+// §39 added the "bucket" field so a client plotting these would not have to
+// assume how wide a point is. That field is a promise, and a restored
+// snapshot from a different bucketWidth used to break it: the series came
+// back with points at irregular intervals, some off the grid entirely,
+// under a header still claiming they were all the current width.
+func TestEverySeriesPointSitsOnTheGridTheResponseClaims(t *testing.T) {
+	s := newStore()
+	now := time.Now()
+	for i := 0; i < numBuckets; i++ {
+		recordAt(t, s, "m", float64(i+1), now.Add(-time.Duration(i)*bucketWidth))
+	}
+
+	resp := getSeries(t, s, "?name=m")
+
+	claimed, err := time.ParseDuration(resp.Bucket)
+	if err != nil {
+		t.Fatalf("the response claims a bucket width of %q, which is not a duration", resp.Bucket)
+	}
+	secs := int64(claimed / time.Second)
+	if secs <= 0 {
+		t.Fatalf("claimed bucket width %s is not usable", claimed)
+	}
+
+	points := resp.Series["m"]
+	if len(points) == 0 {
+		t.Fatal("no points")
+	}
+	for _, p := range points {
+		if p.Start%secs != 0 {
+			t.Errorf("point at %d is not a multiple of the %s the response claims",
+				p.Start, claimed)
+		}
+	}
+	// And consecutive points are exactly one claimed width apart, which is
+	// the other half of what makes the field meaningful.
+	for i := 1; i < len(points); i++ {
+		if gap := points[i].Start - points[i-1].Start; gap != secs {
+			t.Errorf("points %d and %d are %ds apart, not the %s claimed",
+				i-1, i, gap, claimed)
+		}
+	}
+}

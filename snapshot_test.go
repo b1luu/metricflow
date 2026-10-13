@@ -369,8 +369,9 @@ func TestAbsurdLengthsAreRefusedRatherThanAllocated(t *testing.T) {
 	recordNow(s, "svc.metric", 1)
 	good := s.snapshot(now)
 
-	// The metric count sits right after the magic and the timestamp.
-	countAt := len(snapMagic) + 8
+	// The metric count sits after the magic, the timestamp and the bucket
+	// grid (§42).
+	countAt := len(snapMagic) + 8 + 4
 
 	for _, claim := range []uint32{1 << 20, 1 << 28, math.MaxUint32} {
 		bad := append([]byte(nil), good...)
@@ -1416,5 +1417,128 @@ func awaitSelfMetric(t *testing.T, addr, name string) MetricStats {
 			t.Fatalf("%s was never published", name)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// --- the bucket grid (§42) ---
+
+// rechecksum fixes up the trailing CRC after a snapshot has been edited, so
+// a test exercises the check it means to rather than the checksum.
+func rechecksum(b []byte) []byte {
+	binary.LittleEndian.PutUint32(b[len(b)-4:], crc32.Checksum(b[:len(b)-4], crcTable))
+	return b
+}
+
+// gridAt is where the bucket grid sits in the header: after the magic and
+// the written-at timestamp.
+func gridAt() int { return len(snapMagic) + 8 }
+
+// A snapshot written on a different bucket grid must be refused.
+//
+// Bucket keys are absolute unix seconds, so a 15-second bucket and a
+// 10-second one look identical from the key alone. Restoring across a
+// change used to succeed in silence and leave one metric with buckets on
+// two grids at once.
+func TestASnapshotFromADifferentGridIsRefused(t *testing.T) {
+	s := newStore()
+	recordNow(s, "svc.metric", 1)
+
+	bad := append([]byte(nil), s.snapshot(time.Now())...)
+	binary.LittleEndian.PutUint32(bad[gridAt():], 15) // a 15s grid
+	bad = rechecksum(bad)
+
+	_, _, err := decodeSnapshot(bad)
+	if err == nil {
+		t.Fatal("a snapshot from a 15s grid was accepted by a 10s server")
+	}
+	if !strings.Contains(err.Error(), "grid") {
+		t.Errorf("error = %q; it should say the grid was the problem", err)
+	}
+}
+
+// And the grid a snapshot records has to be the one it was written on, or
+// the check above is comparing against a lie.
+func TestASnapshotRecordsItsOwnGrid(t *testing.T) {
+	s := newStore()
+	recordNow(s, "svc.metric", 1)
+	blob := s.snapshot(time.Now())
+
+	got := binary.LittleEndian.Uint32(blob[gridAt():])
+	if want := uint32(bucketWidth / time.Second); got != want {
+		t.Errorf("snapshot records a %ds grid, want %ds", got, want)
+	}
+
+	// And it round-trips, which the rest of the suite would catch but is
+	// worth stating next to the two negative cases.
+	if _, _, err := decodeSnapshot(blob); err != nil {
+		t.Errorf("a snapshot this server wrote did not decode: %v", err)
+	}
+}
+
+// A file can disagree with its own header: a key corrupted into a valid
+// checksum, or a snapshot assembled by something that is not this code. A
+// key off the grid is the one kind of damage that survives restore and
+// surfaces later as a chart with points at intervals the server says are
+// impossible, so it is refused at decode.
+func TestABucketKeyOffTheGridIsRefused(t *testing.T) {
+	s := newStore()
+	now := time.Now()
+	recordNow(s, "svc.metric", 1)
+	good := s.snapshot(now)
+
+	// Find the key and nudge it off the grid. It is the first 8 bytes of
+	// the single metric's single bucket, after the header, the name and
+	// the bucket count.
+	keyAt := len(snapMagic) + 8 + 4 + 4 + 2 + len("svc.metric") + 4
+	key := int64(binary.LittleEndian.Uint64(good[keyAt:]))
+	if key%int64(bucketWidth/time.Second) != 0 {
+		t.Fatalf("setup: located %d, which is not a bucket key", key)
+	}
+
+	bad := append([]byte(nil), good...)
+	binary.LittleEndian.PutUint64(bad[keyAt:], uint64(key+1))
+	bad = rechecksum(bad)
+
+	_, _, err := decodeSnapshot(bad)
+	if err == nil {
+		t.Fatal("a bucket key off the grid was accepted")
+	}
+	if !strings.Contains(err.Error(), "grid") {
+		t.Errorf("error = %q; it should say the key is off the grid", err)
+	}
+}
+
+// The whole point, end to end: a snapshot the server cannot trust leaves it
+// starting empty and saying so, rather than serving a store whose buckets
+// sit on two grids. §33's machinery handles it unchanged, because the grid
+// mismatch is reported as a decode failure like any other.
+func TestAGridMismatchStartsEmptyAndSaysSo(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "snap.bin")
+
+	s := newStore()
+	recordNow(s, "svc.metric", 1)
+	bad := append([]byte(nil), s.snapshot(time.Now())...)
+	binary.LittleEndian.PutUint32(bad[gridAt():], 15)
+	bad = rechecksum(bad)
+
+	for _, p := range []string{path, path + ".prev"} {
+		if err := os.WriteFile(p, bad, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	restored := newStore()
+	res := newSnapshotter(restored, path).restore(time.Now())
+	if res.from != "" {
+		t.Errorf("restored from %q; a grid mismatch must not be loaded", res.from)
+	}
+	if len(res.problems) != 2 {
+		t.Errorf("problems = %v, want one per unusable file", res.problems)
+	}
+	for _, p := range res.problems {
+		if !strings.Contains(p, "grid") {
+			t.Errorf("problem %q does not mention the grid", p)
+		}
 	}
 }

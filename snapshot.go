@@ -53,7 +53,12 @@ const (
 	// snapMagic identifies the file and its layout. The version is part of
 	// the magic rather than a separate field so a format change cannot be
 	// mistaken for corruption, or corruption for a format change.
-	snapMagic = "MFSNAP\x00\x01"
+	// \x02 because §42 added the bucket grid to the header. Bumping it
+	// means a snapshot written by a \x01 binary is refused as "written by a
+	// different version", and the server starts empty once - the cost §32
+	// already accepted for having no format migration, and a cheaper one
+	// than reading a file whose grid cannot be known.
+	snapMagic = "MFSNAP\x00\x02"
 
 	// maxSnapshotBytes bounds what will be read back. The theoretical
 	// maximum is a full store - 32 shards x 1024 metrics x 6 buckets with
@@ -92,6 +97,12 @@ func (s *Store) snapshot(now time.Time) []byte {
 	var b []byte
 	b = append(b, snapMagic...)
 	b = binary.LittleEndian.AppendUint64(b, uint64(now.UnixMilli()))
+
+	// The grid the bucket keys sit on (§42). Without it, a snapshot written
+	// by a binary with a different bucketWidth restores onto the wrong grid
+	// in silence: the keys are absolute unix seconds, so nothing about a
+	// key says how wide the bucket it names is meant to be.
+	b = binary.LittleEndian.AppendUint32(b, uint32(bucketWidth/time.Second))
 
 	// The metric count is patched in once known, so the store's locks are
 	// never held while counting separately.
@@ -253,7 +264,8 @@ func decodeSnapshot(b []byte) ([]snapshotMetric, time.Time, error) {
 		return nil, zero, fmt.Errorf("snapshot is %d bytes, over the %d-byte limit",
 			len(b), maxSnapshotBytes)
 	}
-	if len(b) < len(snapMagic)+4 {
+	// magic + written-at + grid + count + trailing checksum.
+	if len(b) < len(snapMagic)+8+4+4+4 {
 		return nil, zero, errors.New("snapshot is too short to be one")
 	}
 	if string(b[:len(snapMagic)]) != snapMagic {
@@ -270,9 +282,29 @@ func decodeSnapshot(b []byte) ([]snapshotMetric, time.Time, error) {
 	r := &reader{b: body, i: len(snapMagic)}
 
 	written := time.UnixMilli(int64(r.uint64()))
+	grid := r.uint32()
 	n := r.uint32()
 	if r.err != nil {
 		return nil, zero, r.err
+	}
+
+	// A snapshot is only meaningful under the grid that wrote it.
+	//
+	// Bucket keys are absolute unix seconds, so a 15-second bucket and a
+	// 10-second one are indistinguishable from the key alone - which is
+	// why this has to be recorded rather than inferred. Restoring across a
+	// change used to succeed silently and leave one metric with buckets on
+	// two grids at once; /series then reported points at irregular
+	// intervals, some of them not on this server's grid at all, under a
+	// "bucket" field claiming they were all the current width.
+	//
+	// Refused as a decode failure rather than handled specially, so it
+	// reaches §33's machinery unchanged: the older generation is tried, and
+	// if that is no better the server starts empty and says why.
+	if want := uint32(bucketWidth / time.Second); grid != want {
+		return nil, zero, fmt.Errorf(
+			"snapshot was written on a %ds bucket grid; this server uses %ds",
+			grid, want)
 	}
 	// Sized against the bytes actually left rather than against the count
 	// the file claims: the smallest possible metric is a few bytes, so a
@@ -325,6 +357,19 @@ func readMetric(r *reader) snapshotMetric {
 
 func readBucket(r *reader) (int64, *Agg) {
 	key := int64(r.uint64())
+
+	// Every key is a bucket start, so every key is a multiple of the grid
+	// width. The header already says which grid the file was written on
+	// (§42), but a file can disagree with its own header - a corrupt key
+	// that still checksums, or a snapshot assembled by something other
+	// than this code - and a key off the grid is the one kind of damage
+	// that survives restore and shows up later as a chart with points at
+	// intervals the server claims are impossible.
+	if secs := int64(bucketWidth / time.Second); key%secs != 0 {
+		r.fail(fmt.Errorf("bucket key %d is not a multiple of the %ds grid", key, secs))
+		return 0, nil
+	}
+
 	a := &Agg{
 		Count: int(r.uint64()),
 		Sum:   r.float64(),
