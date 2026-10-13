@@ -919,3 +919,72 @@ func BenchmarkStatsBySixNames(b *testing.B) {
 		s.handleStats(w, req)
 	}
 }
+
+// --- the series path (§39), which shipped without a benchmark ---
+
+// seriesStore fills n metrics with every bucket in the window populated, so
+// a series query has the most points it can have.
+func seriesStore(n int) *Store {
+	s := newStore()
+	now := time.Now()
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("svc.metric.%d", i)
+		for b := 0; b < numBuckets; b++ {
+			at := now.Add(-time.Duration(b) * bucketWidth)
+			for v := 0; v < 20; v++ {
+				_ = s.record(now, Event{Name: name, Value: float64(v%17) + 1, TS: at.UnixMilli()})
+			}
+		}
+	}
+	return s
+}
+
+// One metric's full series, against the single merged answer /stats gives
+// for the same metric. A series does one merge and one sort per bucket, so
+// this is where §34's deferred hist.merge cost actually lands.
+func BenchmarkSeriesOneMetric(b *testing.B) {
+	s := seriesStore(200)
+	w := &discardWriter{}
+	series := httptest.NewRequest(http.MethodGet, "/series?name=svc.metric.42", nil)
+	stats := httptest.NewRequest(http.MethodGet, "/stats?name=svc.metric.42", nil)
+
+	b.Run("series", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			s.handleSeries(w, series)
+		}
+	})
+	b.Run("stats-for-comparison", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			s.handleStats(w, stats)
+		}
+	})
+}
+
+// How a series scales with the names asked for, which is what bounds it:
+// §39 requires ?name= precisely so the cost cannot be a function of store
+// size.
+func BenchmarkSeriesByNameCount(b *testing.B) {
+	s := seriesStore(200)
+	w := &discardWriter{}
+
+	for _, names := range []int{1, 6, 24} {
+		q := "/series?name=svc.metric.0"
+		for i := 1; i < names; i++ {
+			q += fmt.Sprintf("&name=svc.metric.%d", i)
+		}
+		req := httptest.NewRequest(http.MethodGet, q, nil)
+		b.Run(fmt.Sprintf("names=%d", names), func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				s.handleSeries(w, req)
+			}
+			b.StopTimer()
+			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N)/float64(names), "ns/name")
+		})
+	}
+}
