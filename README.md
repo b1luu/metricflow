@@ -149,6 +149,21 @@ snapshot: snap.bin is unusable: snapshot checksum is 6b1d4f02, want c0a93e17
 restored 3 metrics (3 buckets) from snap.bin.prev, 0 dropped as stale
 ```
 
+The header records the bucket grid the keys were written on, and a snapshot
+from a different one is refused. Bucket keys are absolute unix seconds, so a
+15-second bucket and a 10-second one look identical from the key alone — a
+server with a changed `bucketWidth` used to restore an old snapshot onto the
+wrong grid in silence, which `/series` then reported as points at irregular
+intervals under a header claiming they were all the current width:
+
+```
+snap.bin is unusable: snapshot was written on a 15s bucket grid;
+this server uses 10s
+```
+
+Changing the format costs a deployment one window, once, because the version
+lives in the magic so a format change cannot be mistaken for corruption.
+
 A bad *path* still stops startup — that is a configuration error, and refusing
 is the only way to make it visible. A *corrupt file* does not. Refusing there
 would turn a damaged cache into a crash loop nobody can break without deleting

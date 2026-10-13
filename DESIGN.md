@@ -163,6 +163,11 @@ for *what* was decided and read in full only where the *why* matters.
 
 - [41. What a series costs the firehose](#41-what-a-series-costs-the-firehose)  
   Computing a series under the shard lock makes the read 31% faster and 54% leaner and costs ingest 2.7×, so §39's copy stays — and the "don't hold a lock across sorts" rule now has a measurement at the scale of one metric, not a thousand.
+
+**The snapshot format**
+
+- [42. A snapshot is only meaningful on the grid that wrote it](#42-a-snapshot-is-only-meaningful-on-the-grid-that-wrote-it)  
+  Bucket keys are absolute unix seconds, so a 15-second bucket is indistinguishable from a 10-second one — the header now records the grid, and §39 is the reason this stopped being invisible.
 ## Design choices
 
 ### 1. Store the conclusion, not the events
@@ -2940,6 +2945,86 @@ this idea should be handed the data rather than the idea.
   mix lock contention with CPU competition — which is the worst case and the
   right one for rejecting something, but not a figure to quote as the cost of
   a dashboard.
+
+### 42. A snapshot is only meaningful on the grid that wrote it
+
+> **In one line:** Bucket keys are absolute unix seconds, so a 15-second
+> bucket is indistinguishable from a 10-second one — the header now records
+> the grid, and §39 is the reason this stopped being invisible.
+
+§32 chose to record the magic, the write time and the metric count, and
+nothing about the bucketing. That was fine for as long as every read merged
+the buckets away before anyone saw them, which was every read until §39.
+
+**The hole.** A bucket key is the bucket's start in unix seconds. Nothing
+about the number says how wide the bucket it names is meant to be, so a
+binary built with a different `bucketWidth` restored an old snapshot straight
+onto the wrong grid — accepted in silence, `dropped=0` — leaving one metric
+with buckets on two grids simultaneously. Probed with a 15-second snapshot
+restored by a 10-second server:
+
+```
+loaded=1 dropped=0        <- accepted without complaint
+start=...295  aligned-to-10s=false
+start=...310  aligned-to-10s=true   (+15s)
+start=...325  aligned-to-10s=false  (+15s)
+start=...340  aligned-to-10s=true   (+15s)
+start=...350  aligned-to-10s=true   (+10s)
+```
+
+Points at irregular intervals, two of them off the grid entirely, and all of
+it under the `"bucket":"10s"` field §39 added precisely so a client plotting
+them would not have to assume. **The server was lying about its own
+resolution**, which is the sharpest way to state why this is a bug rather
+than an oddity: §39 made that field a promise, and this broke it.
+
+**Two defences, because they catch different things.**
+
+The header records the grid, which catches a genuine cross-version restore.
+And every bucket key is checked against it while decoding, which catches a
+file that disagrees with its own header — a key corrupted into a still-valid
+checksum, or a snapshot assembled by something other than this code. The
+first alone is not enough: a file can claim a 10-second grid and carry
+15-second keys, which is exactly what the probe above did.
+
+Both are reported as ordinary decode failures rather than handled specially,
+so §33's machinery applies unchanged: the older generation is tried, and if
+it is no better the server starts empty and says why.
+
+**The version goes to ``**, so a snapshot written by a `` binary is
+refused as "written by a different version" and a deployment upgrading to
+this loses its window once. That is the cost §32 accepted when it chose to
+have no format migration, and it is the cheaper half of the trade: the
+alternative is reading a file whose grid cannot be known.
+
+**Live**, with two binaries built from this tree, one at 15s and one at 10s:
+
+```
+snap.bin is unusable: snapshot was written on a 15s bucket grid;
+this server uses 10s
+snap.bin.prev is unusable: snapshot was written on a 15s bucket grid;
+this server uses 10s
+WARNING: no usable snapshot ...; starting with an empty store.
+The last 1m0s of aggregates is gone.
+```
+
+Both generations refused with the real cause named, then a loud empty start,
+then a server that serves. That is §33's policy doing its job for a failure
+it was not written for.
+
+**What this deliberately does not do.**
+
+- *It does not migrate across grids.* Rebucketing 15-second data onto a
+  10-second grid means splitting counts and histograms that were never
+  recorded separately, which is interpolation dressed as recovery. Refusing
+  is honest; one lost window is the bound.
+- *It does not record `window` or `numBuckets`.* Only the grid changes what a
+  key means. A changed window is already handled correctly, because restore
+  drops whatever falls outside it — that is retention (§10), not loss.
+- *It does not make the version a separate field.* §32's argument still
+  holds: with the version inside the magic, a format change cannot be
+  mistaken for corruption or corruption for a format change. The cost is that
+  every format change spends one window, and this section spent it.
 
 ## Testing
 
