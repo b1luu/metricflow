@@ -33,6 +33,7 @@ type BucketStats struct {
 // the retention actually applied, exactly as /stats does.
 type SeriesResponse struct {
 	Window string                   `json:"window"`
+	Covers string                   `json:"covers"`
 	Bucket string                   `json:"bucket"`
 	Series map[string][]BucketStats `json:"series"`
 }
@@ -100,6 +101,7 @@ func (s *Store) handleSeries(w http.ResponseWriter, r *http.Request) {
 	cutoff := windowStart(now, q.window)
 	resp := SeriesResponse{
 		Window: q.window.String(),
+		Covers: covered(now, cutoff).String(),
 		Bucket: bucketWidth.String(),
 		Series: make(map[string][]BucketStats, len(q.names)),
 	}

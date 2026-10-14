@@ -327,6 +327,7 @@ func (s *Store) handleStats(w http.ResponseWriter, r *http.Request) {
 
 	resp := StatsResponse{
 		Window:  q.window.String(),
+		Covers:  covered(now, cutoff).String(),
 		Metrics: make(map[string]MetricStats, len(names)),
 		Matched: matched,
 		// A named query returns exactly what was asked for, so there is

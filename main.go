@@ -358,8 +358,28 @@ func (s *Store) aggFor(name string, cutoff int64) (Agg, bool) {
 
 // windowStart returns the bucket key marking the start of a window of
 // size d ending at now: any bucket with a key >= this is inside the window.
+//
+// It truncates downwards, so the window it opens is always at least d and
+// can be up to one bucketWidth more. That is deliberate - see covered - and
+// it is the right direction to err: the alternative excludes a bucket that
+// is partly inside the window, which drops recent data from an answer about
+// the recent past.
 func windowStart(now time.Time, d time.Duration) int64 {
 	return now.Add(-d).Truncate(bucketWidth).Unix()
+}
+
+// covered is how much time a query actually looked at, which is not the
+// window it was asked for (§43).
+//
+// Buckets are the unit of retention, so a window can only be honoured to
+// bucketWidth. Asking for a minute at ten-second buckets reaches back
+// between 60 and 69 seconds depending on where in the current bucket the
+// request lands, and returns seven buckets rather than the six numBuckets
+// implies. Every read path reports this beside the window it was given, so
+// a caller is told what it got rather than what it asked for - the call §11
+// made for an over-long window and §28 for an over-large limit.
+func covered(now time.Time, cutoff int64) time.Duration {
+	return time.Duration(now.Unix()-cutoff) * time.Second
 }
 
 // allow wraps a handler so it only runs for one HTTP method. Anything
@@ -519,6 +539,7 @@ type MetricStats struct {
 // len(Metrics) can be smaller than both Matched and the limit.
 type StatsResponse struct {
 	Window    string                 `json:"window"`
+	Covers    string                 `json:"covers"`
 	Metrics   map[string]MetricStats `json:"metrics"`
 	Matched   int                    `json:"matched"`
 	Truncated bool                   `json:"truncated"`
