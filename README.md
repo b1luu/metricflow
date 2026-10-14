@@ -310,8 +310,16 @@ much at once*, this is *too much work*. See [DESIGN.md](DESIGN.md) §34 and §35
 the store holds, and says so:
 
 ```json
-{"window":"1m0s","metrics":{...},"matched":32768,"truncated":true,"next":"svc.api.z"}
+{"window":"1m0s","covers":"1m5s","metrics":{...},"matched":32768,"truncated":true,"next":"svc.api.z"}
 ```
+
+`window` is what you asked for; **`covers` is what was actually looked at.**
+A window is only honoured to the nearest bucket, so a request for a minute
+reaches back between 60 and 69 seconds and returns seven buckets rather than
+the six you would get by dividing. Rounding this way is deliberate — the
+alternative drops a bucket that is partly inside the window, losing the most
+recent data from an answer about the recent past — but the response says so
+rather than leaving you to discover it. See [DESIGN.md](DESIGN.md) §43.
 
 `?prefix=` narrows by name, `?limit=` narrows how many metrics are computed
 (it may only narrow — asking for more is a `400`, not a silent clamp), and

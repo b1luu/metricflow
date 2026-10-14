@@ -168,6 +168,11 @@ for *what* was decided and read in full only where the *why* matters.
 
 - [42. A snapshot is only meaningful on the grid that wrote it](#42-a-snapshot-is-only-meaningful-on-the-grid-that-wrote-it)  
   Bucket keys are absolute unix seconds, so a 15-second bucket is indistinguishable from a 10-second one — the header now records the grid, and §39 is the reason this stopped being invisible.
+
+**What a window really means**
+
+- [43. A window is only honoured to the nearest bucket](#43-a-window-is-only-honoured-to-the-nearest-bucket)  
+  Asking for a minute reaches back between 60 and 69 seconds and returns seven buckets, not six — §25 noticed and left it, §39 made it visible, and the responses now say what they actually covered.
 ## Design choices
 
 ### 1. Store the conclusion, not the events
@@ -3025,6 +3030,83 @@ it was not written for.
   holds: with the version inside the magic, a format change cannot be
   mistaken for corruption or corruption for a format change. The cost is that
   every format change spends one window, and this section spent it.
+
+### 43. A window is only honoured to the nearest bucket
+
+> **In one line:** Asking for a minute reaches back between 60 and 69 seconds
+> and returns seven buckets, not six — §25 noticed and left it, §39 made it
+> visible, and the responses now say what they actually covered.
+
+`windowStart` truncates downwards, so the cutoff it returns is the start of
+the bucket containing `now - d`, which is up to one `bucketWidth` earlier
+than `now - d` itself:
+
+```
+offset=0s into the bucket: 7 buckets inside a 1m0s window; cutoff 1m0s before now
+offset=5s into the bucket: 7 buckets inside a 1m0s window; cutoff 1m5s before now
+offset=9s into the bucket: 7 buckets inside a 1m0s window; cutoff 1m9s before now
+```
+
+**Truncating down is the right direction to err.** Rounding up would exclude
+a bucket that is partly inside the window, which means dropping the most
+recent data from an answer about the recent past — the worst thing a
+monitoring system can quietly do. Including a little extra history is the
+cheaper mistake.
+
+**§25 noticed this and left it, and that was reasonable at the time.** Every
+read path merged the buckets into one number before anyone saw them, so the
+only consequence was that an average covered slightly more than a minute.
+§39 stopped doing that. A client plotting a series gets one point per bucket,
+computes `60/10 = 6`, and receives seven — which looks like a bug in their
+code rather than a rounding rule in ours.
+
+So both read endpoints report `covers` beside `window`: what was asked for,
+and what was actually looked at.
+
+```json
+{"window":"1m0s", "covers":"1m5s", "bucket":"10s", ...}
+```
+
+That is the call §11 made for an over-long window and §28 for an over-large
+limit. A caller who asks for one thing and silently receives another has been
+handed wrong data with a `200` on it; the fix is not to change the answer but
+to stop describing it incorrectly. Nothing about the semantics moved — only
+the response stopped understating itself.
+
+**The same rounding applies to alert rules**, and is left alone deliberately.
+A rule with `Window: 30s` evaluates over 30 to 39 seconds. For `avg`, `max`
+and the percentiles that is a slightly smoother signal and nothing more; for
+`increase` it can read marginally high, which biases toward firing early
+rather than late — the right direction for an alert, and bounded by one
+bucket.
+
+**Two attempts at the test, and the first two both proved nothing.**
+
+A range check — `covers >= window && covers < window+bucketWidth` — passes
+against a handler that simply echoes the request back, because covering
+*exactly* the window is legitimate whenever a request lands on a bucket
+boundary. The lie and the truth are the same value one time in ten.
+
+Checking that the oldest point is exactly `covers` old does separate them,
+but only when the offset into the current bucket exceeds the comparison
+tolerance — so it caught broken code about 80% of the time, which is worse
+than not having it. The test now waits until the clock is at least three
+seconds into a bucket before asking, which is usually no wait at all and
+never more than three seconds, and the failure became deterministic: *"the
+oldest point is 1m8s old but the response claims to cover 1m0s"*.
+
+**What this deliberately does not do.**
+
+- *It does not make the window exact.* That needs sub-bucket resolution,
+  which §1 chose not to keep. The approximation is inherent to bucketing;
+  only the silence about it was fixable.
+- *It does not change `/alerts`.* A rule's effective window has the same
+  rounding, and exposing it per rule would be noise against a threshold
+  somebody chose by feel in the first place.
+- *It does not report coverage per metric.* A metric whose oldest bucket aged
+  out is covered by less than the response says. `covers` describes the query,
+  not each series in it, and `/series` already shows each one's true extent in
+  its points.
 
 ## Testing
 
