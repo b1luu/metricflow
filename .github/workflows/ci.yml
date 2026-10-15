@@ -740,3 +740,134 @@ jobs:
             sleep 0.2
           done
           echo "server did not exit within 20s of SIGTERM"; cat server.log; exit 1
+
+  # §44: SIGHUP re-reads the rules file. Its own job, and the only place
+  # this runs at all - Windows does not deliver SIGHUP, so the development
+  # machine can test reloadRules directly and never the signal that calls
+  # it. The same gap §22 exists for.
+  rulereload:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - run: go build -o metricflow .
+
+      - name: start with a rules file
+        run: |
+          cat > rules.json <<'JSON'
+          [
+            {"name":"before-reload","metric":"svc.a","stat":"max","op":">","value":1},
+            {"name":"watches-self","metric":"metricflow.requests.shed",
+             "stat":"increase","op":">","value":0}
+          ]
+          JSON
+
+          METRICFLOW_RULES=rules.json ./metricflow > server.log 2>&1 &
+          echo $! > server.pid
+          for i in $(seq 1 50); do
+            curl -sf localhost:8080/health > /dev/null && exit 0
+            sleep 0.2
+          done
+          echo "server never became healthy"; cat server.log; exit 1
+
+      - name: a HUP installs the edited rules
+        run: |
+          curl -sf localhost:8080/alerts | python3 -c "
+          import json,sys
+          names = sorted(a['rule'] for a in json.load(sys.stdin)['alerts'])
+          print('before:', names)
+          if names != ['before-reload', 'watches-self']:
+              sys.exit('unexpected starting rules: %s' % names)
+          "
+
+          cat > rules.json <<'JSON'
+          [
+            {"name":"after-reload","metric":"svc.b","stat":"avg","op":"<","value":9},
+            {"name":"watches-self","metric":"metricflow.requests.shed",
+             "stat":"increase","op":">","value":0}
+          ]
+          JSON
+
+          kill -HUP "$(cat server.pid)"
+          # The reload is handled on its own goroutine, so wait for it to
+          # show rather than assuming it is instant.
+          for i in $(seq 1 50); do
+            if curl -sf localhost:8080/alerts | grep -q "after-reload"; then
+              break
+            fi
+            sleep 0.2
+          done
+
+          curl -sf localhost:8080/alerts | python3 -c "
+          import json,sys
+          names = sorted(a['rule'] for a in json.load(sys.stdin)['alerts'])
+          print('after: ', names)
+          if 'after-reload' not in names:
+              sys.exit('the HUP did not install the new rule')
+          if 'before-reload' in names:
+              sys.exit('the replaced rule is still running')
+          "
+          grep -q "reloaded 2 alert rules" server.log             || { echo "no reload line in the log"; cat server.log; exit 1; }
+
+      # The property that makes reloading usable during an incident: a
+      # mistyped file must not take the running rules down with it.
+      - name: a bad file is refused and the running rules survive
+        run: |
+          cp rules.json good.json
+          cat > rules.json <<'JSON'
+          [{"name":"broken","metric":"svc.b","stat":"median","op":">","value":1}]
+          JSON
+
+          kill -HUP "$(cat server.pid)"
+          for i in $(seq 1 25); do
+            grep -q "reload failed" server.log && break
+            sleep 0.2
+          done
+          grep -q "reload failed, keeping the rules already loaded" server.log             || { echo "a bad file was not refused"; cat server.log; exit 1; }
+
+          curl -sf localhost:8080/alerts | python3 -c "
+          import json,sys
+          names = sorted(a['rule'] for a in json.load(sys.stdin)['alerts'])
+          print('after the bad file:', names)
+          if 'after-reload' not in names:
+              sys.exit('a bad file took the running rules down with it')
+          if 'broken' in names:
+              sys.exit('a rule that does not validate was installed')
+          "
+
+      - name: the server reports what it reloaded
+        run: |
+          sleep 2   # let the self-reporter sample
+          curl -sf "localhost:8080/stats?prefix=metricflow.rules." > self.json
+          python3 - <<'PY'
+          import json, sys
+
+          with open("self.json") as f:
+              m = json.load(f)["metrics"]
+          for name in sorted(m):
+              print("%-42s max=%g" % (name, m[name]["max"]))
+
+          ok = m.get("metricflow.rules.reloads")
+          bad = m.get("metricflow.rules.reload_failures")
+          if ok is None or bad is None:
+              sys.exit("the server reloaded rules and published no counters for it")
+          if ok["max"] != 1:
+              sys.exit("reloads = %r, want the 1 that succeeded" % ok["max"])
+          if bad["max"] != 1:
+              sys.exit("reload failures = %r, want the 1 that was refused" % bad["max"])
+          print("one reload, one refusal, both reported")
+          PY
+
+      - name: shut down cleanly
+        run: |
+          kill -TERM "$(cat server.pid)"
+          for i in $(seq 1 100); do
+            if ! kill -0 "$(cat server.pid)" 2>/dev/null; then
+              echo "exited cleanly"; exit 0
+            fi
+            sleep 0.2
+          done
+          echo "server did not exit within 20s of SIGTERM"; cat server.log; exit 1
