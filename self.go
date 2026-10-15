@@ -127,6 +127,11 @@ type counters struct {
 	// queryRefused counts queries refused for being over a client's cost
 	// budget (§35).
 	queryRefused atomic.Int64
+
+	// ruleReload counts successful rule reloads, ruleReloadFail the ones
+	// that were refused and left the running rules in place (§44).
+	ruleReload     atomic.Int64
+	ruleReloadFail atomic.Int64
 }
 
 func (c *counters) addAccepted(n int) {
@@ -156,6 +161,9 @@ func (c *counters) addSnapshotFileFailures(n int) {
 func (c *counters) addSnapshotEmptyStart() { c.snapEmptyStart.Add(1) }
 
 func (c *counters) addQueryRefused() { c.queryRefused.Add(1) }
+
+func (c *counters) addRuleReload()        { c.ruleReload.Add(1) }
+func (c *counters) addRuleReloadFailure() { c.ruleReloadFail.Add(1) }
 
 // selfReporter samples the server and records the result into the store it
 // is sampling.

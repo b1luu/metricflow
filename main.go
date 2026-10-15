@@ -801,6 +801,44 @@ func run(ctx context.Context, ln net.Listener) error {
 		return fmt.Errorf("alert rules: %w", err)
 	}
 
+	// SIGHUP re-reads the rules file (§44).
+	//
+	// A signal rather than watching the file, because watching means
+	// deciding what a half-written file means mid-write - §38 named that
+	// and it has not got easier. A signal lets the operator say when, and
+	// "when" is after the editor has finished writing.
+	//
+	// Only when a file is configured: there is nothing to re-read into a
+	// server running the built-in set, and a HUP that silently did nothing
+	// would be worse than one that is not listened for.
+	hupDone := make(chan struct{})
+	if rulesFile := rulesPath(); rulesFile != "" {
+		hups := make(chan os.Signal, 1)
+		signal.Notify(hups, syscall.SIGHUP)
+
+		go func() {
+			defer close(hupDone)
+			defer signal.Stop(hups)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-hups:
+					n, err := reloadRules(alerter, rulesFile, time.Now())
+					if err != nil {
+						log.Printf("reload failed, keeping the rules already loaded: %v", err)
+						store.counts.addRuleReloadFailure()
+						continue
+					}
+					log.Printf("reloaded %d alert rules from %s", n, rulesFile)
+					store.counts.addRuleReload()
+				}
+			}
+		}()
+	} else {
+		close(hupDone)
+	}
+
 	// The alerter shares the server's shutdown signal. alertDone lets us
 	// wait for it to actually stop, so the process never exits mid-evaluation.
 	alertDone := make(chan struct{})
@@ -880,6 +918,7 @@ func run(ctx context.Context, ln net.Listener) error {
 
 	// Every background loop watches ctx, which is already cancelled, so
 	// these return promptly.
+	<-hupDone
 	<-alertDone
 	<-sweepDone
 	<-selfDone

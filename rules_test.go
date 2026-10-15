@@ -291,3 +291,73 @@ func TestNoRulesFileMeansTheBuiltInRules(t *testing.T) {
 			len(got.Alerts), len(defaultRules()))
 	}
 }
+
+// --- reloading (§44) ---
+
+// A reload that fails must leave the running rules exactly as they were.
+// This is the property that makes reloading safe to reach for during an
+// incident, when it is both most useful and most likely to be mistyped.
+func TestAFailedReloadKeepsTheRunningRules(t *testing.T) {
+	good := writeRules(t, `[{"name":"live","metric":"cpu","stat":"max",
+	  "op":">","value":1}]`)
+
+	a, err := newAlerter(time.Now(), newStore(), defaultRules())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reloadRules(a, good, time.Now()); err != nil {
+		t.Fatalf("loading a good file: %v", err)
+	}
+	before := a.Snapshot()
+
+	for _, why := range []string{
+		`[{"name":"r","metric":"m","stat":"median","op":">","value":1}]`,   // bad stat
+		`[{"name":"r","metric":"m","stat":"avg","op":">","windwo":"30s"}]`, // typo
+		`{"not":"a list"}`,
+		`[{"name":"dup","metric":"a","stat":"avg","op":">","value":1},
+		  {"name":"dup","metric":"b","stat":"avg","op":">","value":1}]`,
+	} {
+		if _, err := reloadRules(a, writeRules(t, why), time.Now()); err == nil {
+			t.Errorf("a bad file was accepted: %s", why)
+		}
+
+		after := a.Snapshot()
+		if len(after) != len(before) || after[0].Rule != before[0].Rule {
+			t.Fatalf("a failed reload changed the running rules: %+v became %+v",
+				before, after)
+		}
+	}
+
+	// A missing file is the same answer.
+	if _, err := reloadRules(a, filepath.Join(t.TempDir(), "gone.json"), time.Now()); err == nil {
+		t.Error("a missing file was accepted as a reload")
+	}
+	if got := a.Snapshot(); len(got) != 1 || got[0].Rule != "live" {
+		t.Errorf("running rules are %+v after a missing-file reload", got)
+	}
+}
+
+// And a reload that succeeds installs the new set.
+func TestASuccessfulReloadInstallsTheNewRules(t *testing.T) {
+	a, err := newAlerter(time.Now(), newStore(), defaultRules())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	path := writeRules(t, `[
+	  {"name":"one","metric":"a","stat":"max","op":">","value":1},
+	  {"name":"two","metric":"b","stat":"avg","op":"<","value":2}
+	]`)
+	n, err := reloadRules(a, path, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Errorf("reloaded %d rules, want 2", n)
+	}
+
+	got := a.Snapshot()
+	if len(got) != 2 || got[0].Rule != "one" || got[1].Rule != "two" {
+		t.Errorf("/alerts reports %+v, want the two rules from the file", got)
+	}
+}

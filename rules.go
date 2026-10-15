@@ -138,6 +138,30 @@ func loadRules(path string) ([]Rule, error) {
 	return rules, nil
 }
 
+// reloadRules re-reads the rules file and installs it, reporting what
+// happened so the caller can log and count it.
+//
+// A failed reload changes nothing. The file is read and converted first,
+// and SetRules validates before it swaps, so a server running good rules
+// that is handed a bad file keeps running the good ones - which is the
+// property that makes reloading safe to reach for during an incident,
+// when it is both most useful and most likely to be fat-fingered.
+//
+// Startup is still fatal on a bad file (§38) and this is not, and the
+// asymmetry is the same one §33 drew for snapshots: refusing to start is
+// visible and costs nothing, while refusing to keep running throws away a
+// working server to protest a file nobody has to apply.
+func reloadRules(a *Alerter, path string, now time.Time) (int, error) {
+	rules, err := loadRules(path)
+	if err != nil {
+		return 0, err
+	}
+	if err := a.SetRules(now, rules); err != nil {
+		return 0, err
+	}
+	return len(rules), nil
+}
+
 // watchesItself reports whether any rule looks at the server's own metrics.
 //
 // A rules file replaces the built-in set rather than adding to it, which is
