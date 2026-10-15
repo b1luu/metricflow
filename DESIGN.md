@@ -173,6 +173,11 @@ for *what* was decided and read in full only where the *why* matters.
 
 - [43. A window is only honoured to the nearest bucket](#43-a-window-is-only-honoured-to-the-nearest-bucket)  
   Asking for a minute reaches back between 60 and 69 seconds and returns seven buckets, not six — §25 noticed and left it, §39 made it visible, and the responses now say what they actually covered.
+
+**Changing the rules while it runs**
+
+- [44. Reloading rules without a restart](#44-reloading-rules-without-a-restart)  
+  `SIGHUP` re-reads the rules file; a bad file is refused and the running rules survive it; and a rule the reload did not change keeps its state, because otherwise editing one threshold re-pages every alert that was already firing.
 ## Design choices
 
 ### 1. Store the conclusion, not the events
@@ -3107,6 +3112,79 @@ oldest point is 1m8s old but the response claims to cover 1m0s"*.
   out is covered by less than the response says. `covers` describes the query,
   not each series in it, and `/series` already shows each one's true extent in
   its points.
+
+### 44. Reloading rules without a restart
+
+> **In one line:** `SIGHUP` re-reads the rules file; a bad file is refused
+> and the running rules survive it; and a rule the reload did not change
+> keeps its state, because otherwise editing one threshold re-pages every
+> alert that was already firing.
+
+§38 put rules in a file and listed "no reload without a restart" among the
+things it deliberately did not do, on the grounds that watching the file
+means deciding what a half-written one means mid-write. That reasoning still
+holds, and a signal sidesteps it: the operator says *when*, and "when" is
+after the editor has finished writing.
+
+**It is listened for only when a file is configured.** There is nothing to
+re-read into a server running the built-in set, and a `HUP` that silently did
+nothing would be worse than one nothing listens for.
+
+**Three properties, and only one of them is the obvious one.**
+
+*The rules can be replaced at all.* `rules` carried the comment "fixed after
+construction, so needs no lock" and `evaluateAll` ranged over it without one.
+That assumption had to go first. A pass now copies the slice header under the
+lock and finishes on the rules it started with, so its log lines and the
+states it writes describe one consistent set rather than a mixture.
+
+*A failed reload changes nothing.* The file is read and converted first, and
+`SetRules` validates before it swaps, so a server running good rules that is
+handed a bad file keeps running the good ones. Startup is still fatal on a
+bad file and this is not — the same asymmetry §33 drew for snapshots:
+refusing to start is visible and costs nothing, while refusing to keep
+running throws away a working server to protest a file nobody has to apply.
+This is the property that makes reloading something an operator will actually
+reach for during an incident, which is when it is both most useful and most
+likely to be mistyped.
+
+*A rule the reload did not change keeps its state.* This is the one that is
+easy to miss and expensive to get wrong. Replacing the set resets every rule
+to `nodata`; the next evaluation walks each back to `firing`, and firing
+announces — so editing a single threshold re-pages every alert that was
+already up. Somebody fixing one rule mid-incident would set off everything
+else, which is the surest way to make reloading a thing nobody dares to use.
+
+State is carried **only when the rule is identical**. A changed threshold,
+window, stat, op or `For` is a different question about the metric, and how
+long the old question had been true says nothing about the new one — carrying
+`Since` across an edit would date a firing alert from before the rule that
+defines it existed. `Rule` is comparable, so "identical" is just `==`.
+
+**Both outcomes are counted**, apart from each other, because they say
+opposite things. A rise in `rules.reloads` means somebody changed the rules,
+so the alerts being looked at are not the ones from an hour ago — the first
+thing worth knowing when an alert's behaviour changes for no apparent reason.
+A rise in `rules.reload_failures` means somebody tried and the server is
+still running what it had.
+
+**Windows does not deliver `SIGHUP`**, so the development machine can test
+`reloadRules` directly and never the signal that calls it. The CI job is the
+only place that wiring runs at all — the same gap §22 exists for.
+
+**What this deliberately does not do.**
+
+- *It does not watch the file.* §38's objection is unchanged: a write is not
+  atomic, and a reload triggered half way through one would be reading a
+  file nobody has finished writing. A signal makes the operator assert that
+  they have.
+- *It does not reload anything else.* The in-flight limit and the snapshot
+  path are read once at startup and stay that way. Rules are the
+  configuration that changes during an incident; those two are decisions
+  about the deployment.
+- *It does not report which rules changed.* The log says how many were
+  loaded, not what moved. A diff would be useful and is a different feature
+  from making the reload safe.
 
 ## Testing
 
