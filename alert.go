@@ -382,6 +382,39 @@ func (a *Alerter) Run(ctx context.Context, every time.Duration) {
 	}
 }
 
+// SetRules replaces the rule set.
+//
+// Validation happens here rather than at the caller, so a rule arriving by
+// reload meets exactly the checks one arriving at startup does - the same
+// reason §38 put conversion and validation in different places and let
+// newAlerter own the second. A rejected set leaves the running rules
+// untouched, which is the property §44 is mostly about.
+//
+// Rules and states are swapped together under one lock. A reader that holds
+// the lock therefore never sees rules from one set and states from another.
+func (a *Alerter) SetRules(now time.Time, rules []Rule) error {
+	states := make(map[string]*AlertState, len(rules))
+	for _, r := range rules {
+		if err := r.Validate(); err != nil {
+			return err
+		}
+		if _, dup := states[r.Name]; dup {
+			return fmt.Errorf("duplicate rule name %q", r.Name)
+		}
+		states[r.Name] = &AlertState{
+			Rule:   r.Name,
+			Metric: r.Metric,
+			State:  StateNoData,
+			Since:  now,
+		}
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.rules, a.states = rules, states
+	return nil
+}
+
 // Snapshot copies out the current state of every rule, ordered by rule name
 // so callers (and tests) get a stable listing rather than map order.
 func (a *Alerter) Snapshot() []AlertState {

@@ -692,3 +692,62 @@ func TestAlerterSuppressesFlapping(t *testing.T) {
 		t.Errorf("final State = %q, want %q", st.State, StateOK)
 	}
 }
+
+// --- replacing the rule set (§44) ---
+
+// The mechanism: a running alerter takes a new set, and both /alerts and
+// evaluation follow it.
+func TestSetRulesReplacesTheRuleSet(t *testing.T) {
+	s := newStore()
+	a, err := newAlerter(time.Now(), s, []Rule{
+		{Name: "old", Metric: "a", Stat: StatMax, Op: OpGT, Value: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := a.SetRules(time.Now(), []Rule{
+		{Name: "new", Metric: "b", Stat: StatAvg, Op: OpLT, Value: 5},
+	}); err != nil {
+		t.Fatalf("replacing a valid rule set: %v", err)
+	}
+
+	got := a.Snapshot()
+	if len(got) != 1 || got[0].Rule != "new" {
+		t.Fatalf("/alerts reports %+v, want only the new rule", got)
+	}
+
+	// And the new rule is the one evaluated, which Snapshot alone does not
+	// prove.
+	recordNow(s, "b", 1) // below 5, so the new rule should fire
+	a.evaluateAll(time.Now())
+	if st := a.Snapshot()[0]; st.State == StateNoData {
+		t.Error("the replacement rule was never evaluated")
+	}
+}
+
+// A rule set that does not validate is refused, and refused for the same
+// reasons newAlerter refuses one - the checks are not duplicated.
+func TestSetRulesRefusesWhatNewAlerterWouldRefuse(t *testing.T) {
+	a, err := newAlerter(time.Now(), newStore(), defaultRules())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	bad := [][]Rule{
+		{{Name: "r", Metric: "m", Stat: "median", Op: OpGT, Value: 1}},
+		{{Name: "r", Metric: "m", Stat: StatAvg, Op: "=~", Value: 1}},
+		{{Name: "", Metric: "m", Stat: StatAvg, Op: OpGT, Value: 1}},
+		{{Name: "r", Metric: "", Stat: StatAvg, Op: OpGT, Value: 1}},
+		{{Name: "r", Metric: "m", Stat: StatAvg, Op: OpGT, Value: 1, Window: 10 * window}},
+		{
+			{Name: "same", Metric: "a", Stat: StatAvg, Op: OpGT, Value: 1},
+			{Name: "same", Metric: "b", Stat: StatAvg, Op: OpGT, Value: 1},
+		},
+	}
+	for i, rules := range bad {
+		if err := a.SetRules(time.Now(), rules); err == nil {
+			t.Errorf("case %d: an invalid rule set was accepted", i)
+		}
+	}
+}
