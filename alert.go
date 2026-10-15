@@ -247,7 +247,12 @@ type Alerter struct {
 	states map[string]*AlertState // by rule name
 
 	store *Store // read-only from here
-	rules []Rule // fixed after construction, so needs no lock
+
+	// rules is replaced wholesale, never mutated in place, and only under
+	// mu - so a reader may copy the slice header under the lock and then
+	// range over it freely (§44). It stopped being "fixed after
+	// construction" when reloading arrived.
+	rules []Rule
 }
 
 // newAlerter validates every rule up front and seeds each one's state.
@@ -278,7 +283,15 @@ func newAlerter(now time.Time, s *Store, rules []Rule) (*Alerter, error) {
 // changed state. Steady state is silent: only transitions are events, so a
 // firing rule logs once, not on every tick.
 func (a *Alerter) evaluateAll(now time.Time) {
-	for _, r := range a.rules {
+	// One copy of the slice header, so a reload part-way through a pass
+	// cannot change what this pass is evaluating. The pass finishes on the
+	// rules it started with, which is the only way its log lines and the
+	// states it writes describe one consistent set.
+	a.mu.Lock()
+	rules := a.rules
+	a.mu.Unlock()
+
+	for _, r := range rules {
 		// Read the store outside a.mu - it has its own lock, and nesting
 		// the two would be a deadlock waiting to happen.
 		agg, ok := a.store.aggFor(r.Metric, windowStart(now, r.lookback()))
@@ -286,6 +299,13 @@ func (a *Alerter) evaluateAll(now time.Time) {
 
 		a.mu.Lock()
 		st := a.states[r.Name]
+		if st == nil {
+			// A rule removed by a reload after this pass took its copy of
+			// the rules. Nothing to update and nothing to report: the rule
+			// is gone, and its state went with it.
+			a.mu.Unlock()
+			continue
+		}
 		from := st.State
 		state := applyFor(r, now, st.State, st.Since, want)
 		changed := from != state
