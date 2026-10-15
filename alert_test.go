@@ -751,3 +751,127 @@ func TestSetRulesRefusesWhatNewAlerterWouldRefuse(t *testing.T) {
 		}
 	}
 }
+
+// A rule a reload did not touch must keep the state it was in.
+//
+// Otherwise editing one rule resets every other to nodata, the next
+// evaluation walks them all back to firing, and every alert that was
+// already firing announces again. An operator fixing one threshold mid
+// incident would set off everything else.
+func TestAReloadDoesNotDisturbUnchangedRules(t *testing.T) {
+	s := newStore()
+	steady := Rule{Name: "steady", Metric: "cpu", Stat: StatMax, Op: OpGT, Value: 1}
+	edited := Rule{Name: "edited", Metric: "mem", Stat: StatMax, Op: OpGT, Value: 1}
+
+	a, err := newAlerter(time.Now(), s, []Rule{steady, edited})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Drive both to firing.
+	recordNow(s, "cpu", 100)
+	recordNow(s, "mem", 100)
+	a.evaluateAll(time.Now())
+
+	before := map[string]AlertState{}
+	for _, st := range a.Snapshot() {
+		before[st.Rule] = st
+		if st.State != StateFiring {
+			t.Fatalf("setup: %s is %s, want firing", st.Rule, st.State)
+		}
+	}
+
+	// Reload with one rule edited and the other byte-identical.
+	edited.Value = 50
+	if err := a.SetRules(time.Now(), []Rule{steady, edited}); err != nil {
+		t.Fatal(err)
+	}
+
+	after := map[string]AlertState{}
+	for _, st := range a.Snapshot() {
+		after[st.Rule] = st
+	}
+
+	if after["steady"].State != StateFiring {
+		t.Errorf("the untouched rule went from firing to %s; a reload re-pages it",
+			after["steady"].State)
+	}
+	if after["steady"].Since != before["steady"].Since {
+		t.Errorf("the untouched rule's Since moved from %v to %v; its alert would "+
+			"look newly raised", before["steady"].Since, after["steady"].Since)
+	}
+}
+
+// And a rule that *was* changed starts again.
+//
+// How long the old question had been true of a metric says nothing about
+// the new one: carrying Since across an edit would date a firing alert from
+// before the rule defining it existed.
+func TestAnEditedRuleStartsFresh(t *testing.T) {
+	s := newStore()
+	r := Rule{Name: "r", Metric: "cpu", Stat: StatMax, Op: OpGT, Value: 1}
+
+	a, err := newAlerter(time.Now(), s, []Rule{r})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recordNow(s, "cpu", 100)
+	a.evaluateAll(time.Now())
+	if a.Snapshot()[0].State != StateFiring {
+		t.Fatal("setup: the rule is not firing")
+	}
+
+	for _, change := range []func(*Rule){
+		func(r *Rule) { r.Value = 500 },
+		func(r *Rule) { r.Stat = StatAvg },
+		func(r *Rule) { r.Op = OpLT },
+		func(r *Rule) { r.Window = 30 * time.Second },
+		func(r *Rule) { r.For = 30 * time.Second },
+		func(r *Rule) { r.Metric = "other" },
+	} {
+		// Back to firing before each case.
+		if err := a.SetRules(time.Now(), []Rule{r}); err != nil {
+			t.Fatal(err)
+		}
+		a.evaluateAll(time.Now())
+
+		changed := r
+		change(&changed)
+		if err := a.SetRules(time.Now(), []Rule{changed}); err != nil {
+			t.Fatal(err)
+		}
+		if st := a.Snapshot()[0]; st.State != StateNoData {
+			t.Errorf("after changing the rule to %+v the state is %s, want nodata",
+				changed, st.State)
+		}
+	}
+}
+
+// A rule added by a reload starts at nodata, and one removed disappears.
+func TestAReloadAddsAndRemovesRules(t *testing.T) {
+	a, err := newAlerter(time.Now(), newStore(), []Rule{
+		{Name: "keep", Metric: "a", Stat: StatMax, Op: OpGT, Value: 1},
+		{Name: "drop", Metric: "b", Stat: StatMax, Op: OpGT, Value: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := a.SetRules(time.Now(), []Rule{
+		{Name: "keep", Metric: "a", Stat: StatMax, Op: OpGT, Value: 1},
+		{Name: "added", Metric: "c", Stat: StatMax, Op: OpGT, Value: 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got := map[string]bool{}
+	for _, st := range a.Snapshot() {
+		got[st.Rule] = true
+	}
+	if !got["keep"] || !got["added"] {
+		t.Errorf("/alerts reports %v, want keep and added", got)
+	}
+	if got["drop"] {
+		t.Error("a rule removed by the reload is still reported")
+	}
+}

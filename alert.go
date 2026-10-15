@@ -411,6 +411,35 @@ func (a *Alerter) SetRules(now time.Time, rules []Rule) error {
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
+	// A rule the reload did not change keeps the state it was in.
+	//
+	// Without this, editing one rule resets every other rule to nodata,
+	// and the next evaluation walks each of them back to firing - which
+	// announces, so every alert that was already firing pages again. An
+	// operator fixing one threshold during an incident would set off
+	// everything else, which is the surest way to make reloading a thing
+	// nobody dares to use.
+	//
+	// Carried only when the rule is identical. A changed threshold,
+	// window, stat or For is a different question about the metric, and
+	// how long the *old* question had been true of it says nothing about
+	// the new one - keeping Since there would date a firing alert from
+	// before the rule that defines it existed. Rule is comparable, so
+	// "identical" is just ==.
+	previous := make(map[string]Rule, len(a.rules))
+	for _, r := range a.rules {
+		previous[r.Name] = r
+	}
+	for _, r := range rules {
+		if old, ok := previous[r.Name]; ok && old == r {
+			if st := a.states[r.Name]; st != nil {
+				carried := *st
+				states[r.Name] = &carried
+			}
+		}
+	}
+
 	a.rules, a.states = rules, states
 	return nil
 }
