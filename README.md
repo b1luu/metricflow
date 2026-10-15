@@ -75,7 +75,30 @@ WARNING: no rule watches the metricflow. namespace; the server's own
          shedding and cardinality are unalerted
 ```
 
-See [DESIGN.md](DESIGN.md) §38.
+**Edit the file and send `SIGHUP` to reload it — no restart.**
+
+```
+kill -HUP $(pidof metricflow)
+```
+
+A file that does not validate is **refused, and the running rules keep
+running**. Startup is fatal on a bad file; a reload is not, because refusing
+to keep serving would throw away a working server to protest a file nobody
+has to apply. That is what makes reloading safe to reach for mid-incident,
+which is when it is most useful and most likely to be mistyped.
+
+A rule the reload did not change **keeps its state**. Without that, editing
+one threshold would reset every rule to `nodata`, and the next evaluation
+would walk them all back to `firing` — re-paging every alert that was already
+up. Only a byte-identical rule carries state forward: a changed threshold or
+window is a different question about the metric, and how long the old one had
+been true says nothing about the new one.
+
+Both outcomes are published as `metricflow.rules.reloads` and
+`metricflow.rules.reload_failures`, so a change in alert behaviour can be
+correlated against somebody having reloaded.
+
+See [DESIGN.md](DESIGN.md) §38 and §44.
 
 A rule may set `For`, requiring the breach to hold that long before it counts;
 until then it sits in `pending` and logs nothing, so a metric flapping across
