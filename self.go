@@ -72,6 +72,14 @@ const (
 	// with a single request at a time.
 	selfQueryRefused = selfPrefix + "clients.query_budget_refusals" // counter
 
+	// Reloads (§44), counted apart from each other because they say
+	// opposite things. A rise in the first means somebody changed the
+	// rules and the alerts you are looking at are not the ones from an
+	// hour ago; a rise in the second means somebody tried and the server
+	// is still running what it had.
+	selfRuleReload     = selfPrefix + "rules.reloads"         // counter
+	selfRuleReloadFail = selfPrefix + "rules.reload_failures" // counter
+
 	// Persistence (§33). Published only when a snapshot path is configured,
 	// because a server with persistence switched off has no snapshot age,
 	// and a zero there would read as "just snapshotted" - indistinguishable
@@ -206,6 +214,8 @@ func (r *selfReporter) sample(now time.Time) {
 		{selfRejected, float64(r.counts.rejected.Load())},
 		{selfSweptMetrics, float64(r.counts.swept.Load())},
 		{selfQueryRefused, float64(r.counts.queryRefused.Load())},
+		{selfRuleReload, float64(r.counts.ruleReload.Load())},
+		{selfRuleReloadFail, float64(r.counts.ruleReloadFail.Load())},
 		{selfClients, float64(r.clients.tracked())},
 		{selfStoreMetrics, float64(metrics)},
 		{selfStoreBuckets, float64(buckets)},

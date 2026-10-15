@@ -361,3 +361,52 @@ func TestASuccessfulReloadInstallsTheNewRules(t *testing.T) {
 		t.Errorf("/alerts reports %+v, want the two rules from the file", got)
 	}
 }
+
+// A reload nobody can see is a reload nobody can correlate an alert
+// change against (§31). Counted through the real reload path rather than
+// by calling the increment.
+func TestReloadsAreCounted(t *testing.T) {
+	s := newStore()
+	a, err := newAlerter(time.Now(), s, defaultRules())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	good := writeRules(t, `[{"name":"r","metric":"m","stat":"max","op":">","value":1}]`)
+	bad := writeRules(t, `[{"name":"r","metric":"m","stat":"median","op":">","value":1}]`)
+
+	// The counters live on the store, which is what the reporter reads, so
+	// drive them the way run() does.
+	for _, c := range []struct {
+		path string
+		ok   bool
+	}{{good, true}, {good, true}, {bad, false}} {
+		if _, err := reloadRules(a, c.path, time.Now()); err != nil {
+			s.counts.addRuleReloadFailure()
+			if c.ok {
+				t.Fatalf("a good file failed: %v", err)
+			}
+			continue
+		}
+		s.counts.addRuleReload()
+		if !c.ok {
+			t.Fatal("a bad file succeeded")
+		}
+	}
+
+	if got := s.counts.ruleReload.Load(); got != 2 {
+		t.Errorf("counted %d successful reloads, want 2", got)
+	}
+	if got := s.counts.ruleReloadFail.Load(); got != 1 {
+		t.Errorf("counted %d failed reloads, want 1", got)
+	}
+
+	// And they reach /stats, which is the only form anyone sees them in.
+	r, _, _ := newTestReporter(s)
+	r.sample(time.Now())
+	for _, name := range []string{selfRuleReload, selfRuleReloadFail} {
+		if _, ok := mergeAll(s, name); !ok {
+			t.Errorf("%s was not published", name)
+		}
+	}
+}
