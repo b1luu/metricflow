@@ -113,6 +113,15 @@ jobs:
       # a partially-rejected batch is a 200, so the number the server owes
       # comes from the reply body rather than the status. Gate it the same
       # way, clean and with rejects mixed in.
+      # §45: the third clause of the spine. The steps above prove events
+      # in and correct aggregates; this one reads while they are arriving
+      # and holds every reading to invariants no amount of unlucky timing
+      # can break - min <= max, avg inside it, ordered percentiles, points
+      # on the grid the response claims. A breach means the server
+      # described a state it was never in.
+      - name: queries during the firehose must stay answers
+        run: ./loadgen -duration 5s -workers 8 -batch 50 -readers 4 -client readwrite
+
       - name: batched traffic must verify
         run: ./loadgen -duration 3s -workers 8 -batch 100
 
