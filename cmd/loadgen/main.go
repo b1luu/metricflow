@@ -928,6 +928,25 @@ func main() {
 	total.report(os.Stdout, elapsed, clockRes)
 	reads.report(os.Stdout, elapsed, clockRes)
 
+	// A reading that contradicts itself is a finding, not a note. Printing
+	// it and exiting zero would make this a report nobody reads rather
+	// than a gate - the same reason verify exits non-zero on a mismatch
+	// and -expect-shed exists at all.
+	if len(reads.breaches) > 0 {
+		fmt.Fprintln(os.Stderr,
+			"read:", len(reads.breaches),
+			"reading(s) described a state the store was never in")
+		os.Exit(1)
+	}
+
+	// And readers that got no answer at all. A transport error on the read
+	// path is the same class of event §26 made loadgen count on the write
+	// path: the server may have been fine, but this run cannot say so.
+	if reads.failed > 0 {
+		fmt.Fprintln(os.Stderr, "read:", reads.failed, "quer(ies) got no response")
+		os.Exit(1)
+	}
+
 	if cfg.verify {
 		if err := verify(newClient(1), cfg, total, elapsed, os.Stdout); err != nil {
 			// A mismatch is a real finding, not a warning: exit non-zero so
