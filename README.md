@@ -488,6 +488,31 @@ verify: OK - 119726 accepted, 119726 recorded
 `/stats` and checks the server recorded exactly as many events as it said it
 accepted, exiting non-zero if not — so it works as a CI gate, not just a demo.
 
+**`-readers N` queries while the writers write**, which is the only way to
+test the third part of the claim: fast queries out, *while* events are
+arriving.
+
+```
+go run ./cmd/loadgen -duration 4s -workers 8 -batch 50 -readers 6
+```
+```
+99194 queries  (24796 q/s)  read while the firehose was running
+  200     50003   50.4%
+  429     49191   49.6%
+query latency  p50 <578µs  p90 <578µs  p99 1.047ms  max 11.847ms
+50000 metric readings checked, all self-consistent
+```
+
+Latency only says reads are quick. A read racing a write does not come back
+slow, it comes back **wrong** — so every reading is checked against things
+that hold for any values at all: `min <= max`, `avg` inside it, ordered
+percentiles, and for `/series` every point on the grid the response claims.
+None can fail by unlucky timing, so a breach means the server described a
+state it was never in, and the run exits non-zero.
+
+(The `429`s above are the per-client query budget doing its job: six readers
+looping with no think time share one client ID and one budget.)
+
 `-batch N` sends N events per request instead of one, which is where the
 throughput actually is:
 
