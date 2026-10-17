@@ -178,6 +178,11 @@ for *what* was decided and read in full only where the *why* matters.
 
 - [44. Reloading rules without a restart](#44-reloading-rules-without-a-restart)  
   `SIGHUP` re-reads the rules file; a bad file is refused and the running rules survive it; and a rule the reload did not change keeps its state, because otherwise editing one threshold re-pages every alert that was already firing.
+
+**Proving the read path**
+
+- [45. Reading while the firehose runs](#45-reading-while-the-firehose-runs)  
+  The harness proved two thirds of the spine — events in, correct aggregates — and never read anything until the run was over; readers now query throughout, and every reading is held to invariants that unlucky timing cannot break.
 ## Design choices
 
 ### 1. Store the conclusion, not the events
@@ -3185,6 +3190,100 @@ only place that wiring runs at all — the same gap §22 exists for.
 - *It does not report which rules changed.* The log says how many were
   loaded, not what moved. A diff would be useful and is a different feature
   from making the reload safe.
+
+### 45. Reading while the firehose runs
+
+> **In one line:** The harness proved two thirds of the spine — events in,
+> correct aggregates — and never read anything until the run was over;
+> readers now query throughout, and every reading is held to invariants that
+> unlucky timing cannot break.
+
+§1 set the shape: *a firehose of events in, correct live aggregates, fast
+queries out.* §21 built `cmd/loadgen` for the claim the in-process
+benchmarks structurally cannot make — that over real HTTP, the server
+recorded exactly what it accepted. That is the first two clauses. The third
+had §34's and §41's benchmarks, which run in-process against a store nobody
+is reading over a socket.
+
+So nothing measured what a query costs, or whether it stays correct, while
+the firehose is actually arriving down another connection.
+
+**`-readers N`** runs N goroutines querying for the duration of the run,
+sharing the writers' deadline so every query they make happened with writes
+in flight. They ask by name (§37), which keeps them measuring the read path
+rather than the cost of scanning whatever else the store holds, and keeps
+them inside their query budget (§35) rather than measuring how fast they can
+get themselves refused. Read latency is tallied separately, because mixing
+it with write latency produces one distribution describing neither.
+
+**Latency is the easy half.** It says whether reads are quick; it says
+nothing about whether they are answers, and a read racing a write does not
+come back slow — it comes back wrong. So every reading is checked against
+statements that hold for *any* set of values whatsoever:
+
+- `min <= max`, and `avg` inside `[min, max]`
+- `p50 <= p90 <= p99`, and `p99` within the sketch's 1% of `max` (§23)
+- a non-negative count, and no metric returned with count 0 when the
+  server's own rule is to skip those
+- for `/series`: every point on the grid the response claims (§42),
+  consecutive points exactly one bucket apart, and the span never exceeding
+  what `covers` says (§43)
+
+None of these can fail by timing. A breach means the response described a
+state the store was never in — exactly what `mergeBuckets` would produce if
+it summed counts from one moment against extremes from another, or if the
+histogram it sorted were not the private copy §23 and §41 depend on.
+
+**Both endpoints, alternating.** Checking only `/stats` would leave the
+endpoint §39 added unexercised by the harness that exists to exercise the
+read path — and `/series` is the one with promises of its own, every one of
+which has been broken at least once: §42 found points off the grid after a
+cross-version restore, §43 found the window understating what it returned.
+Those are claims the server makes in every response, so the harness holds it
+to them on every read rather than only in tests that arrange the conditions.
+
+**A breach fails the run.** Printing it and exiting zero would make this a
+report nobody reads — the same reason `verify` exits non-zero on a mismatch
+and `-expect-shed` exists at all. Proven by building a second binary whose
+reader corrupts every average it decodes, and pointing both at the same
+healthy server:
+
+```
+healthy        exit=0   28126 metric readings checked, all self-consistent
+torn readings  exit=1   read: 5 reading(s) described a state the store
+                        was never in
+```
+
+**Live**, eight writers and six readers for four seconds:
+
+```
+99194 queries  (24796 q/s)  read while the firehose was running
+  200     50003   50.4%
+  429     49191   49.6%
+50000 metric readings checked, all self-consistent
+verify: waited out 1 refused read(s) before the server would answer
+```
+
+Two things worth reading off that, neither of them about this slice. Half
+the queries refused is §35's budget working: six readers looping with no
+think time share one client ID and one budget, and this is the first thing
+to exercise that path over real HTTP. And the `verify` line is §36 earning
+its keep in a live run — the verification read was itself refused, waited,
+and retried, rather than reporting a correctness failure for a server that
+was behaving correctly.
+
+**What this deliberately does not do.**
+
+- *It does not check readings against each other.* Two reads a moment apart
+  legitimately differ, and eviction means a count can fall as well as rise,
+  so any cross-reading invariant would be a guess about timing. Everything
+  here holds within one response.
+- *It does not measure a realistic read rate.* Readers loop with no think
+  time, which is the right shape for finding a race and the wrong one for
+  quoting the cost of a dashboard — the caveat §41 already attached to its
+  contention figures.
+- *It does not read `/alerts`.* The alerting state machine has its own tests
+  and no per-request arithmetic to tear.
 
 ## Testing
 
