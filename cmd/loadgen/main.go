@@ -660,6 +660,19 @@ type metricStats struct {
 	P99   float64 `json:"p99"`
 }
 
+// seriesResponse mirrors GET /series, and like statsResponse it is
+// declared here rather than shared: a client that reuses the server's own
+// struct cannot notice the wire contract changing.
+type seriesResponse struct {
+	Window string `json:"window"`
+	Covers string `json:"covers"`
+	Bucket string `json:"bucket"`
+	Series map[string][]struct {
+		Start int64 `json:"start"`
+		metricStats
+	} `json:"series"`
+}
+
 type statsResponse struct {
 	Window  string                 `json:"window"`
 	Metrics map[string]metricStats `json:"metrics"`
@@ -1040,6 +1053,56 @@ func checkMetric(name string, m metricStats) []string {
 	return bad
 }
 
+// checkSeries is checkMetric plus the promises only a series makes.
+//
+// §39 added the bucket field so a client would not have to assume how wide
+// a point is, which made it a promise; §42 found a restored snapshot
+// breaking it and §43 found the window understating itself. All three are
+// statements the server makes about its own output in every response, so
+// the harness can hold it to them on every read rather than only in a test
+// that arranges the conditions.
+func checkSeries(name string, bucket, covers time.Duration, points []struct {
+	Start int64 `json:"start"`
+	metricStats
+}) []string {
+	var bad []string
+	note := func(f string, a ...any) {
+		bad = append(bad, fmt.Sprintf("%s: %s", name, fmt.Sprintf(f, a...)))
+	}
+
+	if bucket <= 0 {
+		note("the response claims a bucket width of %s", bucket)
+		return bad
+	}
+	secs := int64(bucket / time.Second)
+
+	for i, p := range points {
+		bad = append(bad, checkMetric(name, p.metricStats)...)
+
+		// §42: every point sits on the grid the response claims.
+		if secs > 0 && p.Start%secs != 0 {
+			note("point at %d is not a multiple of the %s claimed", p.Start, bucket)
+		}
+		// Strictly ascending, exactly one bucket apart.
+		if i > 0 {
+			if gap := p.Start - points[i-1].Start; gap != secs {
+				note("points %d and %d are %ds apart, not the %s claimed",
+					i-1, i, gap, bucket)
+			}
+		}
+	}
+
+	// §43: covers describes the span, so the points cannot outrun it.
+	if covers > 0 && len(points) > 0 {
+		span := time.Duration(points[len(points)-1].Start-points[0].Start) * time.Second
+		if span > covers {
+			note("points span %s, more than the %s the response claims to cover",
+				span, covers)
+		}
+	}
+	return bad
+}
+
 // queryUntil reads one of this run's metrics by name until ctx is done.
 //
 // By name on purpose (§37): a reader asking for a known metric does no
@@ -1049,7 +1112,8 @@ func checkMetric(name string, m metricStats) []string {
 // they can get themselves refused.
 func queryUntil(ctx context.Context, client *http.Client, cfg config, readerID int) readTally {
 	t := newReadTally()
-	base := strings.TrimSuffix(cfg.target, "/") + "/stats"
+	root := strings.TrimSuffix(cfg.target, "/")
+	base, seriesBase := root+"/stats", root+"/series"
 
 	for i := 0; ; i++ {
 		if ctx.Err() != nil {
@@ -1057,7 +1121,17 @@ func queryUntil(ctx context.Context, client *http.Client, cfg config, readerID i
 		}
 
 		name := cfg.metricName(readerID + i)
-		u := fmt.Sprintf("%s?name=%s", base, url.QueryEscape(name))
+
+		// Both read endpoints, alternating. /series is the one with
+		// promises of its own to keep, and testing only /stats would leave
+		// the endpoint §39 added unexercised by the harness that exists to
+		// exercise the read path.
+		series := i%2 == 1
+		path := base
+		if series {
+			path = seriesBase
+		}
+		u := fmt.Sprintf("%s?name=%s", path, url.QueryEscape(name))
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 		if err != nil {
@@ -1085,11 +1159,30 @@ func queryUntil(ctx context.Context, client *http.Client, cfg config, readerID i
 			continue
 		}
 
+		if series {
+			var sr seriesResponse
+			decErr := json.NewDecoder(resp.Body).Decode(&sr)
+			resp.Body.Close()
+			if decErr != nil {
+				t.note("%s: undecodable /series response: %v", name, decErr)
+				continue
+			}
+			bucket, _ := time.ParseDuration(sr.Bucket)
+			covers, _ := time.ParseDuration(sr.Covers)
+			for metric, points := range sr.Series {
+				t.checked++
+				for _, b := range checkSeries(metric, bucket, covers, points) {
+					t.note("%s", b)
+				}
+			}
+			continue
+		}
+
 		var stats statsResponse
 		decErr := json.NewDecoder(resp.Body).Decode(&stats)
 		resp.Body.Close()
 		if decErr != nil {
-			t.note("%s: undecodable response: %v", name, decErr)
+			t.note("%s: undecodable /stats response: %v", name, decErr)
 			continue
 		}
 

@@ -1396,3 +1396,68 @@ func TestBreachesAreBounded(t *testing.T) {
 		t.Errorf("merging gave %d breaches, want at most %d", len(t1.breaches), maxBreaches)
 	}
 }
+
+// --- the promises only a series makes (§45) ---
+
+type seriesPoint = struct {
+	Start int64 `json:"start"`
+	metricStats
+}
+
+func pointsAt(bucket int64, starts ...int64) []seriesPoint {
+	out := make([]seriesPoint, 0, len(starts))
+	for _, s := range starts {
+		out = append(out, seriesPoint{
+			Start:       s,
+			metricStats: metricStats{Count: 5, Avg: 5, Min: 1, Max: 9, P50: 5, P90: 8, P99: 9},
+		})
+	}
+	return out
+}
+
+func TestCheckSeriesAcceptsAWellFormedSeries(t *testing.T) {
+	pts := pointsAt(10, 100, 110, 120, 130)
+	if bad := checkSeries("m", 10*time.Second, time.Minute, pts); len(bad) != 0 {
+		t.Errorf("a well-formed series was rejected: %v", bad)
+	}
+}
+
+// The three things a series response promises beyond the numbers, each of
+// which a past slice found broken: the grid (§42), the spacing (§39) and
+// the coverage (§43).
+func TestCheckSeriesRejectsABrokenPromise(t *testing.T) {
+	cases := map[string]struct {
+		bucket, covers time.Duration
+		points         []seriesPoint
+	}{
+		"a point off the claimed grid": {
+			10 * time.Second, time.Minute, pointsAt(10, 100, 115, 120),
+		},
+		"points more than one bucket apart": {
+			10 * time.Second, time.Minute, pointsAt(10, 100, 130, 140),
+		},
+		"points spanning more than covers": {
+			10 * time.Second, 20 * time.Second, pointsAt(10, 100, 110, 120, 130, 140),
+		},
+		"no bucket width at all": {
+			0, time.Minute, pointsAt(10, 100, 110),
+		},
+	}
+	for why, c := range cases {
+		if bad := checkSeries("m", c.bucket, c.covers, c.points); len(bad) == 0 {
+			t.Errorf("%s: accepted", why)
+		}
+	}
+}
+
+// And the per-point numbers are held to the same invariants /stats
+// readings are, so a torn bucket is caught wherever it surfaces.
+func TestCheckSeriesChecksEachPointsNumbers(t *testing.T) {
+	pts := pointsAt(10, 100, 110)
+	pts[1].Avg = 99 // outside [min,max]
+
+	bad := checkSeries("m", 10*time.Second, time.Minute, pts)
+	if len(bad) == 0 {
+		t.Error("a point whose avg is outside [min,max] was accepted")
+	}
+}
