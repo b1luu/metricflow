@@ -1334,3 +1334,65 @@ func TestRetryAfterIsHonouredButCapped(t *testing.T) {
 		}
 	}
 }
+
+// --- the invariants a reading must satisfy (§45) ---
+
+// A sane reading passes. If this ever fails, every other case below is
+// meaningless, because the checker would be rejecting everything.
+func TestCheckMetricAcceptsASaneReading(t *testing.T) {
+	ok := metricStats{Count: 100, Avg: 5, Min: 1, Max: 9, P50: 5, P90: 8, P99: 9}
+	if bad := checkMetric("m", ok); len(bad) != 0 {
+		t.Errorf("a consistent reading was rejected: %v", bad)
+	}
+}
+
+// Each of these describes a state the store was never in. They are the
+// shapes a read racing a write produces, and none of them can happen by
+// unlucky timing alone.
+func TestCheckMetricRejectsAReadingThatContradictsItself(t *testing.T) {
+	cases := map[string]metricStats{
+		"min above max":       {Count: 1, Avg: 5, Min: 9, Max: 1},
+		"avg below min":       {Count: 10, Avg: 0.5, Min: 1, Max: 9, P50: 1, P90: 5, P99: 9},
+		"avg above max":       {Count: 10, Avg: 99, Min: 1, Max: 9, P50: 1, P90: 5, P99: 9},
+		"percentiles swapped": {Count: 10, Avg: 5, Min: 1, Max: 9, P50: 9, P90: 5, P99: 1},
+		"p99 beyond max":      {Count: 10, Avg: 5, Min: 1, Max: 9, P50: 5, P90: 8, P99: 90},
+		"negative count":      {Count: -1, Avg: 5, Min: 1, Max: 9},
+		"returned empty":      {Count: 0},
+	}
+	for why, m := range cases {
+		if bad := checkMetric("m", m); len(bad) == 0 {
+			t.Errorf("%s: accepted %+v", why, m)
+		}
+	}
+}
+
+// The sketch is accurate to 1%, so a p99 a hair above max is the histogram
+// being a histogram, not the server being wrong. Rejecting it would make
+// the harness cry wolf on every run.
+func TestCheckMetricToleratesTheSketchesError(t *testing.T) {
+	m := metricStats{Count: 10, Avg: 5, Min: 1, Max: 100, P50: 50, P90: 90, P99: 100.5}
+	if bad := checkMetric("m", m); len(bad) != 0 {
+		t.Errorf("a p99 within the sketch's 1%% error was rejected: %v", bad)
+	}
+}
+
+// Breaches are bounded. A server that is broken is broken on every
+// response, and the report has to stay readable.
+func TestBreachesAreBounded(t *testing.T) {
+	t1 := newReadTally()
+	for i := 0; i < maxBreaches*10; i++ {
+		t1.note("breach %d", i)
+	}
+	if len(t1.breaches) != maxBreaches {
+		t.Errorf("kept %d breaches, want at most %d", len(t1.breaches), maxBreaches)
+	}
+
+	t2 := newReadTally()
+	for i := 0; i < maxBreaches*10; i++ {
+		t2.note("other %d", i)
+	}
+	t1.merge(t2)
+	if len(t1.breaches) != maxBreaches {
+		t.Errorf("merging gave %d breaches, want at most %d", len(t1.breaches), maxBreaches)
+	}
+}

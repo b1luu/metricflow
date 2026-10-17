@@ -646,14 +646,23 @@ func show(d, clockRes time.Duration) string {
 // statsResponse mirrors GET /stats. Declared here rather than shared with
 // the server: this is the wire contract, and a client that reuses the
 // server's own struct cannot notice if that contract changes.
+// metricStats is one metric's numbers. Named rather than inline now that
+// the readers (§45) check them, and carrying the percentiles the verifier
+// never needed: an answer can be wrong in ways count and average cannot
+// show.
+type metricStats struct {
+	Count int     `json:"count"`
+	Avg   float64 `json:"avg"`
+	Min   float64 `json:"min"`
+	Max   float64 `json:"max"`
+	P50   float64 `json:"p50"`
+	P90   float64 `json:"p90"`
+	P99   float64 `json:"p99"`
+}
+
 type statsResponse struct {
-	Window  string `json:"window"`
-	Metrics map[string]struct {
-		Count int     `json:"count"`
-		Avg   float64 `json:"avg"`
-		Min   float64 `json:"min"`
-		Max   float64 `json:"max"`
-	} `json:"metrics"`
+	Window  string                 `json:"window"`
+	Metrics map[string]metricStats `json:"metrics"`
 
 	// The server bounds how many metrics one response computes (§28), so a
 	// single GET is no longer the whole store. These are how it says so.
@@ -952,10 +961,23 @@ type readTally struct {
 	byStatus map[int]int
 	failed   int // transport errors: no response at all
 	queries  int
+	checked  int      // metric readings whose numbers were examined
+	breaches []string // invariants a reading broke
 	lat      *latencies
 }
 
+// maxBreaches bounds what is kept. A broken server breaks the same
+// invariant on every response, and ten thousand copies of one sentence is
+// not ten thousand findings.
+const maxBreaches = 5
+
 func newReadTally() readTally { return readTally{byStatus: map[int]int{}, lat: newLatencies()} }
+
+func (t *readTally) note(format string, args ...any) {
+	if len(t.breaches) < maxBreaches {
+		t.breaches = append(t.breaches, fmt.Sprintf(format, args...))
+	}
+}
 
 func (t *readTally) merge(o readTally) {
 	for code, n := range o.byStatus {
@@ -963,7 +985,59 @@ func (t *readTally) merge(o readTally) {
 	}
 	t.failed += o.failed
 	t.queries += o.queries
+	t.checked += o.checked
 	t.lat.merge(o.lat)
+	for _, b := range o.breaches {
+		t.note("%s", b)
+	}
+}
+
+// checkMetric reports what is wrong with one metric's numbers, if anything.
+//
+// Latency measures whether reads are fast. These measure whether they are
+// answers at all. Every one holds for any set of values whatsoever, so a
+// breach cannot be unlucky timing - it means the response described a state
+// the store was never in, which is what a read racing a write produces.
+//
+// mergeBuckets sums counts and takes the extremes across a metric's buckets
+// while holding the shard lock, and sorts a private copy of the histogram
+// (§23, §41). If any of that were wrong, these are the statements that
+// would stop being true.
+func checkMetric(name string, m metricStats) []string {
+	var bad []string
+	note := func(f string, a ...any) {
+		bad = append(bad, fmt.Sprintf("%s: %s", name, fmt.Sprintf(f, a...)))
+	}
+
+	if m.Count < 0 {
+		note("count is %d", m.Count)
+	}
+	if m.Count == 0 {
+		// /stats skips a metric with nothing inside the window, so one
+		// coming back empty is the server contradicting its own rule.
+		note("returned with count 0")
+		return bad
+	}
+	if m.Min > m.Max {
+		note("min %g is above max %g", m.Min, m.Max)
+	}
+	// An average of values all within [min,max] cannot fall outside it. A
+	// torn read - a count from one moment against a sum from another - is
+	// exactly what puts it there.
+	if m.Avg < m.Min || m.Avg > m.Max {
+		note("avg %g is outside [%g, %g]", m.Avg, m.Min, m.Max)
+	}
+	// Quantiles of one distribution are ordered by construction.
+	if m.P50 > m.P90 || m.P90 > m.P99 {
+		note("percentiles out of order: p50 %g, p90 %g, p99 %g", m.P50, m.P90, m.P99)
+	}
+	// And they describe the values min and max bound. The sketch is
+	// accurate to 1% (§23), so this allows for that rather than demanding
+	// an exactness it never promised.
+	if m.Max > 0 && m.P99 > m.Max*1.02 {
+		note("p99 %g exceeds max %g by more than the sketch's error", m.P99, m.Max)
+	}
+	return bad
 }
 
 // queryUntil reads one of this run's metrics by name until ctx is done.
@@ -1005,8 +1079,26 @@ func queryUntil(ctx context.Context, client *http.Client, cfg config, readerID i
 		t.queries++
 		t.byStatus[resp.StatusCode]++
 
-		_, _ = io.Copy(io.Discard, resp.Body)
+		if resp.StatusCode != http.StatusOK {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			continue
+		}
+
+		var stats statsResponse
+		decErr := json.NewDecoder(resp.Body).Decode(&stats)
 		resp.Body.Close()
+		if decErr != nil {
+			t.note("%s: undecodable response: %v", name, decErr)
+			continue
+		}
+
+		for metric, m := range stats.Metrics {
+			t.checked++
+			for _, b := range checkMetric(metric, m) {
+				t.note("%s", b)
+			}
+		}
 	}
 }
 
@@ -1043,4 +1135,13 @@ func (t readTally) report(w io.Writer, elapsed, clockRes time.Duration) {
 			show(t.lat.quantile(0.50), clockRes), show(t.lat.quantile(0.90), clockRes),
 			show(t.lat.quantile(0.99), clockRes), show(t.lat.max, clockRes))
 	}
+
+	if len(t.breaches) > 0 {
+		fmt.Fprintf(w, "BROKEN  readings that contradicted themselves:\n")
+		for _, b := range t.breaches {
+			fmt.Fprintf(w, "  %s\n", b)
+		}
+		return
+	}
+	fmt.Fprintf(w, "%d metric readings checked, all self-consistent\n", t.checked)
 }
