@@ -119,7 +119,7 @@ func TestRunLoadStopsAtDuration(t *testing.T) {
 	cfg := config{target: srv.URL, workers: 4, duration: 50 * time.Millisecond, metrics: 2}
 
 	start := time.Now()
-	total, _ := runLoad(context.Background(), cfg)
+	total, _, _ := runLoad(context.Background(), cfg)
 	elapsed := time.Since(start)
 
 	if total.sent() == 0 {
@@ -355,7 +355,7 @@ func TestBadFractionIsHonoured(t *testing.T) {
 
 	cfg := config{target: srv.URL, workers: 1, duration: 100 * time.Millisecond,
 		metrics: 1, badFrac: 0.5}
-	tal, _ := runLoad(context.Background(), cfg)
+	tal, _, _ := runLoad(context.Background(), cfg)
 
 	if tal.sent() < 10 {
 		t.Fatalf("only %d requests; too few to judge the ratio", tal.sent())

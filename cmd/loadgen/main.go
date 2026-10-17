@@ -40,6 +40,7 @@ type config struct {
 	wantCard    bool          // fail unless the server refused a name for cardinality
 	clientID    string        // sent as X-Client-ID, so the server can budget us separately
 	runID       string        // makes this run's metric names unique
+	readers     int           // concurrent readers querying while the writers write
 }
 
 // metricName is the metric a given worker reports under. The run ID keeps
@@ -80,6 +81,7 @@ func parseFlags(args []string) (config, error) {
 	fs.IntVar(&c.cardinality, "cardinality", 0, "distinct metric names per worker; 0 uses one, higher floods the store")
 	fs.BoolVar(&c.wantCard, "expect-cardinality", false, "fail unless the server refused a metric name for cardinality")
 	fs.StringVar(&c.clientID, "client", "", "value for the X-Client-ID header; empty sends none")
+	fs.IntVar(&c.readers, "readers", 0, "concurrent readers querying /stats while the writers write")
 
 	if err := fs.Parse(args); err != nil {
 		return config{}, err
@@ -100,6 +102,8 @@ func parseFlags(args []string) (config, error) {
 		return config{}, fmt.Errorf("-batch must be >= 1, got %d", c.batch)
 	case c.cardinality < 0:
 		return config{}, fmt.Errorf("-cardinality must be >= 0, got %d", c.cardinality)
+	case c.readers < 0:
+		return config{}, fmt.Errorf("-readers must be >= 0, got %d", c.readers)
 	}
 	return c, nil
 }
@@ -497,12 +501,13 @@ func sendUntil(ctx context.Context, client *http.Client, cfg config, workerID in
 // measured rather than assumed to equal cfg.duration: workers overrun the
 // deadline slightly by design (see sendUntil), and dividing by the wrong
 // denominator would quietly overstate throughput.
-func runLoad(ctx context.Context, cfg config) (tally, time.Duration) {
+func runLoad(ctx context.Context, cfg config) (tally, readTally, time.Duration) {
 	ctx, cancel := context.WithTimeout(ctx, cfg.duration)
 	defer cancel()
 
-	client := newClient(cfg.workers)
+	client := newClient(cfg.workers + cfg.readers)
 	results := make(chan tally, cfg.workers)
+	reads := make(chan readTally, cfg.readers)
 
 	start := time.Now()
 	var wg sync.WaitGroup
@@ -513,15 +518,30 @@ func runLoad(ctx context.Context, cfg config) (tally, time.Duration) {
 			results <- sendUntil(ctx, client, cfg, id)
 		}(w)
 	}
+	// Readers share the deadline rather than being stopped afterwards, so
+	// every query they make happened while writes were in flight - which
+	// is the only condition this is here to measure.
+	for r := 0; r < cfg.readers; r++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			reads <- queryUntil(ctx, client, cfg, id)
+		}(r)
+	}
 	wg.Wait()
 	elapsed := time.Since(start)
 	close(results)
+	close(reads)
 
 	total := newTally()
 	for t := range results {
 		total.merge(t)
 	}
-	return total, elapsed
+	totalReads := newReadTally()
+	for t := range reads {
+		totalReads.merge(t)
+	}
+	return total, totalReads, elapsed
 }
 
 // report writes a human-readable summary. Status codes are sorted so two
@@ -882,8 +902,9 @@ func main() {
 	// numbers the clock was too coarse to resolve.
 	clockRes := clockResolution()
 
-	total, elapsed := runLoad(context.Background(), cfg)
+	total, reads, elapsed := runLoad(context.Background(), cfg)
 	total.report(os.Stdout, elapsed, clockRes)
+	reads.report(os.Stdout, elapsed, clockRes)
 
 	if cfg.verify {
 		if err := verify(newClient(1), cfg, total, elapsed, os.Stdout); err != nil {
@@ -909,5 +930,117 @@ func main() {
 			"either it is not limiting concurrency or %d workers did not saturate it\n",
 			cfg.workers)
 		os.Exit(1)
+	}
+}
+
+// --- reading while the firehose runs (§45) ---
+//
+// §21 built this harness for the claim the in-process benchmarks
+// structurally cannot make: over real HTTP, the server recorded exactly
+// what it accepted. That is the first two clauses of the spine - events in,
+// correct aggregates - and it has never touched the third.
+//
+// "Fast queries out" had §34's and §41's benchmarks, which run in-process
+// against a store nobody is reading over a socket. Nothing measured what a
+// query costs, or whether it stays correct, while the firehose is actually
+// arriving down another connection.
+
+// readTally is what the readers bring back. Kept apart from tally rather
+// than folded into it, because mixing read and write latencies into one
+// distribution would report a number describing neither.
+type readTally struct {
+	byStatus map[int]int
+	failed   int // transport errors: no response at all
+	queries  int
+	lat      *latencies
+}
+
+func newReadTally() readTally { return readTally{byStatus: map[int]int{}, lat: newLatencies()} }
+
+func (t *readTally) merge(o readTally) {
+	for code, n := range o.byStatus {
+		t.byStatus[code] += n
+	}
+	t.failed += o.failed
+	t.queries += o.queries
+	t.lat.merge(o.lat)
+}
+
+// queryUntil reads one of this run's metrics by name until ctx is done.
+//
+// By name on purpose (§37): a reader asking for a known metric does no
+// store walk, so this measures the read path rather than the cost of
+// scanning whatever else the server happens to hold - and it keeps the
+// readers inside their query budget (§35) instead of measuring how fast
+// they can get themselves refused.
+func queryUntil(ctx context.Context, client *http.Client, cfg config, readerID int) readTally {
+	t := newReadTally()
+	base := strings.TrimSuffix(cfg.target, "/") + "/stats"
+
+	for i := 0; ; i++ {
+		if ctx.Err() != nil {
+			return t
+		}
+
+		name := cfg.metricName(readerID + i)
+		u := fmt.Sprintf("%s?name=%s", base, url.QueryEscape(name))
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		if err != nil {
+			t.failed++
+			continue
+		}
+		cfg.identify(req)
+
+		start := time.Now()
+		resp, err := client.Do(req)
+		if err != nil {
+			if ctx.Err() != nil {
+				return t // the run ended mid-request, which is not a failure
+			}
+			t.failed++
+			continue
+		}
+		t.lat.add(time.Since(start))
+		t.queries++
+		t.byStatus[resp.StatusCode]++
+
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+}
+
+// report prints the read side beside the write side.
+func (t readTally) report(w io.Writer, elapsed, clockRes time.Duration) {
+	if t.queries == 0 && t.failed == 0 {
+		return
+	}
+
+	fmt.Fprintf(w, "\n%d queries", t.queries)
+	if secs := elapsed.Seconds(); secs > 0 {
+		fmt.Fprintf(w, "  (%.0f q/s)", float64(t.queries)/secs)
+	}
+	fmt.Fprintln(w, "  read while the firehose was running")
+
+	codes := make([]int, 0, len(t.byStatus))
+	for c := range t.byStatus {
+		codes = append(codes, c)
+	}
+	sort.Ints(codes)
+	for _, c := range codes {
+		n := t.byStatus[c]
+		pct := 0.0
+		if t.queries > 0 {
+			pct = float64(n) / float64(t.queries) * 100
+		}
+		fmt.Fprintf(w, "  %3d %9d  %5.1f%%\n", c, n, pct)
+	}
+	if t.failed > 0 {
+		fmt.Fprintf(w, "  err %9d  (no response)\n", t.failed)
+	}
+	if t.lat.count > 0 {
+		fmt.Fprintf(w, "query latency  p50 %s  p90 %s  p99 %s  max %s\n",
+			show(t.lat.quantile(0.50), clockRes), show(t.lat.quantile(0.90), clockRes),
+			show(t.lat.quantile(0.99), clockRes), show(t.lat.max, clockRes))
 	}
 }
