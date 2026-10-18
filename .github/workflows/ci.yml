@@ -870,6 +870,73 @@ jobs:
           print("one reload, one refusal, both reported")
           PY
 
+      # §46: /alerts is bounded the way /stats is, and the rule count is
+      # now whatever a config file says. A thousand rules is the case that
+      # did not exist when §28 bounded everything else.
+      - name: /alerts must stay bounded under a large rule set
+        run: |
+          python3 - <<'PY'
+          import json
+          rules = [{"name": "rule-%05d" % i, "metric": "svc.hot",
+                    "stat": "max", "op": ">", "value": 1} for i in range(1200)]
+          rules.append({"name": "watches-self", "metric": "metricflow.requests.shed",
+                        "stat": "increase", "op": ">", "value": 0})
+          with open("many.json", "w") as f:
+              json.dump(rules, f)
+          PY
+
+          kill -TERM "$(cat server.pid)"
+          for i in $(seq 1 100); do
+            kill -0 "$(cat server.pid)" 2>/dev/null || break
+            sleep 0.2
+          done
+
+          METRICFLOW_RULES=many.json ./metricflow > many.log 2>&1 &
+          echo $! > server.pid
+          for i in $(seq 1 50); do
+            curl -sf localhost:8080/health > /dev/null && break
+            sleep 0.2
+          done
+
+          curl -sf --max-time 10 "localhost:8080/alerts" > alerts.json
+          curl -sf --max-time 10 "localhost:8080/alerts?state=firing" > firing.json
+          wc -c alerts.json
+
+          python3 - <<'PY'
+          import json, sys
+
+          with open("alerts.json") as f:
+              body = json.load(f)
+
+          returned, matched = len(body["alerts"]), body["matched"]
+          print("returned=%d matched=%d truncated=%s next=%s"
+                % (returned, matched, body["truncated"], body.get("next")))
+
+          if matched != 1201:
+              sys.exit("matched = %d, want the 1201 rules configured" % matched)
+          if returned > 1000:
+              sys.exit("returned %d rule states in one response; the limit is not honoured"
+                       % returned)
+          if not body["truncated"]:
+              sys.exit("dropped %d rules without saying so" % (matched - returned))
+          if not body.get("next"):
+              sys.exit("a truncated response carried no cursor; a client cannot continue")
+
+          # The filter is what makes the bound usable rather than merely safe.
+          with open("firing.json") as f:
+              firing = json.load(f)
+          for a in firing["alerts"]:
+              if a["state"] != "firing":
+                  sys.exit("?state=firing returned a rule in state %s" % a["state"])
+          print("state filter returned %d rules, all firing" % len(firing["alerts"]))
+          PY
+
+          # An over-large limit is an error, not a silent clamp.
+          code=$(curl -s -o /dev/null -w '%{http_code}' "localhost:8080/alerts?limit=99999")
+          [ "$code" = "400" ] || { echo "limit=99999 gave $code, want 400"; exit 1; }
+          code=$(curl -s -o /dev/null -w '%{http_code}' "localhost:8080/alerts?state=firingg")
+          [ "$code" = "400" ] || { echo "an unknown state gave $code, want 400"; exit 1; }
+
       - name: shut down cleanly
         run: |
           kill -TERM "$(cat server.pid)"
