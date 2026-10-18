@@ -183,6 +183,11 @@ for *what* was decided and read in full only where the *why* matters.
 
 - [45. Reading while the firehose runs](#45-reading-while-the-firehose-runs)  
   The harness proved two thirds of the spine — events in, correct aggregates — and never read anything until the run was over; readers now query throughout, and every reading is held to invariants that unlucky timing cannot break.
+
+**Bounding the last endpoint**
+
+- [46. The endpoint the bound forgot](#46-the-endpoint-the-bound-forgot)  
+  §28 called an unbounded response "the last unbounded thing in the server" and was right about every endpoint that existed then; §38 made the rule count a config input and handed `/alerts` the same problem back.
 ## Design choices
 
 ### 1. Store the conclusion, not the events
@@ -3284,6 +3289,74 @@ was behaving correctly.
   contention figures.
 - *It does not read `/alerts`.* The alerting state machine has its own tests
   and no per-request arithmetic to tear.
+
+### 46. The endpoint the bound forgot
+
+> **In one line:** §28 called an unbounded response "the last unbounded thing
+> in the server" and was right about every endpoint that existed then; §38
+> made the rule count a config input and handed `/alerts` the same problem
+> back.
+
+§28 bounded `/stats` because one ~30-byte `GET` could cost 77 ms and 62 MB,
+and §26's limiter admits 256 of those at once. At the time `/alerts`
+answered for the five rules in `defaultRules`, so there was nothing to
+bound and no reason to look.
+
+§38 made the rule count something a config file decides. A 1 MiB rules file
+holds about 9 800 rules:
+
+| rules | one `/alerts` | × 256 concurrent |
+| --- | --- | --- |
+| 5 | 638 bytes | — |
+| 1 000 | 125 KB | 30 MB |
+| 9 800 | **1.2 MB** | **299 MB** |
+
+That is §28's arithmetic exactly, for the same kind of request, against the
+same limiter — reintroduced by a later slice into an endpoint the earlier one
+had no reason to examine. Neither slice was wrong on its own. The gap is
+what they imply together, and nothing in the codebase was positioned to
+notice.
+
+**So `/alerts` takes the same bound `/stats` does**: `?limit=`, `?after=`,
+and `matched` / `truncated` / `next` meaning exactly what they mean there.
+An over-large limit is an error rather than a silent clamp, which is the call
+§11 made for a window past retention. `maxAlertsLimit` *is* `maxStatsLimit`
+rather than a second constant, because it is the same decision about the same
+kind of request and two numbers would only drift apart.
+
+**A bound alone would make it safe and useless.** With a rules file of any
+size the question is almost always *what is firing*, and paging ten times to
+find three rules is a worse answer than the unbounded response was. `?state=`
+filters to one of the four states.
+
+That filter validates rather than passes through. `?state=firingg` would
+otherwise match nothing and return an empty list, **which looks exactly like
+a healthy fleet** — the most dangerous wrong answer this endpoint can give,
+and the same reasoning §38 used for refusing an unknown stat in a rules file
+instead of letting it evaluate to nothing.
+
+**And it is charged now** (§35). `/stats` and `/series` were priced and
+`/alerts` was not, which was defensible while it answered for five rules and
+stopped being so when the count became a config input: a client could ask for
+a thousand rule states as often as it liked and pay nothing. Priced per rule
+returned and nothing for a walk, because there is no walk — the states are a
+map the alerter already holds, which is §37's arithmetic for a named query.
+It is the third endpoint to call `refuseOverBudget`, which is the payoff for
+extracting that in §39 rather than pasting the block a second time.
+
+**What this deliberately does not do.**
+
+- *It does not sort by state.* A caller wanting the firing ones asks for
+  them; ordering by state would make `next` mean something that changes as
+  rules transition, and a cursor that moves under a client is worse than no
+  cursor.
+- *It does not bound the rule count itself.* 9 800 rules evaluate in 19 ms
+  per interval with no measurable effect on ingest — measured before
+  assuming — so the cost was never in evaluating them, only in serialising
+  them all into one response.
+- *It does not page `/alerts` from the alerting loop.* `Snapshot` stays
+  unbounded for callers inside the process, which are not going to be handed
+  9 800 rules by a stranger.
 
 ## Testing
 
