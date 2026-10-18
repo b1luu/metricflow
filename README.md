@@ -39,12 +39,25 @@ exits; a second `Ctrl-C` kills immediately.
 | POST   | `/ingest/batch` | Submit many events as newline-delimited JSON.    |
 | GET    | `/stats`  | Per-metric count/avg/min/max and p50/p90/p99 over a time window (JSON, default 60s). Bounded — see below. |
 | GET    | `/series` | Per-bucket values for named metrics, for plotting (JSON). |
-| GET    | `/alerts` | Current state of every alert rule (JSON).              |
+| GET    | `/alerts` | State of every alert rule (JSON). Bounded and filterable. |
 
 `/alerts` reports each rule as `ok`, `pending`, `firing`, or `nodata`, with
 the value it last saw and when it entered that state. Rules are re-evaluated
 every 10 seconds, so a threshold crossing shows up within one interval — and a
 rule whose metric has no data reads as `nodata`, never as healthy.
+
+**Ask for what is firing rather than reading all of it**, because a rules
+file can hold thousands:
+
+```
+curl -s "localhost:8080/alerts?state=firing"
+```
+
+`/alerts` is bounded exactly as `/stats` is — `?limit=`, `?after=`, and
+`matched` / `truncated` / `next` — and charged against the same per-client
+query budget. An over-large limit is a `400`, and so is an unknown state: a
+misspelled `?state=firingg` returning an empty list would look exactly like a
+healthy fleet. See [DESIGN.md](DESIGN.md) §46.
 
 **Rules come from a file.** Point `METRICFLOW_RULES` at one; leave it unset and
 the built-in set is used.
