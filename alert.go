@@ -13,6 +13,7 @@ import (
 	"log"
 	"net/http"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -444,8 +445,25 @@ func (a *Alerter) SetRules(now time.Time, rules []Rule) error {
 	return nil
 }
 
+// maxAlertsLimit bounds one /alerts response (§46).
+//
+// §28 bounded /stats because an unbounded response was "the last unbounded
+// thing in the server", and at the time /alerts answered for the five rules
+// in defaultRules. §38 made the rule count something a config file decides:
+// a 1 MiB rules file holds about 9 800 rules, which is a 1.2 MB response
+// that §26's limiter will admit 256 of at once - 299 MB, for the same
+// ~30-byte GET §28 was arguing about.
+//
+// The same number as maxStatsLimit, because it is the same decision about
+// the same kind of request and two of them would only invite drift.
+const maxAlertsLimit = maxStatsLimit
+
 // Snapshot copies out the current state of every rule, ordered by rule name
 // so callers (and tests) get a stable listing rather than map order.
+//
+// Unbounded, and kept that way for callers inside the process - the
+// alerting loop and tests - which are not going to be handed 9 800 rules
+// by a stranger. handleAlerts uses SnapshotPage.
 func (a *Alerter) Snapshot() []AlertState {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -458,11 +476,44 @@ func (a *Alerter) Snapshot() []AlertState {
 	return out
 }
 
+// alertsQuery is what a caller asked /alerts for.
+type alertsQuery struct {
+	limit int
+	after string // only rules ordered strictly after this one
+}
+
+// SnapshotPage is Snapshot bounded: at most limit states, ordered by rule
+// name, starting after the given one.
+//
+// matched is how many rules exist in total, not how many came back, for the
+// reason §28 gives: a caller that cannot tell it got a partial answer will
+// act as though rules that exist do not.
+func (a *Alerter) SnapshotPage(q alertsQuery) (states []AlertState, matched int) {
+	all := a.Snapshot() // already sorted by rule name
+
+	for _, st := range all {
+		if st.Rule <= q.after {
+			continue
+		}
+		matched++
+		if len(states) < q.limit {
+			states = append(states, st)
+		}
+	}
+	return states, matched
+}
+
 // AlertsResponse is the JSON body of GET /alerts. An object rather than a
 // bare array so fields can be added later without breaking every caller's
 // parser.
 type AlertsResponse struct {
 	Alerts []AlertState `json:"alerts"`
+
+	// The same three fields /stats carries, and for the same reason (§28):
+	// a bounded response has to say that it is one.
+	Matched   int    `json:"matched"`
+	Truncated bool   `json:"truncated"`
+	Next      string `json:"next,omitempty"`
 }
 
 // handleAlerts: GET /alerts - the current state of every configured rule.
@@ -471,10 +522,55 @@ type AlertsResponse struct {
 // (§18), which keeps this a cheap read: polling it hard costs a lock and a
 // copy, never a full re-evaluation of every rule.
 func (a *Alerter) handleAlerts(w http.ResponseWriter, r *http.Request) {
-	// Snapshot() always returns a non-nil slice, so an empty rule set
-	// encodes as [] rather than null.
-	resp := AlertsResponse{Alerts: a.Snapshot()}
+	q, err := parseAlertsQuery(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	states, matched := a.SnapshotPage(q)
+
+	// Non-nil so an empty rule set encodes as [] rather than null.
+	if states == nil {
+		states = []AlertState{}
+	}
+	resp := AlertsResponse{
+		Alerts:    states,
+		Matched:   matched,
+		Truncated: matched > len(states),
+	}
+	if resp.Truncated && len(states) > 0 {
+		resp.Next = states[len(states)-1].Rule
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp) // see §17: nothing to do on failure
+}
+
+// parseAlertsQuery reads ?limit= and ?after=.
+//
+// An over-large limit is an error rather than something quietly clamped,
+// which is the call §11 made for a window past retention and §28 for a
+// limit past the maximum: a caller who asks for 50 000 and receives 1 000
+// under a 200 has been handed wrong data.
+func parseAlertsQuery(r *http.Request) (alertsQuery, error) {
+	q := alertsQuery{limit: maxAlertsLimit}
+	v := r.URL.Query()
+
+	if s := v.Get("limit"); s != "" {
+		n, err := strconv.Atoi(s)
+		if err != nil {
+			return q, fmt.Errorf("invalid limit (want a positive integer)")
+		}
+		if n < 1 {
+			return q, fmt.Errorf("limit must be at least 1, got %d", n)
+		}
+		if n > maxAlertsLimit {
+			return q, fmt.Errorf("limit exceeds the maximum of %d", maxAlertsLimit)
+		}
+		q.limit = n
+	}
+
+	q.after = v.Get("after")
+	return q, nil
 }

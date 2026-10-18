@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -549,8 +550,16 @@ func TestAlertsHandlerEmptyEncodesAsArray(t *testing.T) {
 	rec := httptest.NewRecorder()
 	a.handleAlerts(rec, httptest.NewRequest(http.MethodGet, "/alerts", nil))
 
-	if body := strings.TrimSpace(rec.Body.String()); body != `{"alerts":[]}` {
-		t.Errorf("body = %s, want {\"alerts\":[]}", body)
+	// The property is that an empty rule set encodes as [] and not null,
+	// so a client ranging over it does not have to special-case nothing.
+	// Asserting the whole body instead would break every time a field is
+	// added, which is what it did when §46 added the three bounding ones.
+	body := strings.TrimSpace(rec.Body.String())
+	if !strings.Contains(body, `"alerts":[]`) {
+		t.Errorf("body = %s, want an empty array for alerts", body)
+	}
+	if strings.Contains(body, `"alerts":null`) {
+		t.Errorf("body = %s, want [] rather than null", body)
 	}
 }
 
@@ -873,5 +882,108 @@ func TestAReloadAddsAndRemovesRules(t *testing.T) {
 	}
 	if got["drop"] {
 		t.Error("a rule removed by the reload is still reported")
+	}
+}
+
+// --- bounding /alerts (§46) ---
+
+func alertsWith(t *testing.T, n int) *Alerter {
+	t.Helper()
+	rules := make([]Rule, 0, n)
+	for i := 0; i < n; i++ {
+		rules = append(rules, Rule{
+			Name: fmt.Sprintf("rule-%05d", i), Metric: "m",
+			Stat: StatMax, Op: OpGT, Value: 1,
+		})
+	}
+	a, err := newAlerter(time.Now(), newStore(), rules)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return a
+}
+
+func getAlertsQuery(t *testing.T, a *Alerter, query string) AlertsResponse {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	a.handleAlerts(rec, httptest.NewRequest(http.MethodGet, "/alerts"+query, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("alerts %q: status = %d (body %q)", query, rec.Code, rec.Body.String())
+	}
+	var resp AlertsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("alerts %q: invalid JSON: %v", query, err)
+	}
+	return resp
+}
+
+// The bound holds without being asked for. §38 made the rule count
+// something a config file decides, so a caller sending no parameters must
+// still get a bounded answer - the difference between a limit and a
+// suggestion.
+func TestAlertsIsBoundedWithNoParameters(t *testing.T) {
+	a := alertsWith(t, maxAlertsLimit+250)
+
+	resp := getAlertsQuery(t, a, "")
+	if len(resp.Alerts) != maxAlertsLimit {
+		t.Errorf("returned %d rules with no parameters, want at most %d",
+			len(resp.Alerts), maxAlertsLimit)
+	}
+	if resp.Matched != maxAlertsLimit+250 {
+		t.Errorf("matched = %d, want every rule that exists", resp.Matched)
+	}
+	if !resp.Truncated {
+		t.Error("truncated = false on a response that left 250 rules out")
+	}
+	if resp.Next == "" {
+		t.Error("a truncated response carried no cursor; a client cannot continue")
+	}
+}
+
+// And a caller can page through all of them, which is what makes the
+// bound acceptable rather than a loss of information.
+func TestAlertsCanBePagedThrough(t *testing.T) {
+	const total = 25
+	a := alertsWith(t, total)
+
+	seen := map[string]bool{}
+	after := ""
+	for page := 0; page < 10; page++ {
+		resp := getAlertsQuery(t, a, fmt.Sprintf("?limit=10&after=%s", after))
+		for _, st := range resp.Alerts {
+			if seen[st.Rule] {
+				t.Fatalf("%s came back twice", st.Rule)
+			}
+			seen[st.Rule] = true
+		}
+		if !resp.Truncated {
+			break
+		}
+		if resp.Next <= after {
+			t.Fatalf("cursor did not advance past %q", after)
+		}
+		after = resp.Next
+	}
+
+	if len(seen) != total {
+		t.Errorf("paged through %d rules, want all %d", len(seen), total)
+	}
+}
+
+// An over-large limit is an error, not a silent clamp (§11, §28).
+func TestAlertsRefusesAnImpossibleLimit(t *testing.T) {
+	a := alertsWith(t, 5)
+
+	for _, raw := range []string{
+		fmt.Sprintf("?limit=%d", maxAlertsLimit+1),
+		"?limit=0",
+		"?limit=-1",
+		"?limit=abc",
+	} {
+		rec := httptest.NewRecorder()
+		a.handleAlerts(rec, httptest.NewRequest(http.MethodGet, "/alerts"+raw, nil))
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("%s: status = %d, want 400", raw, rec.Code)
+		}
 	}
 }
