@@ -532,7 +532,23 @@ func (a *Alerter) handleAlerts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Charged like the other two read endpoints (§35). /alerts was the
+	// one left out, which was defensible while it answered for five rules
+	// and stopped being so when §38 made the count a config input: a
+	// client can now ask for a thousand rule states as often as it likes
+	// and pay nothing for any of it.
+	//
+	// Priced per rule returned, and nothing for a walk, because there is
+	// no store walk here - the states are a map the alerter already holds
+	// (§37's arithmetic for a named query).
+	now := time.Now()
+	c, _ := clientFrom(r.Context())
+	if a.store.refuseOverBudget(w, c, now) {
+		return
+	}
+
 	states, matched := a.SnapshotPage(q)
+	c.chargeQuery(now, queryCost(0, len(states)))
 
 	// Non-nil so an empty rule set encodes as [] rather than null.
 	if states == nil {

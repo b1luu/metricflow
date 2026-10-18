@@ -1064,3 +1064,60 @@ func TestAFilteredListingIsStillBounded(t *testing.T) {
 		t.Error("a filtered listing that left rules out did not say so")
 	}
 }
+
+// /alerts is charged like the other read endpoints (§35). It was the one
+// left out, which was defensible while it answered for five rules and
+// stopped being so when §38 made the count a config input.
+func TestAlertsIsChargedAgainstTheQueryBudget(t *testing.T) {
+	s := newStore()
+	a, err := newAlerter(time.Now(), s, []Rule{
+		{Name: "a", Metric: "m", Stat: StatMax, Op: OpGT, Value: 1},
+		{Name: "b", Metric: "m", Stat: StatMax, Op: OpGT, Value: 1},
+		{Name: "c", Metric: "m", Stat: StatMax, Op: OpGT, Value: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c := &client{}
+	req := httptest.NewRequest(http.MethodGet, "/alerts", nil)
+	req = req.WithContext(withClient(req.Context(), c, "tester"))
+	rec := httptest.NewRecorder()
+	a.handleAlerts(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+
+	c.mu.Lock()
+	spent := c.querySpent
+	c.mu.Unlock()
+	if spent != 3 {
+		t.Errorf("charged %d for three rule states, want 3 - priced per rule "+
+			"returned and nothing for a walk it did not do", spent)
+	}
+}
+
+// And a client over its budget is refused here too, with the status the
+// other endpoints use.
+func TestAlertsRefusesAClientOverItsBudget(t *testing.T) {
+	s := newStore()
+	a, err := newAlerter(time.Now(), s, defaultRules())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c := &client{}
+	c.chargeQuery(time.Now(), maxQueryCostPerEpoch*2)
+
+	req := httptest.NewRequest(http.MethodGet, "/alerts", nil)
+	req = req.WithContext(withClient(req.Context(), c, "tester"))
+	rec := httptest.NewRecorder()
+	a.handleAlerts(rec, req)
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Errorf("status = %d, want 429 for a client over its budget", rec.Code)
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Error("a refusal with no Retry-After tells the client nothing")
+	}
+}
