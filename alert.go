@@ -480,6 +480,7 @@ func (a *Alerter) Snapshot() []AlertState {
 type alertsQuery struct {
 	limit int
 	after string // only rules ordered strictly after this one
+	state State  // only rules in this state; empty means all
 }
 
 // SnapshotPage is Snapshot bounded: at most limit states, ordered by rule
@@ -493,6 +494,9 @@ func (a *Alerter) SnapshotPage(q alertsQuery) (states []AlertState, matched int)
 
 	for _, st := range all {
 		if st.Rule <= q.after {
+			continue
+		}
+		if q.state != "" && st.State != q.state {
 			continue
 		}
 		matched++
@@ -572,5 +576,24 @@ func parseAlertsQuery(r *http.Request) (alertsQuery, error) {
 	}
 
 	q.after = v.Get("after")
+
+	// ?state= is what makes the bound usable rather than merely safe.
+	// With a rules file of any size the question is almost always "what
+	// is firing", and paging ten times to find three rules is a worse
+	// answer than the unbounded response was.
+	//
+	// Validated against the states that exist rather than passed through:
+	// ?state=firingg would otherwise match nothing and look exactly like
+	// a healthy fleet, which is the most dangerous wrong answer this
+	// endpoint can give.
+	if s := v.Get("state"); s != "" {
+		switch State(s) {
+		case StateOK, StatePending, StateFiring, StateNoData:
+			q.state = State(s)
+		default:
+			return q, fmt.Errorf("unknown state %q (want ok, pending, firing or nodata)", s)
+		}
+	}
+
 	return q, nil
 }

@@ -987,3 +987,80 @@ func TestAlertsRefusesAnImpossibleLimit(t *testing.T) {
 		}
 	}
 }
+
+// ?state= is what makes the bound usable. With a large rule set the
+// question is almost always "what is firing", and paging to find it is a
+// worse answer than the unbounded response was.
+func TestAlertsCanBeFilteredByState(t *testing.T) {
+	s := newStore()
+	a, err := newAlerter(time.Now(), s, []Rule{
+		{Name: "hot", Metric: "cpu", Stat: StatMax, Op: OpGT, Value: 1},
+		{Name: "cold", Metric: "mem", Stat: StatMax, Op: OpGT, Value: 1000},
+		{Name: "silent", Metric: "absent", Stat: StatMax, Op: OpGT, Value: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	recordNow(s, "cpu", 100) // breaches
+	recordNow(s, "mem", 1)   // does not
+	a.evaluateAll(time.Now())
+
+	firing := getAlertsQuery(t, a, "?state=firing")
+	if len(firing.Alerts) != 1 || firing.Alerts[0].Rule != "hot" {
+		t.Errorf("?state=firing returned %+v, want only hot", firing.Alerts)
+	}
+	if firing.Matched != 1 {
+		t.Errorf("matched = %d, want 1 - matched counts what the filter kept",
+			firing.Matched)
+	}
+
+	nodata := getAlertsQuery(t, a, "?state=nodata")
+	if len(nodata.Alerts) != 1 || nodata.Alerts[0].Rule != "silent" {
+		t.Errorf("?state=nodata returned %+v, want only silent", nodata.Alerts)
+	}
+
+	// And no filter still returns everything.
+	if all := getAlertsQuery(t, a, ""); len(all.Alerts) != 3 {
+		t.Errorf("no filter returned %d rules, want 3", len(all.Alerts))
+	}
+}
+
+// A state nobody defined is refused rather than matching nothing.
+//
+// ?state=firingg returning an empty list looks exactly like a healthy
+// fleet, which is the most dangerous wrong answer this endpoint can give.
+func TestAlertsRefusesAnUnknownState(t *testing.T) {
+	a := alertsWith(t, 3)
+
+	for _, raw := range []string{"?state=firingg", "?state=FIRING", "?state=up", "?state=1"} {
+		rec := httptest.NewRecorder()
+		a.handleAlerts(rec, httptest.NewRequest(http.MethodGet, "/alerts"+raw, nil))
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("%s: status = %d, want 400 - an unknown state must not "+
+				"quietly match nothing", raw, rec.Code)
+		}
+	}
+
+	// Every state the server can actually be in is accepted.
+	for _, st := range []State{StateOK, StatePending, StateFiring, StateNoData} {
+		rec := httptest.NewRecorder()
+		a.handleAlerts(rec, httptest.NewRequest(http.MethodGet, "/alerts?state="+string(st), nil))
+		if rec.Code != http.StatusOK {
+			t.Errorf("?state=%s: status = %d, want 200", st, rec.Code)
+		}
+	}
+}
+
+// Filtering and paging compose: a filtered listing is bounded too.
+func TestAFilteredListingIsStillBounded(t *testing.T) {
+	a := alertsWith(t, maxAlertsLimit+50) // all start at nodata
+
+	resp := getAlertsQuery(t, a, "?state=nodata")
+	if len(resp.Alerts) != maxAlertsLimit {
+		t.Errorf("returned %d, want at most %d", len(resp.Alerts), maxAlertsLimit)
+	}
+	if !resp.Truncated || resp.Next == "" {
+		t.Error("a filtered listing that left rules out did not say so")
+	}
+}
