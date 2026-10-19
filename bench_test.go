@@ -1035,3 +1035,59 @@ func BenchmarkRecordUnderSeries(b *testing.B) {
 		})
 	}
 }
+
+// --- what the store costs in memory (§47) ---
+
+// §27 capped metric names at shardCount * maxMetricsPerShard and treated
+// that as the memory bound. It bounds names. What a name costs depends on
+// how widely its values are spread, which nothing bounds - and §32's "a
+// full store is 9 MB" was bytes on disk for modest data, not heap for
+// realistic data.
+//
+// A benchmark rather than a test: the numbers move with Go's map layout
+// and the point is to be able to take the measurement, not to assert a
+// figure that will drift.
+func BenchmarkStoreMemoryByValueSpread(b *testing.B) {
+	heap := func() float64 {
+		runtime.GC()
+		runtime.GC()
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		return float64(m.HeapAlloc)
+	}
+
+	for _, c := range []struct {
+		why    string
+		spread float64
+		steps  int
+	}{
+		{"one-value", 1.0, 50},
+		{"latency-1ms-1s", 1.02, 350},
+		{"wide-1e-3-1e9", 1.05, 600},
+	} {
+		b.Run(c.why, func(b *testing.B) {
+			const metrics = 2000
+
+			base := heap()
+			s := newStore()
+			now := time.Now()
+			for m := 0; m < metrics; m++ {
+				name := fmt.Sprintf("svc.metric.%d", m)
+				for bucket := 0; bucket < numBuckets; bucket++ {
+					at := now.Add(-time.Duration(bucket) * bucketWidth)
+					v := 0.001
+					for i := 0; i < c.steps; i++ {
+						_ = s.record(now, Event{Name: name, Value: v, TS: at.UnixMilli()})
+						v *= c.spread
+					}
+				}
+			}
+			held := heap() - base
+			runtime.KeepAlive(s)
+
+			perMetric := held / metrics
+			b.ReportMetric(perMetric/1024, "KB/metric")
+			b.ReportMetric(perMetric*float64(shardCount*maxMetricsPerShard)/(1<<20), "MB/full-store")
+		})
+	}
+}
