@@ -588,6 +588,24 @@ names per shard (32 shards, so ~32k in total), and at most 256 bytes per name.
 Capping only the count would bound nothing — a 1 MiB batch body means names
 could be megabytes each.
 
+**That cap bounds names, not memory**, and the difference is large. What a
+metric costs depends on how widely its values are spread, measured with every
+time bucket populated:
+
+| values reported | per metric | a full store |
+| --- | --- | --- |
+| one value only | 1.9 KB | 59 MB |
+| 1 ms – 1 s latency | 56.8 KB | 1,816 MB |
+| 1e-3 – 1e9 wide | 109.2 KB | 3,496 MB |
+
+So size the cap against what your fleet actually reports.
+`metricflow.store.histogram_buckets` is the gauge that tells you which of
+those rows you are on — `store.metrics` and `store.buckets` read identically
+for all three. A single histogram is capped at 1024 buckets per sign, which
+covers nine orders of magnitude; past that the *lowest* buckets collapse, so
+p99 stays accurate and the fastest requests blur. See
+[DESIGN.md](DESIGN.md) §47.
+
 Past the limit a **new** name is refused with `429` and `Retry-After`; in a
 batch it is a per-event rejection marked `"retryable": true`, to distinguish
 it from a contract violation that will never succeed. Metrics that already
