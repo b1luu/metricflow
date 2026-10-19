@@ -483,3 +483,114 @@ func TestPercentileRuleWithoutADistribution(t *testing.T) {
 		t.Errorf("got state=%q value=%g, want ok/0", state, v)
 	}
 }
+
+// --- bounding one histogram (§47) ---
+
+// A histogram must not grow without limit. bucketIndex spans 36 525
+// buckets per sign, so a client reporting across the float64 range could
+// make one metric hold a megabyte - which is what §27's cap on *names*
+// does not bound.
+func TestAHistogramIsBounded(t *testing.T) {
+	h := &hist{}
+
+	// Values across the whole usable range, positive and negative.
+	for v := minMagnitude; v < 1e30; v *= 1.05 {
+		h.add(v)
+		h.add(-v)
+	}
+
+	if len(h.pos) > maxHistBuckets {
+		t.Errorf("pos holds %d buckets, over the cap of %d", len(h.pos), maxHistBuckets)
+	}
+	if len(h.neg) > maxHistBuckets {
+		t.Errorf("neg holds %d buckets, over the cap of %d", len(h.neg), maxHistBuckets)
+	}
+}
+
+// Nothing is lost when a bucket collapses - the count moves, it does not
+// disappear. An observation the histogram forgot would make every
+// percentile a guess about a different distribution.
+func TestCollapsingKeepsEveryObservation(t *testing.T) {
+	h := &hist{}
+
+	n := 0
+	for v := minMagnitude; v < 1e30; v *= 1.05 {
+		h.add(v)
+		n++
+	}
+
+	var held int64
+	for _, c := range h.pos {
+		held += c
+	}
+	if held != int64(n) {
+		t.Errorf("histogram holds %d observations, want the %d added", held, n)
+	}
+	if h.count != int64(n) {
+		t.Errorf("count = %d, want %d", h.count, n)
+	}
+}
+
+// The cap is generous enough that a realistic metric never reaches it, so
+// §23's 1% promise holds unqualified for the data anyone actually has.
+func TestARealisticSpreadNeverCollapses(t *testing.T) {
+	h := &hist{}
+
+	// A microsecond to ten seconds, which is wider than most latency
+	// metrics ever get.
+	for v := 1e-6; v < 10; v *= 1.02 {
+		h.add(v)
+	}
+
+	if len(h.pos) >= maxHistBuckets {
+		t.Errorf("a 1us..10s spread used %d buckets and hit the cap of %d; "+
+			"the cap is too tight for real data", len(h.pos), maxHistBuckets)
+	}
+
+	// And the quantiles are still accurate, not merely present. Compared
+	// against the same values held in an uncapped histogram rather than
+	// against a number guessed by hand - the first version of this test
+	// guessed, and guessed wrong.
+	exact := &hist{}
+	for v := 1e-6; v < 10; v *= 1.02 {
+		exact.pos = addUncapped(exact.pos, bucketIndex(v))
+		exact.count++
+	}
+
+	got, want := h.quantiles(0.99)[0], exact.quantiles(0.99)[0]
+	if rel := (got - want) / want; rel > relAccuracy || rel < -relAccuracy {
+		t.Errorf("p99 = %g against an uncapped %g, a %.1f%% difference; the cap "+
+			"changed an answer it was supposed to leave alone", got, want, rel*100)
+	}
+}
+
+// addUncapped puts an index in without the cap, so a test can compare
+// against what the histogram would have held.
+func addUncapped(m map[int32]int64, i int32) map[int32]int64 {
+	if m == nil {
+		m = map[int32]int64{}
+	}
+	m[i]++
+	return m
+}
+
+// Collapsing sacrifices the fast end, never the slow one. Percentiles are
+// asked for to find out how bad the tail is, so blurring the top would
+// blur the only number anything alerts on.
+func TestCollapsingSacrificesTheFastEndNotTheTail(t *testing.T) {
+	h := &hist{}
+
+	// Enough spread to force collapsing, with a clear slow tail.
+	for v := minMagnitude; v < 1e20; v *= 1.05 {
+		h.add(v)
+	}
+	for i := 0; i < 100; i++ {
+		h.add(1e20) // the tail everyone cares about
+	}
+
+	p99 := h.quantiles(0.99)[0]
+	if p99 < 1e19 {
+		t.Errorf("p99 = %g, want the slow tail near 1e20; collapsing blurred "+
+			"the end that matters", p99)
+	}
+}

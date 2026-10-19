@@ -75,6 +75,30 @@ type hist struct {
 
 // add records one observation. The maps are created on first use, so a
 // metric that never reports a negative never allocates a negative map.
+// maxHistBuckets caps how many buckets one sign of one histogram may hold
+// (§47).
+//
+// Without it, the only bound is the float64 range: bucketIndex spans
+// -1036 to 35488, so 36 525 buckets per sign are reachable by a client
+// reporting values across the whole range. §27 capped the number of metric
+// names and treated that as the memory bound, but what a name costs
+// depends on how widely its values are spread - a thirty-fold range the
+// cap has no opinion about.
+//
+// 1024 covers gamma^1024, about nine orders of magnitude. The number was
+// chosen by asking what real metrics need rather than for roundness:
+// microseconds to ten seconds is 806 buckets, milliseconds to seconds is
+// 346. 512 was the first attempt and a test caught it - a 1us..10s latency
+// metric hit the cap exactly, which is precisely the data this has to keep
+// exact.
+//
+// It bounds the pathological case rather than making the store small: a
+// client spreading values across the whole float64 range could otherwise
+// reach 36 525 buckets in one histogram. Full-store memory is still
+// dominated by how many metrics exist times how wide their values are
+// (§47), and the lever for that is §27's cardinality cap.
+const maxHistBuckets = 1024
+
 func (h *hist) add(v float64) {
 	h.count++
 	switch {
@@ -82,15 +106,58 @@ func (h *hist) add(v float64) {
 		if h.pos == nil {
 			h.pos = make(map[int32]int64)
 		}
-		h.pos[bucketIndex(v)]++
+		h.pos[h.fit(h.pos, bucketIndex(v))]++
 	case v <= -minMagnitude:
 		if h.neg == nil {
 			h.neg = make(map[int32]int64)
 		}
-		h.neg[bucketIndex(-v)]++
+		h.neg[h.fit(h.neg, bucketIndex(-v))]++
 	default:
 		h.zeros++
 	}
+}
+
+// fit returns the bucket i belongs in, collapsing the lowest buckets first
+// if the map is full.
+//
+// Which end to sacrifice is the whole decision. Percentiles are asked for
+// to find out how bad the slow end is - §18's rules watch p99 and §23
+// exists because a max fires on one unlucky request while a p99 describes
+// a real fraction of users. Collapsing the *highest* buckets would blur
+// exactly the number everything else is built to read. Collapsing the
+// lowest blurs the fastest requests, which nobody alerts on.
+//
+// This is DDSketch's collapsingLowest, and it keeps the promise §23 makes
+// where it matters: every bucket above the floor is still accurate to 1%,
+// and the floor only rises for a metric spanning more than 30 000 to one.
+func (h *hist) fit(buckets map[int32]int64, i int32) int32 {
+	if _, exists := buckets[i]; exists || len(buckets) < maxHistBuckets {
+		return i
+	}
+
+	// Full, and i is new. Find the two lowest and fold one into the other,
+	// which frees the slot i is about to take.
+	lowest, second := int32(0), int32(0)
+	first := true
+	for b := range buckets {
+		switch {
+		case first:
+			lowest, second, first = b, b, false
+		case b < lowest:
+			lowest, second = b, lowest
+		case b < second || second == lowest:
+			second = b
+		}
+	}
+
+	// A value below everything already held becomes the new floor, so the
+	// floor is where it belongs rather than above the data.
+	if i < lowest {
+		return lowest
+	}
+	buckets[second] += buckets[lowest]
+	delete(buckets, lowest)
+	return i
 }
 
 // merge folds o into h. Merging is exact - bucket counts simply add - which
