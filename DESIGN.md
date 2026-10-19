@@ -188,6 +188,11 @@ for *what* was decided and read in full only where the *why* matters.
 
 - [46. The endpoint the bound forgot](#46-the-endpoint-the-bound-forgot)  
   §28 called an unbounded response "the last unbounded thing in the server" and was right about every endpoint that existed then; §38 made the rule count a config input and handed `/alerts` the same problem back.
+
+**What the store really costs**
+
+- [47. What the cardinality cap does not bound](#47-what-the-cardinality-cap-does-not-bound)  
+  §27 capped metric names and called it the memory bound; measured, the same cap allows anywhere from 59 MB to 3.5 GB depending on how widely clients spread their values — a thirty-fold range the cap has no opinion about.
 ## Design choices
 
 ### 1. Store the conclusion, not the events
@@ -3357,6 +3362,81 @@ extracting that in §39 rather than pasting the block a second time.
 - *It does not page `/alerts` from the alerting loop.* `Snapshot` stays
   unbounded for callers inside the process, which are not going to be handed
   9 800 rules by a stranger.
+
+### 47. What the cardinality cap does not bound
+
+> **In one line:** §27 capped metric names and called it the memory bound;
+> measured, the same cap allows anywhere from 59 MB to 3.5 GB depending on
+> how widely clients spread their values — a thirty-fold range the cap has
+> no opinion about.
+
+§27 is titled "the way metrics systems actually die" and it bounded the
+thing that kills them: an unbounded metric-name space. It capped names at
+`shardCount * maxMetricsPerShard`, 32 768, and that number has been carried
+since as *the* bound on what the store can hold.
+
+It bounds names. Nobody measured what a name costs.
+
+**Measured**, 2 000 metrics with every time bucket populated:
+
+| values reported | per metric | a full store would be |
+| --- | --- | --- |
+| one value only | 1.9 KB | **59 MB** |
+| 1 ms – 1 s latency | 56.8 KB | **1 816 MB** |
+| 1e-3 – 1e9 wide | 109.2 KB | **3 496 MB** |
+
+So the cap admits a store between 59 MB and three and a half gigabytes, and
+which one you get is decided by the clients rather than by the operator.
+§32's "a full store is 9.00 MB" is not in conflict with this — that is the
+*snapshot* on disk for modest data, which is a different question nobody
+noticed was different.
+
+**Nothing bounded a single histogram either.** `bucketIndex` spans −1036 to
+35488, so a client reporting across the float64 range could put 36 525
+buckets into one histogram of one metric. That is now capped at 1024 per
+sign, collapsing the lowest buckets when full.
+
+**Which end to sacrifice is the whole decision.** Percentiles exist here to
+answer how bad the slow end is: §18's default rules watch p99, and §23 was
+built because a `max` fires on one unlucky request while a p99 describes a
+real fraction of users. Collapsing the *highest* buckets would blur exactly
+the number everything else is built to read. Collapsing the lowest blurs the
+fastest requests, which nobody alerts on. This is DDSketch's
+`collapsingLowest`, and it keeps §23's promise where it is wanted: every
+bucket above the floor is still accurate to 1%.
+
+**The cap was 512 first, and a test caught it.** A 1 µs – 10 s latency
+metric needs 806 buckets and hit the cap exactly — precisely the data this
+has to keep exact. 1024 covers nine orders of magnitude, so a realistic
+metric never collapses and §23's promise holds for it unqualified. Worth
+recording that the same test *also* compared p99 against a figure written
+by hand, which was wrong; it now compares against the identical values in
+an uncapped histogram. Had the cap been generous enough, the hand-written
+number would have passed and the test would have been right by luck about a
+quantity it invented.
+
+**The cap bounds the pathological case; it does not make the store small.**
+Full-store memory is metrics × time buckets × how wide the values are, and
+32 768 metrics with six live buckets is 196 608 histograms however small
+each one is. The lever is §27's cap, and this section's contribution is
+that an operator now has the arithmetic to set it.
+
+**So the store says what it is holding.** `store.metrics` and
+`store.buckets` count series; `store.histogram_buckets` counts what is
+inside them. The first two read identically for a 59 MB fleet and a 1.8 GB
+one, which is what made this invisible for fifteen sections.
+
+**What this deliberately does not do.**
+
+- *It does not cap memory directly.* A byte budget would mean evicting
+  metrics mid-window on a threshold, and §27 already chose refusing new
+  names over evicting existing ones — the property that a client inventing
+  names cannot degrade the metrics already there.
+- *It does not make the cardinality cap adaptive.* Sizing it against
+  measured memory would need the server to decide what the machine can
+  afford, which is the operator's call and now has numbers behind it.
+- *It does not change the snapshot format.* A collapsed histogram encodes
+  like any other; §42's grid check and the bucket counts are unaffected.
 
 ## Testing
 
