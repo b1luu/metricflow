@@ -63,7 +63,14 @@ const (
 	selfClients      = selfPrefix + "clients.tracked"         // gauge
 	selfStoreMetrics = selfPrefix + "store.metrics"           // gauge
 	selfStoreBuckets = selfPrefix + "store.buckets"           // gauge
-	selfGoroutines   = selfPrefix + "runtime.goroutines"      // gauge
+
+	// The gauge that says how much the store is actually holding (§47).
+	// metrics and buckets count series; this counts what is inside them,
+	// which is where the memory is - and it is the only way to tell a
+	// fleet costing 59 MB from one costing 1.8 GB, because the other two
+	// gauges read identically for both.
+	selfStoreHistBuckets = selfPrefix + "store.histogram_buckets" // gauge
+	selfGoroutines       = selfPrefix + "runtime.goroutines"      // gauge
 
 	// Counted apart from requests.throttled for the same reason that one
 	// is counted apart from requests.shed (§26): they say different things
@@ -202,7 +209,7 @@ func (r *selfReporter) sample(now time.Time) {
 	// gauges include the reporter's own series - a fixed offset of however
 	// many metrics this file publishes, which is the whole extent of the
 	// self-reference and is cheaper to explain than to correct for.
-	metrics, buckets := r.store.size()
+	metrics, buckets, histBuckets := r.store.sizeWithHist()
 
 	observations := [...]struct {
 		name  string
@@ -219,6 +226,7 @@ func (r *selfReporter) sample(now time.Time) {
 		{selfClients, float64(r.clients.tracked())},
 		{selfStoreMetrics, float64(metrics)},
 		{selfStoreBuckets, float64(buckets)},
+		{selfStoreHistBuckets, float64(histBuckets)},
 		{selfGoroutines, float64(runtime.NumGoroutine())},
 	}
 

@@ -133,7 +133,8 @@ func TestSelfReporterRecordsEveryMetric(t *testing.T) {
 	want := []string{
 		selfShed, selfThrottled, selfAccepted, selfRejected, selfSweptMetrics,
 		selfQueryRefused, selfRuleReload, selfRuleReloadFail,
-		selfClients, selfStoreMetrics, selfStoreBuckets, selfGoroutines,
+		selfClients, selfStoreMetrics, selfStoreBuckets, selfStoreHistBuckets,
+		selfGoroutines,
 	}
 	for _, name := range want {
 		if _, ok := mergeAll(s, name); !ok {

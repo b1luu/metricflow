@@ -519,3 +519,59 @@ func TestAnOversizedNameConsumesNothing(t *testing.T) {
 		t.Errorf("status = %d, want 400 - an oversized name is the client's to fix", rec.Code)
 	}
 }
+
+// --- what the store is holding, not just how many series (§47) ---
+
+// metrics and buckets count series. Neither says how much each one holds,
+// and that is where the memory is: a fleet reporting one value per metric
+// and one reporting across seven orders of magnitude look identical in
+// those two gauges and differ by thirty times in heap.
+func TestSizeWithHistCountsWhatIsInsideTheSeries(t *testing.T) {
+	s := newStore()
+	now := time.Now()
+
+	// Two metrics, same number of series, very different contents.
+	for v := 0; v < 200; v++ {
+		if err := s.record(now, Event{Name: "narrow", Value: 1, TS: now.UnixMilli()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	v := 1.0
+	for i := 0; i < 200; i++ {
+		if err := s.record(now, Event{Name: "wide", Value: v, TS: now.UnixMilli()}); err != nil {
+			t.Fatal(err)
+		}
+		v *= 1.5
+	}
+
+	metrics, buckets, hist := s.sizeWithHist()
+	if metrics != 2 {
+		t.Fatalf("metrics = %d, want 2", metrics)
+	}
+	if buckets != 2 {
+		t.Fatalf("buckets = %d, want 2 - one time bucket each", buckets)
+	}
+	// narrow put 200 observations in one histogram bucket; wide spread
+	// them across many. The gauge has to separate them.
+	if hist < 100 {
+		t.Errorf("histogram buckets = %d, want the wide metric's many", hist)
+	}
+
+	// And it never exceeds what the cap allows.
+	if hist > 2*maxHistBuckets*buckets {
+		t.Errorf("histogram buckets = %d, over what %d series can hold", hist, buckets)
+	}
+}
+
+// size stays the two-value function everything else calls.
+func TestSizeStillAgreesWithSizeWithHist(t *testing.T) {
+	s := newStore()
+	recordNow(s, "a", 1)
+	recordNow(s, "b", 2)
+
+	m1, b1 := s.size()
+	m2, b2, _ := s.sizeWithHist()
+	if m1 != m2 || b1 != b2 {
+		t.Errorf("size() = (%d, %d) but sizeWithHist() = (%d, %d)", m1, b1, m2, b2)
+	}
+}

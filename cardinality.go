@@ -124,6 +124,19 @@ func (s *Store) sweep(now time.Time) (metrics, buckets int) {
 // shards - it is read once a second to record §31's own metrics, where being
 // a few writes out of date is not a defect.
 func (s *Store) size() (metrics, buckets int) {
+	m, b, _ := s.sizeWithHist()
+	return m, b
+}
+
+// sizeWithHist also counts histogram buckets, which is what the store's
+// memory actually tracks (§47).
+//
+// metrics and buckets say how many series exist; neither says how much
+// each one holds. A fleet reporting one value per metric costs about 59 MB
+// at the cardinality ceiling and one reporting latencies across seven
+// orders of magnitude costs 1.8 GB, and those two look identical in the
+// gauges §31 publishes. This is the number that tells them apart.
+func (s *Store) sizeWithHist() (metrics, buckets, histBuckets int) {
 	for i := range s.shards {
 		sh := &s.shards[i]
 
@@ -131,10 +144,15 @@ func (s *Store) size() (metrics, buckets int) {
 		metrics += len(sh.aggs)
 		for _, series := range sh.aggs {
 			buckets += len(series)
+			for _, a := range series {
+				if a.h != nil {
+					histBuckets += len(a.h.pos) + len(a.h.neg)
+				}
+			}
 		}
 		sh.mu.Unlock()
 	}
-	return metrics, buckets
+	return metrics, buckets, histBuckets
 }
 
 // Sweep reclaims idle metrics every `every` until ctx is cancelled.
