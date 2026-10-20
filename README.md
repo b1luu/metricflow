@@ -606,6 +606,29 @@ covers nine orders of magnitude; past that the *lowest* buckets collapse, so
 p99 stays accurate and the fastest requests blur. See
 [DESIGN.md](DESIGN.md) §47.
 
+**`METRICFLOW_MAX_METRICS` sets the ceiling**, as a total; unset keeps 32,768.
+
+```
+METRICFLOW_MAX_METRICS=4096 ./metricflow
+```
+```
+cardinality cap: 4096 metrics (128 per shard); up to 18 of those hold
+the server's own metrics
+```
+
+Three things that line is telling you. The total is divided across 32 shards
+and **rounds down**, so a cap is never exceeded — ask for 100 and you get 96.
+Up to 18 names are the server's own telemetry, which is exempt from refusal
+but still occupies the budget; negligible at the default, a third of it at
+very small caps. And `cardinality-pressure` fires at 80% of *your* number,
+not of the default — a server given a smaller cap is the one most likely to
+fill, so the alert has to follow the cap rather than the constant.
+
+A value below one per shard, or one that isn't a number, **stops startup**
+rather than falling back to the default: a knob that quietly ignores you is
+found at 3am. Changing the cap needs a restart, which snapshots make cheap.
+See [DESIGN.md](DESIGN.md) §48.
+
 Past the limit a **new** name is refused with `429` and `Retry-After`; in a
 batch it is a per-event rejection marked `"retryable": true`, to distinguish
 it from a contract violation that will never succeed. Metrics that already
