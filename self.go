@@ -98,6 +98,26 @@ const (
 	selfSnapEmptyStart = selfPrefix + "snapshot.empty_starts"   // counter
 )
 
+// maxSelfMetrics is how many names the reserved namespace can occupy: the
+// thirteen always published plus the five persistence ones (§33), which
+// exist only when a snapshot path is configured.
+//
+// It matters because reserved names are exempt from being *refused* by the
+// cardinality cap but still occupy space under it, so they come out of the
+// operator's budget. At the default of 32 768 that is 0.05% and invisible.
+// With METRICFLOW_MAX_METRICS set small it is not: at 64 the server holds
+// up to eighteen of them itself, and a shard whose whole allowance is taken
+// by reserved names accepts no client metric at all.
+//
+// Startup says so rather than leaving it to be discovered, which is the
+// cheapest honest answer: counting only client names would make the knob
+// exact but needs a per-shard counter kept in step with every insert and
+// every sweep, and that is a synchronisation bug waiting to happen for a
+// rounding error.
+//
+// A test holds this to what the reporter actually publishes.
+const maxSelfMetrics = 18
+
 // reserved reports whether a metric name belongs to the server rather than
 // to a client.
 // Generic for the same reason fnv32 is: the ingest hot path holds a name as

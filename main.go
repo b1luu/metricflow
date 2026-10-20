@@ -732,7 +732,8 @@ func run(ctx context.Context, ln net.Listener) error {
 		return err
 	}
 	store.maxPerShard = perShard
-	log.Printf("cardinality cap: %d metrics (%d per shard)", perShard*shardCount, perShard)
+	log.Printf("cardinality cap: %d metrics (%d per shard); up to %d of those "+
+		"hold the server's own metrics", perShard*shardCount, perShard, maxSelfMetrics)
 
 	// Persistence (§32), before anything else touches the store: whatever
 	// survived the last shutdown should be there before the first request

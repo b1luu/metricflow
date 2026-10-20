@@ -735,3 +735,51 @@ func TestSnapshotWriteFailuresArePublishedBeforeAnySuccess(t *testing.T) {
 		t.Errorf("%s was published by a snapshotter that has never written one", selfSnapAge)
 	}
 }
+
+// maxSelfMetrics is a number the cardinality cap's log line quotes, so it
+// has to be the number the reporter actually publishes. Derived from a real
+// sample rather than recounted by hand, because a constant that drifts from
+// what it describes is worse than no constant.
+func TestMaxSelfMetricsMatchesWhatIsPublished(t *testing.T) {
+	s := newStore()
+	r, _, _ := newTestReporter(s)
+	r.snap = writtenSnapshotter(t, time.Now()) // so the persistence ones publish too
+
+	r.sample(time.Now())
+
+	published := 0
+	for name := range storeDump(s) {
+		if reserved(name) {
+			published++
+		}
+	}
+
+	if published != maxSelfMetrics {
+		t.Errorf("the reporter publishes %d reserved metrics but maxSelfMetrics "+
+			"says %d; the cardinality cap's log line quotes that number",
+			published, maxSelfMetrics)
+	}
+}
+
+// And with persistence off, fewer are published - never more. The constant
+// is a ceiling on what the server takes from the operator's budget.
+func TestSelfMetricsNeverExceedTheirCeiling(t *testing.T) {
+	s := newStore()
+	r, _, _ := newTestReporter(s) // no snapshotter
+
+	r.sample(time.Now())
+
+	published := 0
+	for name := range storeDump(s) {
+		if reserved(name) {
+			published++
+		}
+	}
+	if published > maxSelfMetrics {
+		t.Errorf("published %d reserved metrics, over the ceiling of %d",
+			published, maxSelfMetrics)
+	}
+	if published == 0 {
+		t.Error("the reporter published nothing; this test would pass against anything")
+	}
+}
