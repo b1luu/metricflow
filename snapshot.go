@@ -445,7 +445,7 @@ func (s *Store) load(metrics []snapshotMetric, now time.Time) (loaded, dropped, 
 		// The cap still applies (§27). A snapshot taken under a larger cap,
 		// or restored onto a server configured with a smaller one, must not
 		// be able to exceed it just because the data used to fit.
-		if _, exists := sh.aggs[m.name]; !exists && len(sh.aggs) >= maxMetricsPerShard {
+		if _, exists := sh.aggs[m.name]; !exists && len(sh.aggs) >= s.perShardCap() {
 			sh.mu.Unlock()
 			dropped++
 			continue

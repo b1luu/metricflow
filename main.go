@@ -85,6 +85,25 @@ type Store struct {
 	// threading a separate object through both would be the same coupling
 	// with more parameters.
 	counts counters
+
+	// maxPerShard is the cardinality cap this store enforces (§27); read it
+	// through perShardCap. A field rather than the constant so an operator
+	// can set it (metricsLimit), and rather than a package var so tests can
+	// run stores with different caps side by side. Set before the store is
+	// shared and only read after, so it needs no lock.
+	//
+	// Zero means the default rather than a cap of zero, so a Store built
+	// without newStore behaves as it always has instead of refusing every
+	// name - metricsLimit already refuses an operator asking for zero.
+	maxPerShard int
+}
+
+// perShardCap is the number of distinct names one shard may hold.
+func (s *Store) perShardCap() int {
+	if s.maxPerShard == 0 {
+		return maxMetricsPerShard
+	}
+	return s.maxPerShard
 }
 
 // newStore returns a ready-to-use Store with every shard's map initialized.
@@ -183,8 +202,8 @@ func (s *Store) recordForName(now time.Time, c *client, name []byte, ev Event) e
 		// store is exactly when somebody needs to see that it is full. The
 		// set is fixed by self.go rather than by any client, so exempting
 		// it cannot let anything grow without bound.
-		if !reserved(name) && len(sh.aggs) >= maxMetricsPerShard {
-			return errCardinality
+		if limit := s.perShardCap(); !reserved(name) && len(sh.aggs) >= limit {
+			return fmt.Errorf("%w (%d distinct names per shard)", errCardinality, limit)
 		}
 
 		// The caller's own budget, checked after the global cap rather than
@@ -593,6 +612,15 @@ func routes(s *Store, a *Alerter, l *limiter, cs *clients) http.Handler {
 // rule here - a metric with no events has no aggregate to compare, so that
 // case surfaces as StateNoData rather than as a count rule (§18).
 func defaultRules() []Rule {
+	return defaultRulesFor(shardCount * maxMetricsPerShard)
+}
+
+// defaultRulesFor is defaultRules for a store capped at maxMetrics names in
+// total. cardinality-pressure is the one rule whose threshold depends on
+// configuration: built from the constant, it would never fire on a server
+// whose operator set a smaller cap, which is exactly the server most likely
+// to fill.
+func defaultRulesFor(maxMetrics int) []Rule {
 	return []Rule{
 		// Sustained load: the average over half a minute, and it has to
 		// stay bad for a couple of evaluations before it's worth saying.
@@ -625,7 +653,7 @@ func defaultRules() []Rule {
 		// legitimate new metrics are already being refused, and the point
 		// of the alert is to arrive before that.
 		{Name: "cardinality-pressure", Metric: selfStoreMetrics, Stat: StatMax, Op: OpGT,
-			Value: 0.8 * shardCount * maxMetricsPerShard, For: 30 * time.Second},
+			Value: 0.8 * float64(maxMetrics), For: 30 * time.Second},
 	}
 }
 
@@ -695,6 +723,16 @@ func ranAndPanicked(ctx context.Context, name string, backoff time.Duration, fn 
 // lifecycle with a cancellable context instead of a real signal.
 func run(ctx context.Context, ln net.Listener) error {
 	store := newStore()
+
+	// The cardinality cap, before the restore below: a snapshot must be
+	// loaded under the cap this server will enforce, not the default (§27).
+	// Fatal on a bad value, like the in-flight limit further down.
+	perShard, err := metricsLimit()
+	if err != nil {
+		return err
+	}
+	store.maxPerShard = perShard
+	log.Printf("cardinality cap: %d metrics (%d per shard)", perShard*shardCount, perShard)
 
 	// Persistence (§32), before anything else touches the store: whatever
 	// survived the last shutdown should be there before the first request
@@ -769,7 +807,7 @@ func run(ctx context.Context, ln net.Listener) error {
 	// been served, and refusing is the only way to make it visible. An
 	// operator who mistyped a threshold should not learn about it from the
 	// alert that never fired.
-	rules := defaultRules()
+	rules := defaultRulesFor(perShard * shardCount)
 	if path := rulesPath(); path != "" {
 		loaded, err := loadRules(path)
 		if err != nil {

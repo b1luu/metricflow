@@ -20,14 +20,18 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"os"
+	"strconv"
 	"time"
 )
 
 const (
 	// maxMetricsPerShard caps distinct metric names per shard, so the store
-	// holds at most shardCount * this many.
+	// holds at most shardCount * this many. It is the default; an operator
+	// can set a different total with METRICFLOW_MAX_METRICS (metricsLimit).
 	//
 	// Per shard rather than globally, and that is a deliberate trade. A
 	// global counter would be exact, but every ingest would touch it, which
@@ -61,9 +65,46 @@ const (
 // errCardinality is returned by record when a metric name is new and its
 // shard is full. It reads as a rejection of the event, because that is what
 // it is - but the cause is the name, not the value or the timestamp.
-var errCardinality = fmt.Errorf(
-	"cardinality limit reached: this shard already holds %d distinct metric "+
-		"names and this one is new", maxMetricsPerShard)
+//
+// A plain sentinel with no number in it: the cap is configured at startup
+// (METRICFLOW_MAX_METRICS), after this var is built, so record wraps it with
+// the store's actual limit instead.
+var errCardinality = errors.New(
+	"cardinality limit reached: this shard is full and this metric name is new")
+
+// metricsLimit is the per-shard cap, derived from METRICFLOW_MAX_METRICS when
+// it is set and maxMetricsPerShard when it is not.
+//
+// Tunable for the reason inFlightLimit is and shardCount is not: the right
+// cap depends on how much memory the deployment has and how widely its
+// fleet's values spread (§47), none of which this code can know. §47 gives
+// the operator the arithmetic; this gives them somewhere to put the answer.
+//
+// The operator writes a total, because §47's arithmetic is in total metrics
+// and the shard count is an internal detail (§24). The per-shard figure
+// rounds down, so the cap the operator sized against memory is never
+// exceeded - at the cost of up to shardCount-1 names of headroom, which run
+// logs so the number enforced is never a surprise.
+//
+// Fewer than one per shard is refused: it would turn away every client name,
+// a server that cannot ingest, which is a mistake rather than a policy. A bad
+// value fails startup, as a bad in-flight limit does (§18, §26).
+func metricsLimit() (perShard int, err error) {
+	v, ok := os.LookupEnv("METRICFLOW_MAX_METRICS")
+	if !ok {
+		return maxMetricsPerShard, nil
+	}
+
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, fmt.Errorf("METRICFLOW_MAX_METRICS=%q is not an integer", v)
+	}
+	if n < shardCount {
+		return 0, fmt.Errorf("METRICFLOW_MAX_METRICS=%d must be at least %d, "+
+			"one per shard; fewer would refuse every new metric name", n, shardCount)
+	}
+	return n / shardCount, nil
+}
 
 // errClientNames is returned when a caller has introduced metric names
 // faster than maxNewNamesPerEpoch allows.

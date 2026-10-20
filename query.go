@@ -9,8 +9,8 @@ package main
 //
 // §27 is what made that urgent rather than theoretical. Capping cardinality
 // bounded memory, but it also made the ceiling reachable and stable: an
-// attacker can push the store to exactly shardCount * maxMetricsPerShard
-// names and leave it there. Every /stats then merged all of them and sorted
+// attacker can push the store to exactly the configured cap (32 768 names by
+// default) and leave it there. Every /stats then merged all of them and sorted
 // a histogram per metric for three quantiles, measured at 77 ms of CPU and
 // 62 MB of allocation for one ~30-byte GET - and §26's limiter will admit
 // 256 of those at once. The cardinality cap traded a memory exhaustion for a

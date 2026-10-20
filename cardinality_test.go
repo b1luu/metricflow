@@ -209,6 +209,128 @@ func TestRecordRefusesNewMetricsPastTheShardCap(t *testing.T) {
 	}
 }
 
+// --- a configured cap ---
+
+// METRICFLOW_MAX_METRICS is held to the in-flight limit's standard: a value
+// the operator got wrong stops the process rather than being replaced by the
+// default. The rounding case is the one with teeth: rounding up would let a
+// total of 100 become 128 and quietly exceed the budget it was sized against.
+func TestMetricsLimitFromTheEnvironment(t *testing.T) {
+	cases := []struct {
+		name    string
+		set     bool
+		value   string
+		want    int
+		wantErr bool
+	}{
+		{name: "unset falls back to the constant", want: maxMetricsPerShard},
+		{name: "a multiple of the shard count", set: true, value: "64", want: 2},
+		{name: "rounds down, never past the total", set: true, value: "100", want: 3},
+		{name: "one per shard is allowed", set: true, value: fmt.Sprint(shardCount), want: 1},
+		{name: "fewer than one per shard", set: true, value: fmt.Sprint(shardCount - 1), wantErr: true},
+		{name: "zero", set: true, value: "0", wantErr: true},
+		{name: "negative", set: true, value: "-64", wantErr: true},
+		{name: "not a number", set: true, value: "lots", wantErr: true},
+		{name: "empty but set", set: true, value: "", wantErr: true},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if c.set {
+				t.Setenv("METRICFLOW_MAX_METRICS", c.value)
+			}
+
+			got, err := metricsLimit()
+			if c.wantErr {
+				if err == nil {
+					t.Fatalf("value %q was accepted as %d per shard, want an error", c.value, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("value %q: %v", c.value, err)
+			}
+			if got != c.want {
+				t.Errorf("value %q gave %d per shard, want %d", c.value, got, c.want)
+			}
+		})
+	}
+}
+
+// A store enforces its own cap, not the constant. Without this, an operator
+// who set a small cap would get the default anyway and find out only when
+// memory ran out.
+func TestRecordEnforcesAConfiguredCap(t *testing.T) {
+	s := newStore()
+	s.maxPerShard = 2
+	now := time.Now()
+	ts := now.UnixMilli()
+
+	names := namesForShard(t, 0, 3)
+	for _, name := range names[:2] {
+		if err := s.record(now, Event{Name: name, Value: 1, TS: ts}); err != nil {
+			t.Fatalf("%s was refused under a cap of 2: %v", name, err)
+		}
+	}
+
+	err := s.record(now, Event{Name: names[2], Value: 1, TS: ts})
+	if !errors.Is(err, errCardinality) {
+		t.Fatalf("the third name returned %v, want errCardinality", err)
+	}
+	if !strings.Contains(err.Error(), "2 distinct names per shard") {
+		t.Errorf("error %q does not say which cap was hit", err)
+	}
+	if got := metricCount(s); got != 2 {
+		t.Errorf("store holds %d metrics, want exactly the configured cap 2", got)
+	}
+}
+
+// The restore half of the same promise: a snapshot written under the default
+// cap, loaded onto a server configured with a smaller one, keeps only what
+// fits and counts the rest as dropped.
+func TestLoadRespectsAConfiguredCap(t *testing.T) {
+	now := time.Now()
+
+	var metrics []snapshotMetric
+	for _, name := range namesForShard(t, 0, 5) {
+		metrics = append(metrics, snapshotMetric{
+			name:    name,
+			buckets: map[int64]*Agg{bucketAt(0): {Count: 1, Sum: 1, Min: 1, Max: 1}},
+		})
+	}
+
+	s := newStore()
+	s.maxPerShard = 2
+	loaded, dropped, _ := s.load(metrics, now)
+
+	if loaded != 2 || dropped != 3 {
+		t.Errorf("loaded %d and dropped %d, want 2 and 3", loaded, dropped)
+	}
+}
+
+// cardinality-pressure has to follow the configured cap. Built from the
+// constant, it would fire at 26 214 names on a server capped at 64 - which
+// is to say never.
+func TestCardinalityPressureFollowsTheConfiguredCap(t *testing.T) {
+	threshold := func(rules []Rule) float64 {
+		t.Helper()
+		for _, r := range rules {
+			if r.Name == "cardinality-pressure" {
+				return r.Value
+			}
+		}
+		t.Fatal("no cardinality-pressure rule")
+		return 0
+	}
+
+	if got, want := threshold(defaultRulesFor(64)), 0.8*64; got != want {
+		t.Errorf("under a cap of 64 the rule fires at %v, want %v", got, want)
+	}
+	if got, want := threshold(defaultRules()), 0.8*shardCount*maxMetricsPerShard; got != want {
+		t.Errorf("the default rule fires at %v, want %v - the default cap's behaviour changed", got, want)
+	}
+}
+
 // The property the limit exists for: a client inventing names must not be
 // able to degrade the metrics that were already there. A full shard keeps
 // serving every metric it already holds.
