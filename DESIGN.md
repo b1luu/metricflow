@@ -193,6 +193,8 @@ for *what* was decided and read in full only where the *why* matters.
 
 - [47. What the cardinality cap does not bound](#47-what-the-cardinality-cap-does-not-bound)  
   §27 capped metric names and called it the memory bound; measured, the same cap allows anywhere from 59 MB to 3.5 GB depending on how widely clients spread their values — a thirty-fold range the cap has no opinion about.
+- [48. Giving the operator the lever](#48-giving-the-operator-the-lever)  
+  §47 ended by saying the operator now has the arithmetic to size the cardinality cap, and there was nothing to set — a measurement with no lever. `METRICFLOW_MAX_METRICS` is the lever, and the interesting question is why this knob exists when `shardCount` deliberately does not.
 ## Design choices
 
 ### 1. Store the conclusion, not the events
@@ -3437,6 +3439,100 @@ one, which is what made this invisible for fifteen sections.
   afford, which is the operator's call and now has numbers behind it.
 - *It does not change the snapshot format.* A collapsed histogram encodes
   like any other; §42's grid check and the bucket counts are unaffected.
+
+### 48. Giving the operator the lever
+
+> **In one line:** §47 ended by saying the operator now has the arithmetic to
+> size the cardinality cap, and there was nothing to set — a measurement with
+> no lever. `METRICFLOW_MAX_METRICS` is the lever, and the interesting
+> question is why this knob exists when `shardCount` deliberately does not.
+
+§47 measured that §27's cap admits a store between 59 MB and 3.5 GB depending
+on how widely clients spread their values, and closed on the line that the
+operator now has the arithmetic to set it. `maxMetricsPerShard` was a
+compile-time constant. There was no answer to give.
+
+**Tunable, and the codebase already had the rule for deciding that.** §26
+exposed the in-flight limit and §24 refused to expose `shardCount`, and
+`inFlightLimit`'s comment says why: *"shardCount is an algorithmic choice
+whose right value follows from the code, and exposing it would invite tuning
+nobody has data for. A concurrency limit is an operational choice — it
+depends on the machine, the deployment, and how expensive a request is
+there, none of which this code can know."*
+
+By that test the cardinality cap is plainly operational. §47's whole
+contribution was showing the right value depends on how much memory the
+deployment has and what its fleet reports — two things the code cannot know
+and the operator can.
+
+**The same test settles the unit.** The operator writes a *total*, and the
+code divides by `shardCount`, because §47's arithmetic is in total metrics
+while shards are the algorithmic detail §24 keeps unexposed. Exposing a
+per-shard figure would make the operator do a division about an internal
+choice in order to express a budget about memory.
+
+**It rounds down.** A cap is a ceiling somebody sized against memory, so
+exceeding it breaks the promise the number was making: 100 becomes 96, never
+128. The cost is up to 31 names of headroom, and the effective figure is
+logged so the difference between what was asked for and what is enforced is
+never discovered later.
+
+**Three places had to follow the configured cap, and missing any one would
+have been silent.** `record`, or the knob does nothing at all. Snapshot
+restore, or a restart quietly reintroduces metrics the cap was meant to
+refuse — §32 anticipated exactly this and the comment there was already
+written for it. And `cardinality-pressure`'s threshold, which is the subtle
+one: computed from the constant it fires at 26 214, a figure a 64-metric
+store can never reach, so **a server given a smaller cap — precisely the one
+most likely to fill — would never fire the alert that exists to warn it.**
+
+**An exemption from refusal is not an exemption from occupancy.** The
+eighteen metrics §31 publishes are exempt from being refused by the cap, but
+they still sit under it. At the default that is 0.05% and invisible, which is
+why fifteen sections went by without noticing. At `=64` it is more than a
+quarter of the budget, and a shard whose whole allowance of two is taken by
+reserved names accepts no client metric at all, permanently.
+
+Startup says so rather than fixing it. Counting only client names would make
+the knob mean exactly what it says, but it needs a per-shard counter kept in
+step with every insert and every sweep — a synchronisation invariant on the
+hot path, bought with a rounding error that only matters at caps nobody runs
+in production.
+
+**A bad value stops the process**, as a bad in-flight limit (§26) and a bad
+alert rule (§18) do: a knob that quietly ignores you is found at 3am. Below
+one per shard is refused too, because it describes a server that cannot
+ingest — a mistake rather than a policy.
+
+**It is not hot-reloadable**, unlike rules (§44). Lowering a cap at runtime
+immediately asks whether existing metrics should be evicted to meet it, and
+§27 and §47 both answered the opposite question the same way: refuse new
+rather than evict existing, so a client inventing names cannot degrade the
+metrics already there. Changing it needs a restart, which §32 made cheap.
+
+**Verified rather than read.** Five mutations — rounding up, either
+enforcement site reverted to the constant, the rule reverted to the
+constant, and accepting a sub-`shardCount` value — each fail exactly one
+test. Live, `=5` refuses to start, `=64` logs `cardinality cap: 64 metrics
+(2 per shard); up to 18 of those hold the server's own metrics`, a flood of
+500 names per worker leaves the store at exactly 64 with 97.4% refused, and
+`cardinality-pressure` fires at 51.2.
+
+CI checks the alert reaches `pending` rather than waiting for `firing`. The
+rule carries `For: 30s`, pending arrives on the first evaluation after the
+breach, and it discriminates identically — against the constant the rule
+would sit at `ok` forever — at a third of the waiting.
+
+**What this deliberately does not do.**
+
+- *No byte budget and no adaptive sizing.* §47 declined both and nothing here
+  changes the reasoning: a byte budget means evicting mid-window, and sizing
+  the cap from measured memory makes the server decide what the machine can
+  afford.
+- *`shardCount` stays fixed.* It is the algorithmic choice this section's
+  first argument is built on; exposing it would undo that argument.
+- *`maxHistBuckets` stays constant.* It guards §23's accuracy rather than the
+  operator's memory, and §47 set it from what real metrics need.
 
 ## Testing
 
