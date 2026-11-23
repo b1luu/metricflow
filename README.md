@@ -697,7 +697,7 @@ while a quiet one beside it is not).
 ## Mutation testing
 
 Pull requests targeting `main` run [Gremlins](https://github.com/go-gremlins/gremlins)
-(`v0.6.0`) in the `mutation-test` workflow (`.github/workflows/mutation.yml`)
+(`v0.6.0`) in the `mutation-test` job (`.github/workflows/mutation.yml`)
 after `go test ./...` passes. Gremlins injects small code mutations —
 arithmetic operators, conditional boundaries and negations, increments/decrements,
 and sign inversions — into the core `metricflow` server package and checks that
@@ -712,16 +712,19 @@ make mutation
 Or directly without `make` (for example in PowerShell):
 
 ```
-go install github.com/go-gremlins/gremlins/cmd/gremlins@v0.6.0
+go test ./... -count=1
 go clean -testcache
-gremlins unleash --output=gremlins-report.json
+go run github.com/go-gremlins/gremlins/cmd/gremlins@v0.6.0 unleash --config=.gremlins.yaml --output=gremlins-report.json
 ```
+
+(On high-core machines without Linux's `ulimit -v` guard, pass `--workers=4` to
+avoid memory spikes from mutated parser loops.)
 
 Thresholds live in [`.gremlins.yaml`](.gremlins.yaml) so local and CI runs
 enforce the same gate:
 
-- **Test efficacy**: `> 85%` (killed / (killed + survived))
-- **Mutant coverage**: `> 78%` (covered mutants / total non-timed-out mutants)
+- **Test efficacy**: `> 85%` (`killed / (killed + survived)`)
+- **Mutant coverage**: `> 78%` (`(killed + survived) / (killed + survived + not covered)`)
 
 The check fails if either score drops to or below its threshold.
 
