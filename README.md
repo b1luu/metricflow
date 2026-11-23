@@ -703,10 +703,15 @@ arithmetic operators, conditional boundaries and negations, increments/decrement
 and sign inversions — into the core `metricflow` server package and checks that
 the test suite kills them.
 
-Run the same check locally:
+On pull requests, CI runs in diff mode (`--diff=origin/<base>`) so only lines
+changed in the PR are mutated (typically finishing in under a minute). Manual
+`workflow_dispatch` and `merge_group` runs evaluate the entire server package.
+
+Run the same checks locally:
 
 ```
-make mutation
+make mutation        # full server package
+make mutation-diff   # only lines changed since main (override with DIFF_BASE=...)
 ```
 
 Or directly without `make` (for example in PowerShell):
@@ -715,6 +720,7 @@ Or directly without `make` (for example in PowerShell):
 go test ./... -count=1
 go clean -testcache
 go run github.com/go-gremlins/gremlins/cmd/gremlins@v0.6.0 unleash --config=.gremlins.yaml --output=gremlins-report.json
+# add --diff=main to check only changed lines
 ```
 
 (On high-core machines without Linux's `ulimit -v` guard, pass `--workers=4` to
