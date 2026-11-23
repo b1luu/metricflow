@@ -1,6 +1,7 @@
 # Gremlins v0.6.0 configuration for MetricFlow.
 # Both local (`make mutation`) and CI (.github/workflows/mutation.yml) load
-# this file so thresholds, mutators, and exclusions always match.
+# this file explicitly via `--config=.gremlins.yaml` so thresholds, mutators,
+# and exclusions always match.
 
 unleash:
   # Print surviving, timed-out, and not-viable mutants to keep logs readable;
@@ -13,7 +14,9 @@ unleash:
 
   # Quality gate thresholds (percentages). Gremlins exits non-zero if a score
   # falls at or below its threshold.
-  # Baseline on main (core server package): ~89.9% efficacy, ~82.3% mutant coverage.
+  # Verified baseline on main (core server package):
+  #   - Linux CI:  88.65% efficacy, 82.85% mutant coverage
+  #   - Windows:   89.91% efficacy, 82.26% mutant coverage
   threshold:
     efficacy: 85
     mutant-coverage: 78
@@ -22,11 +25,14 @@ unleash:
   # 1. It is a test/load-driving tool rather than the MetricFlow server itself.
   # 2. Gremlins v0.6.0 maps non-root `package main` directories back to the root
   #    module package when invoking `go test`, and uses OS-native path separators
-  #    in coverage lookups, causing cmd/loadgen results to diverge between
+  #    in coverage lookups (any future non-root subpackage would also report 0%
+  #    coverage on Windows), causing cmd/loadgen results to diverge between
   #    Windows and Linux and produce false-positive LIVED mutants on Linux.
   exclude-files:
     - "^cmd/loadgen/"
 
+# Pin every mutator explicitly so future Gremlins upgrades cannot shift scores
+# silently by changing defaults.
 mutants:
   arithmetic-base:
     enabled: true
@@ -38,3 +44,15 @@ mutants:
     enabled: true
   invert-negatives:
     enabled: true
+  invert-assignments:
+    enabled: false
+  invert-bitwise:
+    enabled: false
+  invert-bwassign:
+    enabled: false
+  invert-logical:
+    enabled: false
+  invert-loopctrl:
+    enabled: false
+  remove-self-assignments:
+    enabled: false
