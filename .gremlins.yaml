@@ -1,0 +1,58 @@
+# Gremlins v0.6.0 configuration for MetricFlow.
+# Both local (`make mutation`) and CI (.github/workflows/mutation.yml) load
+# this file explicitly via `--config=.gremlins.yaml` so thresholds, mutators,
+# and exclusions always match.
+
+unleash:
+  # Print surviving, timed-out, and not-viable mutants to keep logs readable;
+  # the full per-mutant breakdown is written to the JSON report.
+  output-statuses: "ltv"
+
+  # Multiplier applied to the baseline coverage test duration for each mutant's
+  # execution timeout.
+  timeout-coefficient: 3
+
+  # Quality gate thresholds (percentages). Gremlins exits non-zero if a score
+  # falls at or below its threshold.
+  # Verified baseline on main (core server package):
+  #   - Linux CI:  88.65% efficacy, 82.85% mutant coverage
+  #   - Windows:   89.91% efficacy, 82.26% mutant coverage
+  threshold:
+    efficacy: 85
+    mutant-coverage: 78
+
+  # Exclude the standalone load-generator CLI (cmd/loadgen):
+  # 1. It is a test/load-driving tool rather than the MetricFlow server itself.
+  # 2. Gremlins v0.6.0 maps non-root `package main` directories back to the root
+  #    module package when invoking `go test`, and uses OS-native path separators
+  #    in coverage lookups (any future non-root subpackage would also report 0%
+  #    coverage on Windows), causing cmd/loadgen results to diverge between
+  #    Windows and Linux and produce false-positive LIVED mutants on Linux.
+  exclude-files:
+    - "^cmd/loadgen/"
+
+# Pin every mutator explicitly so future Gremlins upgrades cannot shift scores
+# silently by changing defaults.
+mutants:
+  arithmetic-base:
+    enabled: true
+  conditionals-boundary:
+    enabled: true
+  conditionals-negation:
+    enabled: true
+  increment-decrement:
+    enabled: true
+  invert-negatives:
+    enabled: true
+  invert-assignments:
+    enabled: false
+  invert-bitwise:
+    enabled: false
+  invert-bwassign:
+    enabled: false
+  invert-logical:
+    enabled: false
+  invert-loopctrl:
+    enabled: false
+  remove-self-assignments:
+    enabled: false

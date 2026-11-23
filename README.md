@@ -694,6 +694,46 @@ snapshot and checks the fallback), and `querybudget` (fills a store with
 thousands of metrics, then proves a client hammering `/stats` is cut off
 while a quiet one beside it is not).
 
+## Mutation testing
+
+Pull requests targeting `main` run [Gremlins](https://github.com/go-gremlins/gremlins)
+(`v0.6.0`) in the `mutation-test` job (`.github/workflows/mutation.yml`)
+after `go test ./...` passes. Gremlins injects small code mutations —
+arithmetic operators, conditional boundaries and negations, increments/decrements,
+and sign inversions — into the core `metricflow` server package and checks that
+the test suite kills them.
+
+On pull requests, CI runs in diff mode (`--diff=origin/<base>`) so only lines
+changed in the PR are mutated (typically finishing in under a minute). Manual
+`workflow_dispatch` and `merge_group` runs evaluate the entire server package.
+
+Run the same checks locally:
+
+```
+make mutation        # full server package
+make mutation-diff   # only lines changed since main (override with DIFF_BASE=...)
+```
+
+Or directly without `make` (for example in PowerShell):
+
+```
+go test ./... -count=1
+go clean -testcache
+go run github.com/go-gremlins/gremlins/cmd/gremlins@v0.6.0 unleash --config=.gremlins.yaml --output=gremlins-report.json
+# add --diff=main to check only changed lines
+```
+
+(On high-core machines without Linux's `ulimit -v` guard, pass `--workers=4` to
+avoid memory spikes from mutated parser loops.)
+
+Thresholds live in [`.gremlins.yaml`](.gremlins.yaml) so local and CI runs
+enforce the same gate:
+
+- **Test efficacy**: `> 85%` (`killed / (killed + survived)`)
+- **Mutant coverage**: `> 78%` (`(killed + survived) / (killed + survived + not covered)`)
+
+The check fails if either score drops to or below its threshold.
+
 ## Design
 
 Aggregates are stored as fixed-width time buckets (10s each, 6 in a 60-second
