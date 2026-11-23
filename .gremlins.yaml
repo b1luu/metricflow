@@ -1,0 +1,40 @@
+# Gremlins v0.6.0 configuration for MetricFlow.
+# Both local (`make mutation`) and CI (.github/workflows/mutation.yml) load
+# this file so thresholds, mutators, and exclusions always match.
+
+unleash:
+  # Print surviving, timed-out, and not-viable mutants to keep logs readable;
+  # the full per-mutant breakdown is written to the JSON report.
+  output-statuses: "ltv"
+
+  # Multiplier applied to the baseline coverage test duration for each mutant's
+  # execution timeout.
+  timeout-coefficient: 5
+
+  # Quality gate thresholds (percentages). Gremlins exits non-zero if a score
+  # falls at or below its threshold.
+  # Baseline on main (core server package): ~89.9% efficacy, ~82.3% mutant coverage.
+  threshold:
+    efficacy: 85
+    mutant-coverage: 78
+
+  # Exclude the standalone load-generator CLI (cmd/loadgen):
+  # 1. It is a test/load-driving tool rather than the MetricFlow server itself.
+  # 2. Gremlins v0.6.0 maps non-root `package main` directories back to the root
+  #    module package when invoking `go test`, and uses OS-native path separators
+  #    in coverage lookups, causing cmd/loadgen results to diverge between
+  #    Windows and Linux and produce false-positive LIVED mutants on Linux.
+  exclude-files:
+    - "^cmd/loadgen/"
+
+mutants:
+  arithmetic-base:
+    enabled: true
+  conditionals-boundary:
+    enabled: true
+  conditionals-negation:
+    enabled: true
+  increment-decrement:
+    enabled: true
+  invert-negatives:
+    enabled: true

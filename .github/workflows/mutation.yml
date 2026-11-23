@@ -1,0 +1,170 @@
+name: Mutation Testing
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mutation-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  GREMLINS_VERSION: v0.6.0
+  GREMLINS_REPORT: gremlins-report.json
+
+jobs:
+  # Stable job name used as a required status check on main.
+  mutation-test:
+    name: mutation-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          # MetricFlow has no third-party dependencies (no go.sum), so
+          # setup-go's built-in cache would be skipped. Explicit caching below
+          # covers module downloads (for Gremlins) and the Go build cache.
+          cache: false
+
+      - name: Resolve Go cache paths
+        id: go-env
+        run: |
+          echo "goversion=$(go env GOVERSION)" >> "$GITHUB_OUTPUT"
+          echo "gomodcache=$(go env GOMODCACHE)" >> "$GITHUB_OUTPUT"
+          echo "gocache=$(go env GOCACHE)" >> "$GITHUB_OUTPUT"
+          echo "gobin=$(go env GOPATH)/bin" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Go modules and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ steps.go-env.outputs.gomodcache }}
+            ${{ steps.go-env.outputs.gocache }}
+          key: go-mutation-${{ runner.os }}-${{ steps.go-env.outputs.goversion }}-gremlins-${{ env.GREMLINS_VERSION }}-${{ hashFiles('go.mod') }}
+          restore-keys: |
+            go-mutation-${{ runner.os }}-${{ steps.go-env.outputs.goversion }}-gremlins-${{ env.GREMLINS_VERSION }}-
+            go-mutation-${{ runner.os }}-${{ steps.go-env.outputs.goversion }}-
+
+      # Run unit tests first; if they fail, skip mutation testing.
+      - name: Run unit tests
+        id: unit-tests
+        run: go test ./... -count=1
+
+      - name: Install Gremlins (${{ env.GREMLINS_VERSION }})
+        run: |
+          go install "github.com/go-gremlins/gremlins/cmd/gremlins@${GREMLINS_VERSION}"
+          echo "${{ steps.go-env.outputs.gobin }}" >> "$GITHUB_PATH"
+
+      - name: Run mutation tests
+        id: gremlins
+        run: |
+          # Clear cached test results so Gremlins measures real uncached test
+          # duration when computing per-mutant timeouts (build cache stays intact).
+          go clean -testcache
+          gremlins unleash --output="${GREMLINS_REPORT}"
+
+      - name: Upload mutation report
+        if: ${{ !cancelled() && steps.unit-tests.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: gremlins-report
+          path: ${{ env.GREMLINS_REPORT }}
+          if-no-files-found: warn
+
+      - name: Write job summary
+        if: ${{ !cancelled() && steps.unit-tests.outcome == 'success' }}
+        env:
+          GREMLINS_OUTCOME: ${{ steps.gremlins.outcome }}
+        run: |
+          python3 - <<'PY'
+          import collections
+          import json
+          import os
+          import re
+          import sys
+
+          report_path = os.environ["GREMLINS_REPORT"]
+          summary_path = os.environ["GITHUB_STEP_SUMMARY"]
+          outcome = os.environ.get("GREMLINS_OUTCOME", "unknown")
+
+          if not os.path.exists(report_path):
+              with open(summary_path, "a") as out:
+                  out.write("## Mutation Testing\n\n")
+                  out.write(f"Status: **{outcome}** (report `{report_path}` was not generated)\n")
+              sys.exit(0)
+
+          with open(report_path) as f:
+              data = json.load(f)
+
+          # Read configured thresholds from .gremlins.yaml without external YAML deps.
+          eff_threshold = None
+          cov_threshold = None
+          if os.path.exists(".gremlins.yaml"):
+              cfg = open(".gremlins.yaml").read()
+              m_eff = re.search(r"^\s*efficacy:\s*([0-9.]+)", cfg, re.M)
+              m_cov = re.search(r"^\s*mutant-coverage:\s*([0-9.]+)", cfg, re.M)
+              if m_eff:
+                  eff_threshold = float(m_eff.group(1))
+              if m_cov:
+                  cov_threshold = float(m_cov.group(1))
+
+          timed_out = 0
+          lived_by_file = collections.Counter()
+          for entry in data.get("files", []):
+              fname = entry.get("file_name", "")
+              for mut in entry.get("mutations", []):
+                  st = mut.get("status")
+                  if st == "TIMED OUT":
+                      timed_out += 1
+                  elif st == "LIVED":
+                      lived_by_file[fname] += 1
+
+          efficacy = data.get("test_efficacy", 0.0)
+          coverage = data.get("mutations_coverage", 0.0)
+          killed = data.get("mutants_killed", 0)
+          lived = data.get("mutants_lived", 0)
+          not_covered = data.get("mutants_not_covered", 0)
+          not_viable = data.get("mutants_not_viable", 0)
+          elapsed = data.get("elapsed_time", 0.0)
+
+          status_label = "PASSED" if outcome == "success" else "FAILED"
+          eff_thresh_str = f"> {eff_threshold:g}%" if eff_threshold is not None else "n/a"
+          cov_thresh_str = f"> {cov_threshold:g}%" if cov_threshold is not None else "n/a"
+
+          lines = [
+              f"## Mutation Testing — {status_label}",
+              "",
+              "| Metric | Value | Threshold |",
+              "| --- | ---: | ---: |",
+              f"| **Test efficacy** | **{efficacy:.2f}%** | {eff_thresh_str} |",
+              f"| **Mutant coverage** | **{coverage:.2f}%** | {cov_thresh_str} |",
+              "",
+              "| Killed | Survived (Lived) | Not covered | Timed out | Not viable | Duration |",
+              "| ---: | ---: | ---: | ---: | ---: | ---: |",
+              f"| {killed} | {lived} | {not_covered} | {timed_out} | {not_viable} | {elapsed:.1f}s |",
+          ]
+
+          if lived_by_file:
+              lines += [
+                  "",
+                  "### Top files with surviving mutants",
+                  "",
+                  "| File | Surviving mutants |",
+                  "| --- | ---: |",
+              ]
+              for fname, count in lived_by_file.most_common(5):
+                  lines.append(f"| `{fname}` | {count} |")
+
+          with open(summary_path, "a") as out:
+              out.write("\n".join(lines) + "\n")
+          PY
