@@ -9,7 +9,7 @@ unleash:
 
   # Multiplier applied to the baseline coverage test duration for each mutant's
   # execution timeout.
-  timeout-coefficient: 5
+  timeout-coefficient: 3
 
   # Quality gate thresholds (percentages). Gremlins exits non-zero if a score
   # falls at or below its threshold.
