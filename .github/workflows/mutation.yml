@@ -28,6 +28,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+        with:
+          # Full history is needed so `git diff --merge-base origin/<base>` works
+          # in PR diff mode.
+          fetch-depth: 0
 
       - uses: actions/setup-go@v7
         with:
@@ -74,7 +78,28 @@ jobs:
 
       - name: Run mutation tests
         id: gremlins
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
         run: |
+          # On pull requests, mutate only lines changed relative to the PR base
+          # branch so checks finish in seconds/minutes. Manual workflow_dispatch
+          # and merge_group runs evaluate the full codebase.
+          diff_args=()
+          if [ "${EVENT_NAME}" = "pull_request" ]; then
+            echo "mode=diff" >> "$GITHUB_OUTPUT"
+            # Guard against an empty diff: Gremlins v0.6.0 treats an empty
+            # diff map as "mutate everything".
+            if [ -z "$(git diff --name-only --merge-base "origin/${BASE_REF}")" ]; then
+              echo "no_mutable_changes=true" >> "$GITHUB_OUTPUT"
+              echo "No files changed against origin/${BASE_REF}; skipping mutation run."
+              exit 0
+            fi
+            diff_args+=(--diff="origin/${BASE_REF}")
+          else
+            echo "mode=full" >> "$GITHUB_OUTPUT"
+          fi
+
           # Isolate Gremlins's temporary per-mutant builds in an ephemeral
           # GOCACHE so hundreds of uncacheable mutated packages don't bloat the
           # saved GitHub Actions cache (also guarantees uncached coverage timing).
@@ -94,6 +119,7 @@ jobs:
           set +e
           GOCACHE="$mutation_gocache" gremlins unleash \
             --config="${GREMLINS_CONFIG}" \
+            "${diff_args[@]}" \
             --output="${GREMLINS_REPORT}"
           gremlins_rc=$?
           set -e
@@ -105,8 +131,40 @@ jobs:
             exit "${gremlins_rc:-1}"
           fi
 
-          evaluated="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("mutants_killed",0)+d.get("mutants_lived",0))' "${GREMLINS_REPORT}")"
-          if [ "${evaluated}" -le 0 ]; then
+          read -r in_diff skipped evaluated < <(python3 - "${GREMLINS_REPORT}" <<'PY'
+          import json, sys
+          with open(sys.argv[1]) as f:
+              d = json.load(f)
+          skipped = 0
+          in_diff = 0
+          for entry in d.get("files") or []:
+              for m in entry.get("mutations") or []:
+                  if m.get("status") == "SKIPPED":
+                      skipped += 1
+                  else:
+                      in_diff += 1
+          evaluated = d.get("mutants_killed", 0) + d.get("mutants_lived", 0)
+          print(in_diff, skipped, evaluated)
+          PY
+          )
+
+          # In PR diff mode, a PR touching only docs/CI/tests/comments skips
+          # every mutant (in_diff=0, skipped>0). Gremlins reports 0% efficacy
+          # and exits 10 in that case; treat it as a clean pass rather than
+          # blocking non-code PRs.
+          if [ "${EVENT_NAME}" = "pull_request" ] && [ "${in_diff}" -eq 0 ] && [ "${skipped}" -gt 0 ]; then
+            echo "no_mutable_changes=true" >> "$GITHUB_OUTPUT"
+            echo "No mutable Go lines changed in this PR (${skipped} mutants skipped)."
+            exit 0
+          fi
+
+          # Fail if Gremlins found 0 mutants anywhere (broken config/exclusions)
+          # or if a full run evaluated 0 mutants.
+          if [ "${in_diff}" -eq 0 ] && [ "${skipped}" -eq 0 ]; then
+            echo "::error::Gremlins discovered 0 mutants; check exclude-files and config."
+            exit 1
+          fi
+          if [ "${EVENT_NAME}" != "pull_request" ] && [ "${evaluated}" -le 0 ]; then
             echo "::error::Gremlins evaluated 0 mutants; check exclude-files and config."
             exit 1
           fi
@@ -120,12 +178,14 @@ jobs:
           name: gremlins-report
           path: ${{ env.GREMLINS_REPORT }}
           retention-days: 30
-          if-no-files-found: warn
+          if-no-files-found: ignore
 
       - name: Write job summary
         if: ${{ !cancelled() && (steps.gremlins.outcome == 'success' || steps.gremlins.outcome == 'failure') }}
         env:
           GREMLINS_OUTCOME: ${{ steps.gremlins.outcome }}
+          GREMLINS_MODE: ${{ steps.gremlins.outputs.mode }}
+          NO_MUTABLE_CHANGES: ${{ steps.gremlins.outputs.no_mutable_changes }}
         run: |
           python3 - <<'PY'
           import collections
@@ -138,11 +198,18 @@ jobs:
           config_path = os.environ["GREMLINS_CONFIG"]
           summary_path = os.environ["GITHUB_STEP_SUMMARY"]
           outcome = os.environ.get("GREMLINS_OUTCOME", "unknown")
+          mode = os.environ.get("GREMLINS_MODE", "full")
+          no_mutable_changes = os.environ.get("NO_MUTABLE_CHANGES") == "true"
+
+          mode_label = "PR diff" if mode == "diff" else "full codebase"
 
           if not os.path.exists(report_path):
               with open(summary_path, "a") as out:
-                  out.write("## Mutation Testing\n\n")
-                  out.write(f"Status: **{outcome}** (report `{report_path}` was not generated)\n")
+                  out.write(f"## Mutation Testing ({mode_label})\n\n")
+                  if no_mutable_changes:
+                      out.write("Status: **PASSED** — no files changed against base branch.\n")
+                  else:
+                      out.write(f"Status: **{outcome}** (report `{report_path}` was not generated)\n")
               sys.exit(0)
 
           with open(report_path) as f:
@@ -162,6 +229,7 @@ jobs:
                   cov_threshold = float(m_cov.group(1))
 
           timed_out = 0
+          skipped = 0
           lived_by_file = collections.Counter()
           for entry in data.get("files") or []:
               fname = entry.get("file_name") or ""
@@ -169,6 +237,8 @@ jobs:
                   st = mut.get("status")
                   if st == "TIMED OUT":
                       timed_out += 1
+                  elif st == "SKIPPED":
+                      skipped += 1
                   elif st == "LIVED":
                       lived_by_file[fname] += 1
 
@@ -190,29 +260,36 @@ jobs:
           def escape_md(s: str) -> str:
               return s.replace("|", "\\|").replace("`", "\\`")
 
-          lines = [
-              f"## Mutation Testing — {status_label}",
-              "",
-              "| Metric | Value | Threshold |",
-              "| --- | ---: | ---: |",
-              f"| **Test efficacy** | **{efficacy:.2f}%** | {eff_thresh_str} |",
-              f"| **Mutant coverage** | **{coverage:.2f}%** | {cov_thresh_str} |",
-              "",
-              "| Killed | Survived (Lived) | Not covered | Timed out | Not viable | Duration |",
-              "| ---: | ---: | ---: | ---: | ---: | ---: |",
-              f"| {killed} | {lived} | {not_covered} | {timed_out} | {not_viable} | {duration_str} |",
-          ]
-
-          if lived_by_file:
-              lines += [
+          if no_mutable_changes:
+              lines = [
+                  f"## Mutation Testing ({mode_label}) — PASSED",
                   "",
-                  "### Top files with surviving mutants",
-                  "",
-                  "| File | Surviving mutants |",
-                  "| --- | ---: |",
+                  f"No mutable Go lines changed in this PR ({skipped} mutants skipped, checked in {duration_str}).",
               ]
-              for fname, count in lived_by_file.most_common(5):
-                  lines.append(f"| `{escape_md(fname)}` | {count} |")
+          else:
+              lines = [
+                  f"## Mutation Testing ({mode_label}) — {status_label}",
+                  "",
+                  "| Metric | Value | Threshold |",
+                  "| --- | ---: | ---: |",
+                  f"| **Test efficacy** | **{efficacy:.2f}%** | {eff_thresh_str} |",
+                  f"| **Mutant coverage** | **{coverage:.2f}%** | {cov_thresh_str} |",
+                  "",
+                  "| Killed | Survived (Lived) | Not covered | Timed out | Skipped | Not viable | Duration |",
+                  "| ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+                  f"| {killed} | {lived} | {not_covered} | {timed_out} | {skipped} | {not_viable} | {duration_str} |",
+              ]
+
+              if lived_by_file:
+                  lines += [
+                      "",
+                      "### Top files with surviving mutants",
+                      "",
+                      "| File | Surviving mutants |",
+                      "| --- | ---: |",
+                  ]
+                  for fname, count in lived_by_file.most_common(5):
+                      lines.append(f"| `{escape_md(fname)}` | {count} |")
 
           with open(summary_path, "a") as out:
               out.write("\n".join(lines) + "\n")
