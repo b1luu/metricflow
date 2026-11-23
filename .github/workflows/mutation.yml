@@ -12,10 +12,11 @@ permissions:
 
 concurrency:
   group: mutation-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   GREMLINS_VERSION: v0.6.0
+  GREMLINS_CONFIG: .gremlins.yaml
   GREMLINS_REPORT: gremlins-report.json
 
 jobs:
@@ -23,7 +24,7 @@ jobs:
   mutation-test:
     name: mutation-test
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v7
@@ -33,27 +34,33 @@ jobs:
           go-version-file: go.mod
           # MetricFlow has no third-party dependencies (no go.sum), so
           # setup-go's built-in cache would be skipped. Explicit caching below
-          # covers module downloads (for Gremlins) and the Go build cache.
+          # covers module downloads (for Gremlins), clean build artifacts, and
+          # the installed Gremlins binary.
           cache: false
 
       - name: Resolve Go cache paths
         id: go-env
         run: |
+          gobin="$(go env GOBIN)"
+          if [ -z "$gobin" ]; then
+            gobin="$(go env GOPATH | cut -d: -f1)/bin"
+          fi
           echo "goversion=$(go env GOVERSION)" >> "$GITHUB_OUTPUT"
           echo "gomodcache=$(go env GOMODCACHE)" >> "$GITHUB_OUTPUT"
           echo "gocache=$(go env GOCACHE)" >> "$GITHUB_OUTPUT"
-          echo "gobin=$(go env GOPATH)/bin" >> "$GITHUB_OUTPUT"
+          echo "gobin=${gobin}" >> "$GITHUB_OUTPUT"
 
-      - name: Cache Go modules and build artifacts
+      - name: Cache Go modules, build cache, and Gremlins binary
         uses: actions/cache@v6
         with:
           path: |
             ${{ steps.go-env.outputs.gomodcache }}
             ${{ steps.go-env.outputs.gocache }}
-          key: go-mutation-${{ runner.os }}-${{ steps.go-env.outputs.goversion }}-gremlins-${{ env.GREMLINS_VERSION }}-${{ hashFiles('go.mod') }}
+            ${{ steps.go-env.outputs.gobin }}/gremlins
+          key: go-mutation-v2-${{ runner.os }}-${{ steps.go-env.outputs.goversion }}-gremlins-${{ env.GREMLINS_VERSION }}-${{ hashFiles('go.mod') }}
           restore-keys: |
-            go-mutation-${{ runner.os }}-${{ steps.go-env.outputs.goversion }}-gremlins-${{ env.GREMLINS_VERSION }}-
-            go-mutation-${{ runner.os }}-${{ steps.go-env.outputs.goversion }}-
+            go-mutation-v2-${{ runner.os }}-${{ steps.go-env.outputs.goversion }}-gremlins-${{ env.GREMLINS_VERSION }}-
+            go-mutation-v2-${{ runner.os }}-${{ steps.go-env.outputs.goversion }}-
 
       # Run unit tests first; if they fail, skip mutation testing.
       - name: Run unit tests
@@ -68,25 +75,55 @@ jobs:
       - name: Run mutation tests
         id: gremlins
         run: |
-          # Clear cached test results so Gremlins measures real uncached test
-          # duration when computing per-mutant timeouts (build cache stays intact).
-          go clean -testcache
+          # Isolate Gremlins's temporary per-mutant builds in an ephemeral
+          # GOCACHE so hundreds of uncacheable mutated packages don't bloat the
+          # saved GitHub Actions cache (also guarantees uncached coverage timing).
+          mutation_gocache="$(mktemp -d)"
+          trap 'rm -rf "$mutation_gocache"' EXIT
+
           # Cap per-process virtual address space (2.5 GiB) so mutants that create
-          # unbounded allocation loops (e.g. parser index decrement mutations) abort
-          # cleanly instead of OOMing the 16 GiB runner across parallel workers.
+          # unbounded allocation loops (e.g. parser index decrement mutations)
+          # abort cleanly with Go OOM (counted as KILLED rather than TIMED OUT)
+          # instead of OOMing the 16 GiB runner across parallel workers.
+          # Note: incompatible with `go test -race` (TSan reserves TB-scale VM).
           ulimit -v 2621440
-          gremlins unleash --output="${GREMLINS_REPORT}"
+
+          # Pass --config explicitly: without it, Gremlins v0.6.0 silently
+          # ignores YAML parse errors and lets global/home configs shadow repo
+          # thresholds.
+          set +e
+          GOCACHE="$mutation_gocache" gremlins unleash \
+            --config="${GREMLINS_CONFIG}" \
+            --output="${GREMLINS_REPORT}"
+          gremlins_rc=$?
+          set -e
+
+          # Guard against silent green passes when zero mutants are discovered
+          # (Gremlins exits 0 without writing a report if 0 mutants match).
+          if [ ! -s "${GREMLINS_REPORT}" ]; then
+            echo "::error::Gremlins did not produce ${GREMLINS_REPORT} (exit ${gremlins_rc})."
+            exit "${gremlins_rc:-1}"
+          fi
+
+          evaluated="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("mutants_killed",0)+d.get("mutants_lived",0))' "${GREMLINS_REPORT}")"
+          if [ "${evaluated}" -le 0 ]; then
+            echo "::error::Gremlins evaluated 0 mutants; check exclude-files and config."
+            exit 1
+          fi
+
+          exit "${gremlins_rc}"
 
       - name: Upload mutation report
-        if: ${{ !cancelled() && steps.unit-tests.outcome == 'success' }}
+        if: ${{ !cancelled() && (steps.gremlins.outcome == 'success' || steps.gremlins.outcome == 'failure') }}
         uses: actions/upload-artifact@v7
         with:
           name: gremlins-report
           path: ${{ env.GREMLINS_REPORT }}
+          retention-days: 30
           if-no-files-found: warn
 
       - name: Write job summary
-        if: ${{ !cancelled() && steps.unit-tests.outcome == 'success' }}
+        if: ${{ !cancelled() && (steps.gremlins.outcome == 'success' || steps.gremlins.outcome == 'failure') }}
         env:
           GREMLINS_OUTCOME: ${{ steps.gremlins.outcome }}
         run: |
@@ -98,6 +135,7 @@ jobs:
           import sys
 
           report_path = os.environ["GREMLINS_REPORT"]
+          config_path = os.environ["GREMLINS_CONFIG"]
           summary_path = os.environ["GITHUB_STEP_SUMMARY"]
           outcome = os.environ.get("GREMLINS_OUTCOME", "unknown")
 
@@ -111,10 +149,11 @@ jobs:
               data = json.load(f)
 
           # Read configured thresholds from .gremlins.yaml without external YAML deps.
-          eff_threshold = None
-          cov_threshold = None
-          if os.path.exists(".gremlins.yaml"):
-              cfg = open(".gremlins.yaml").read()
+          eff_threshold = 0.0
+          cov_threshold = 0.0
+          if os.path.exists(config_path):
+              with open(config_path) as cf:
+                  cfg = cf.read()
               m_eff = re.search(r"^\s*efficacy:\s*([0-9.]+)", cfg, re.M)
               m_cov = re.search(r"^\s*mutant-coverage:\s*([0-9.]+)", cfg, re.M)
               if m_eff:
@@ -124,9 +163,9 @@ jobs:
 
           timed_out = 0
           lived_by_file = collections.Counter()
-          for entry in data.get("files", []):
-              fname = entry.get("file_name", "")
-              for mut in entry.get("mutations", []):
+          for entry in data.get("files") or []:
+              fname = entry.get("file_name") or ""
+              for mut in entry.get("mutations") or []:
                   st = mut.get("status")
                   if st == "TIMED OUT":
                       timed_out += 1
@@ -139,11 +178,17 @@ jobs:
           lived = data.get("mutants_lived", 0)
           not_covered = data.get("mutants_not_covered", 0)
           not_viable = data.get("mutants_not_viable", 0)
-          elapsed = data.get("elapsed_time", 0.0)
+          elapsed = float(data.get("elapsed_time", 0.0))
+
+          mins, secs = divmod(int(round(elapsed)), 60)
+          duration_str = f"{mins}m {secs}s" if mins else f"{elapsed:.1f}s"
 
           status_label = "PASSED" if outcome == "success" else "FAILED"
-          eff_thresh_str = f"> {eff_threshold:g}%" if eff_threshold is not None else "n/a"
-          cov_thresh_str = f"> {cov_threshold:g}%" if cov_threshold is not None else "n/a"
+          eff_thresh_str = f"> {eff_threshold:g}%" if eff_threshold > 0 else "n/a"
+          cov_thresh_str = f"> {cov_threshold:g}%" if cov_threshold > 0 else "n/a"
+
+          def escape_md(s: str) -> str:
+              return s.replace("|", "\\|").replace("`", "\\`")
 
           lines = [
               f"## Mutation Testing — {status_label}",
@@ -155,7 +200,7 @@ jobs:
               "",
               "| Killed | Survived (Lived) | Not covered | Timed out | Not viable | Duration |",
               "| ---: | ---: | ---: | ---: | ---: | ---: |",
-              f"| {killed} | {lived} | {not_covered} | {timed_out} | {not_viable} | {elapsed:.1f}s |",
+              f"| {killed} | {lived} | {not_covered} | {timed_out} | {not_viable} | {duration_str} |",
           ]
 
           if lived_by_file:
@@ -167,7 +212,7 @@ jobs:
                   "| --- | ---: |",
               ]
               for fname, count in lived_by_file.most_common(5):
-                  lines.append(f"| `{fname}` | {count} |")
+                  lines.append(f"| `{escape_md(fname)}` | {count} |")
 
           with open(summary_path, "a") as out:
               out.write("\n".join(lines) + "\n")
